@@ -5,7 +5,7 @@ use bevy::{
         Render, RenderApp, RenderStartup, RenderSystems,
         extract_resource::{ExtractResource, ExtractResourcePlugin},
         render_asset::RenderAssets,
-        render_graph::{self, RenderGraph, RenderLabel},
+        render_graph::{Node, NodeRunError, RenderGraph, RenderGraphContext, RenderLabel},
         render_resource::{
             binding_types::{
                 storage_buffer_read_only, texture_2d, texture_storage_2d, uniform_buffer,
@@ -18,6 +18,10 @@ use bevy::{
     shader::PipelineCacheError,
 };
 use std::borrow::Cow;
+mod terrain_pipeline;
+use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
+
+use crate::terrain_pipeline::TerrainMarker;
 
 const EROSION_SHADER: &str = "erosion.wgsl";
 
@@ -38,8 +42,11 @@ fn main() {
                 })
                 .set(ImagePlugin::default_nearest()),
             ErosionComputePlugin,
+            PanOrbitCameraPlugin,
         ))
-        .add_systems(Startup, setup)
+        .add_plugins(terrain_pipeline::TerrainPlugin)
+        .add_systems(Startup, (setup, spawn_terrain))
+        .add_systems(Update, draw_brush_gizmo)
         .run();
 }
 
@@ -50,6 +57,17 @@ struct ErosionImages {
     display: Handle<Image>,
     dummy_read: Handle<Image>,
     dummy_write: Handle<Image>,
+}
+
+fn draw_brush_gizmo(mut g: Gizmos) {
+    // Simple static brush visualization at center for now
+    let radius_world = 10.0;
+    let half_size = radius_world * 0.5;
+    g.ellipse(
+        Isometry3d::IDENTITY,
+        Vec2::new(half_size, half_size),
+        Color::WHITE,
+    );
 }
 
 #[derive(Resource, Clone, ExtractResource, ShaderType)]
@@ -105,15 +123,15 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     let dummy_read = images.add(dummy_r);
     let dummy_write = images.add(dummy_w);
 
-    commands.spawn((
-        Sprite {
-            image: display_handle.clone(),
-            custom_size: Some(SIZE.as_vec2()),
-            ..default()
-        },
-        Transform::from_scale(Vec3::splat(DISPLAY_FACTOR as f32)),
-    ));
-    commands.spawn(Camera2d);
+    // commands.spawn((
+    //     Sprite {
+    //         image: display_handle.clone(),
+    //         custom_size: Some(SIZE.as_vec2()),
+    //         ..default()
+    //     },
+    //     Transform::from_scale(Vec3::splat(DISPLAY_FACTOR as f32)),
+    // ));
+    // commands.spawn(Camera2d);
 
     commands.insert_resource(ErosionImages {
         height_a,
@@ -150,6 +168,33 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         brush_indices,
         brush_weights,
     });
+}
+
+fn spawn_terrain(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
+    // Spawn a subdivided plane with UVs
+    let size = 256.0;
+    let resolution = 255; // subdivisions
+    let half_size = size * 0.5;
+    let plane = Mesh::from(
+        Plane3d::default()
+            .mesh()
+            .subdivisions(resolution)
+            .size(half_size, half_size),
+    );
+    let mesh_handle = meshes.add(plane);
+
+    commands.spawn((
+        TerrainMarker,
+        Mesh3d(mesh_handle),
+        Transform::from_xyz(0.0, 0.0, 0.0),
+    ));
+
+    // 3D camera
+    commands.spawn((
+        Camera3d::default(),
+        Transform::from_xyz(150.0, 150.0, 150.0).looking_at(Vec3::ZERO, Vec3::Y),
+        PanOrbitCamera::default(),
+    ));
 }
 
 fn generate_random_indices(count: u32, max_index: u32) -> Vec<u32> {
@@ -422,7 +467,7 @@ impl Default for ErosionNode {
     }
 }
 
-impl render_graph::Node for ErosionNode {
+impl Node for ErosionNode {
     fn update(&mut self, world: &mut World) {
         let pipeline = world.resource::<ErosionPipeline>();
         let cache = world.resource::<PipelineCache>();
@@ -457,10 +502,10 @@ impl render_graph::Node for ErosionNode {
 
     fn run(
         &self,
-        _graph: &mut render_graph::RenderGraphContext,
+        _graph: &mut RenderGraphContext,
         render_context: &mut RenderContext,
         world: &World,
-    ) -> Result<(), render_graph::NodeRunError> {
+    ) -> Result<(), NodeRunError> {
         let cache = world.resource::<PipelineCache>();
         let pipes = world.resource::<ErosionPipeline>();
         let groups = world.resource::<ErosionBindGroups>();
@@ -511,6 +556,19 @@ impl render_graph::Node for ErosionNode {
                 }
             }
             ErosionState::Erode(index) => {
+                // Pass 0: copy in -> out so untouched pixels persist this frame
+                {
+                    let mut pass = render_context
+                        .command_encoder()
+                        .begin_compute_pass(&ComputePassDescriptor::default());
+                    let p_copy = cache.get_compute_pipeline(pipes.pipeline_copy).unwrap();
+                    pass.set_pipeline(p_copy);
+                    pass.set_bind_group(0, &groups.erosion[index], &[]);
+                    let gx = (params.map_size.x + 7) / 8;
+                    let gy = (params.map_size.y + 7) / 8;
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
+
                 // Pass 1: erode (writes storage)
                 {
                     let mut pass = render_context

@@ -173,8 +173,11 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
             let amountToErode = min((cap - sediment) * params.erode_speed, -deltaH);
             for (var i: u32 = 0u; i < params.brush_length; i = i + 1u) {
                 let erodeIndex = dropletIndex + brush_indices[i];
-                let ex = erodeIndex % size;
-                let ey = erodeIndex / size;
+                // Clamp neighbor coordinates to avoid OOB at terrain edges
+                var ex = erodeIndex % size;
+                var ey = erodeIndex / size;
+                ex = clamp(ex, 0, size - 1);
+                ey = clamp(ey, 0, size - 1);
                 let p = vec2<i32>(ex, ey);
                 let current = textureLoad(height_in, p).x;
                 let weighted = amountToErode * brush_weights[i];

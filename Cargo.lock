@@ -659,6 +659,7 @@ name = "bevy_erosion"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bevy_panorbit_camera",
 ]
 
 [[package]]
@@ -969,6 +970,14 @@ name = "bevy_mikktspace"
 version = "0.17.0-dev"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef8e4b7e61dfe7719bb03c884dc270cd46a82efb40f93e9933b990c5c190c59"
+
+[[package]]
+name = "bevy_panorbit_camera"
+version = "0.28.0"
+source = "git+https://github.com/kristoff3r/bevy_panorbit_camera?branch=master#feb2858d8a431b6efb7dcd5a6885a33906eef9b1"
+dependencies = [
+ "bevy",
+]
 
 [[package]]
 name = "bevy_pbr"
