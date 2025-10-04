@@ -3,8 +3,7 @@
 // Pass 2: erode - run droplets using structured buffers (map as storage texture).
 // Pass 3: blit_to_texture - optional, copy height to rgba for display.
 
-@group(0) @binding(0) var height_in: texture_storage_2d<r32float, read>;
-@group(0) @binding(1) var height_out: texture_storage_2d<r32float, write>;
+@group(0) @binding(0) var<storage, read_write> height: array<f32>;
 
 // For init_fbm we only need output; height_in is ignored.
 
@@ -25,11 +24,11 @@ struct ErodeParams {
     num_particles: u32,
 }
 
-@group(0) @binding(2) var<uniform> params: ErodeParams;
+@group(0) @binding(1) var<uniform> params: ErodeParams;
 
-@group(0) @binding(3) var<storage, read> random_indices: array<u32>;
-@group(0) @binding(4) var<storage, read> brush_indices: array<i32>;
-@group(0) @binding(5) var<storage, read> brush_weights: array<f32>;
+@group(0) @binding(2) var<storage, read> random_indices: array<u32>;
+@group(0) @binding(3) var<storage, read> brush_indices: array<i32>;
+@group(0) @binding(4) var<storage, read> brush_weights: array<f32>;
 
 fn rand_hash(v: u32) -> u32 {
     var x = v;
@@ -83,21 +82,17 @@ fn fbm(p: vec2<f32>) -> f32 {
 fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
     let uv = vec2<f32>(gid.xy);
-    let h = fbm(uv);
-    textureStore(height_out, vec2<i32>(gid.xy), vec4<f32>(h,0.0,0.0,0.0));
+    let hval = fbm(uv);
+    let idx = gid.y * params.map_size.x + gid.x;
+    height[idx] = hval;
 }
 
-// Copy entire height_in to height_out
-@compute @workgroup_size(8,8,1)
-fn copy_height(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
-    let p = vec2<i32>(gid.xy);
-    let h = textureLoad(height_in, p).x;
-    textureStore(height_out, p, vec4<f32>(h,0.0,0.0,0.0));
-}
+// No copy pass needed with in-place buffer
 
 fn load_height(p: vec2<i32>) -> f32 {
-    return textureLoad(height_in, p).x;
+    let size = i32(params.map_size.x);
+    let idx = u32(p.y * size + p.x);
+    return height[idx];
 }
 
 fn sample_height_and_gradient(pos: vec2<f32>) -> vec3<f32> {
@@ -163,26 +158,25 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
             let wNE = cellOffsetX * (1.0 - cellOffsetY);
             let wSW = (1.0 - cellOffsetX) * cellOffsetY;
             let wSE = cellOffsetX * cellOffsetY;
-            // Read-modify-write via textureLoad/Store (r32float)
-            let p = vec2<i32>(nodeX, nodeY);
-            textureStore(height_out, p, vec4<f32>(textureLoad(height_in, p).x + deposit * wNW,0.0,0.0,0.0));
-            textureStore(height_out, p + vec2<i32>(1,0), vec4<f32>(textureLoad(height_in, p + vec2<i32>(1,0)).x + deposit * wNE,0.0,0.0,0.0));
-            textureStore(height_out, p + vec2<i32>(0,1), vec4<f32>(textureLoad(height_in, p + vec2<i32>(0,1)).x + deposit * wSW,0.0,0.0,0.0));
-            textureStore(height_out, p + vec2<i32>(1,1), vec4<f32>(textureLoad(height_in, p + vec2<i32>(1,1)).x + deposit * wSE,0.0,0.0,0.0));
+            let size_i = i32(params.map_size.x);
+            let base = nodeY * size_i + nodeX;
+            let iNW = u32(base);
+            let iNE = u32(base + 1);
+            let iSW = u32(base + size_i);
+            let iSE = u32(base + size_i + 1);
+            height[iNW] = height[iNW] + deposit * wNW;
+            height[iNE] = height[iNE] + deposit * wNE;
+            height[iSW] = height[iSW] + deposit * wSW;
+            height[iSE] = height[iSE] + deposit * wSE;
         } else {
             let amountToErode = min((cap - sediment) * params.erode_speed, -deltaH);
             for (var i: u32 = 0u; i < params.brush_length; i = i + 1u) {
                 let erodeIndex = dropletIndex + brush_indices[i];
-                // Clamp neighbor coordinates to avoid OOB at terrain edges
-                var ex = erodeIndex % size;
-                var ey = erodeIndex / size;
-                ex = clamp(ex, 0, size - 1);
-                ey = clamp(ey, 0, size - 1);
-                let p = vec2<i32>(ex, ey);
-                let current = textureLoad(height_in, p).x;
+                let idx = u32(erodeIndex);
+                let current = height[idx];
                 let weighted = amountToErode * brush_weights[i];
                 let delta = select(weighted, current, current < weighted);
-                textureStore(height_out, p, vec4<f32>(current - delta,0.0,0.0,0.0));
+                height[idx] = current - delta;
                 sediment += delta;
             }
         }
@@ -192,13 +186,15 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
-@group(1) @binding(0) var height_for_display: texture_2d<f32>;
-@group(1) @binding(1) var display_out: texture_storage_2d<rgba8unorm, write>;
+@group(1) @binding(0) var display_out: texture_storage_2d<rgba8unorm, write>;
 
 @compute @workgroup_size(8,8,1)
 fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
-    let h = textureLoad(height_for_display, vec2<i32>(gid.xy), 0).x;
+    let size = i32(params.map_size.x);
+    let p = vec2<i32>(gid.xy);
+    let idx = u32(p.y * size + p.x);
+    let h = height[idx];
     let c = clamp(h, 0.0, 1.0);
     textureStore(display_out, vec2<i32>(gid.xy), vec4<f32>(c, c, c, 1.0));
 }

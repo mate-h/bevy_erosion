@@ -8,7 +8,7 @@ use bevy::{
         render_graph::{Node, NodeRunError, RenderGraph, RenderGraphContext, RenderLabel},
         render_resource::{
             binding_types::{
-                storage_buffer_read_only, texture_2d, texture_storage_2d, uniform_buffer,
+                storage_buffer, storage_buffer_read_only, texture_storage_2d, uniform_buffer,
             },
             *,
         },
@@ -25,49 +25,25 @@ use crate::terrain_pipeline::TerrainMarker;
 
 const EROSION_SHADER: &str = "erosion.wgsl";
 
-const DISPLAY_FACTOR: u32 = 2;
 const SIZE: UVec2 = UVec2::new(512, 512);
 
 fn main() {
     App::new()
         .insert_resource(ClearColor(Color::BLACK))
         .add_plugins((
-            DefaultPlugins
-                .set(WindowPlugin {
-                    primary_window: Some(Window {
-                        resolution: (SIZE * DISPLAY_FACTOR).into(),
-                        ..default()
-                    }),
-                    ..default()
-                })
-                .set(ImagePlugin::default_nearest()),
+            DefaultPlugins,
             ErosionComputePlugin,
             PanOrbitCameraPlugin,
         ))
         .add_plugins(terrain_pipeline::TerrainPlugin)
         .add_systems(Startup, (setup, spawn_terrain))
-        .add_systems(Update, draw_brush_gizmo)
+        .add_systems(Update, handle_reset_input)
         .run();
 }
 
 #[derive(Resource, Clone, ExtractResource)]
 struct ErosionImages {
-    height_a: Handle<Image>,
-    height_b: Handle<Image>,
     display: Handle<Image>,
-    dummy_read: Handle<Image>,
-    dummy_write: Handle<Image>,
-}
-
-fn draw_brush_gizmo(mut g: Gizmos) {
-    // Simple static brush visualization at center for now
-    let radius_world = 10.0;
-    let half_size = radius_world * 0.5;
-    g.ellipse(
-        Isometry3d::IDENTITY,
-        Vec2::new(half_size, half_size),
-        Color::WHITE,
-    );
 }
 
 #[derive(Resource, Clone, ExtractResource, ShaderType)]
@@ -95,33 +71,18 @@ struct ErosionCpuBuffers {
     brush_weights: Vec<f32>,
 }
 
-fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
-    // Height textures (r32float) for ping-pong
-    let mut height = Image::new_target_texture(SIZE.x, SIZE.y, TextureFormat::R32Float);
-    height.asset_usage = RenderAssetUsages::RENDER_WORLD;
-    height.texture_descriptor.usage =
-        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
-    let height_a = images.add(height.clone());
-    let height_b = images.add(height);
+#[derive(Resource, Clone, ExtractResource, Default)]
+struct ResetSim {
+    generation: u32,
+}
 
+fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     // Display texture (rgba8unorm) written by compute blit
     let mut display = Image::new_target_texture(SIZE.x, SIZE.y, TextureFormat::Rgba8Unorm);
     display.asset_usage = RenderAssetUsages::RENDER_WORLD;
     display.texture_descriptor.usage =
         TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
     let display_handle = images.add(display);
-
-    // Dummy storage textures (1x1 r32float) to occupy storage slots during blit (distinct for read/write)
-    let mut dummy_r = Image::new_target_texture(1, 1, TextureFormat::R32Float);
-    dummy_r.asset_usage = RenderAssetUsages::RENDER_WORLD;
-    dummy_r.texture_descriptor.usage =
-        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
-    let mut dummy_w = Image::new_target_texture(1, 1, TextureFormat::R32Float);
-    dummy_w.asset_usage = RenderAssetUsages::RENDER_WORLD;
-    dummy_w.texture_descriptor.usage =
-        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
-    let dummy_read = images.add(dummy_r);
-    let dummy_write = images.add(dummy_w);
 
     // commands.spawn((
     //     Sprite {
@@ -133,30 +94,24 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     // ));
     // commands.spawn(Camera2d);
 
-    commands.insert_resource(ErosionImages {
-        height_a,
-        height_b,
-        display: display_handle,
-        dummy_read,
-        dummy_write,
-    });
+    commands.insert_resource(ErosionImages { display: display_handle });
 
     // Parameters
     let brush_radius: i32 = 3;
     let (brush_indices, brush_weights) = build_brush(SIZE.x as i32, brush_radius);
-    let num_particles: u32 = 262_144;
+    let num_particles: u32 = 60_000;
     let random_indices = generate_random_indices(num_particles, (SIZE.x * SIZE.y) as u32);
 
     commands.insert_resource(ErodeParams {
         map_size: SIZE,
         max_lifetime: 30,
-        border_size: 4,
+        border_size: brush_radius as u32,
         inertia: 0.05,
         sediment_capacity_factor: 4.0,
         min_sediment_capacity: 0.01,
         deposit_speed: 0.3,
         erode_speed: 0.3,
-        evaporate_speed: 0.02,
+        evaporate_speed: 0.01,
         gravity: 4.0,
         start_speed: 1.0,
         start_water: 1.0,
@@ -168,6 +123,7 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         brush_indices,
         brush_weights,
     });
+    commands.insert_resource(ResetSim::default());
 }
 
 fn spawn_terrain(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
@@ -243,6 +199,7 @@ impl Plugin for ErosionComputePlugin {
             ExtractResourcePlugin::<ErosionImages>::default(),
             ExtractResourcePlugin::<ErodeParams>::default(),
             ExtractResourcePlugin::<ErosionCpuBuffers>::default(),
+            ExtractResourcePlugin::<ResetSim>::default(),
         ));
 
         let render_app = app.sub_app_mut(RenderApp);
@@ -264,21 +221,20 @@ struct ErosionPipeline {
     layout_erosion: BindGroupLayout,
     layout_blit: BindGroupLayout,
     pipeline_init: CachedComputePipelineId,
-    pipeline_copy: CachedComputePipelineId,
     pipeline_erode: CachedComputePipelineId,
     pipeline_blit: CachedComputePipelineId,
 }
 
 #[derive(Resource)]
 struct ErosionBindGroups {
-    erosion: [BindGroup; 2],
-    blit: [BindGroup; 2],
-    blit_g0_dummy: BindGroup,
+    erosion: BindGroup,
+    blit: BindGroup,
 }
 
 #[derive(Resource)]
 struct ErosionBuffers {
     uniform: UniformBuffer<ErodeParams>,
+    height: StorageBuffer<Vec<f32>>,
     random: StorageBuffer<Vec<u32>>,
     brush_idx: StorageBuffer<Vec<i32>>,
     brush_w: StorageBuffer<Vec<f32>>,
@@ -296,10 +252,8 @@ fn init_erosion_pipeline(
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadOnly),
-                texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::WriteOnly),
+                storage_buffer::<f32>(false),
                 uniform_buffer::<ErodeParams>(false),
-                // random_indices, brush_indices, brush_weights (no dynamic offsets)
                 storage_buffer_read_only::<u32>(false),
                 storage_buffer_read_only::<i32>(false),
                 storage_buffer_read_only::<f32>(false),
@@ -313,7 +267,6 @@ fn init_erosion_pipeline(
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                texture_2d(TextureSampleType::Float { filterable: false }),
                 texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
             ),
         ),
@@ -324,12 +277,6 @@ fn init_erosion_pipeline(
         layout: vec![layout_erosion.clone()],
         shader: shader.clone(),
         entry_point: Some(Cow::from("init_fbm")),
-        ..default()
-    });
-    let pipeline_copy = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        layout: vec![layout_erosion.clone()],
-        shader: shader.clone(),
-        entry_point: Some(Cow::from("copy_height")),
         ..default()
     });
     let pipeline_erode = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
@@ -349,7 +296,6 @@ fn init_erosion_pipeline(
         layout_erosion,
         layout_blit,
         pipeline_init,
-        pipeline_copy,
         pipeline_erode,
         pipeline_blit,
     });
@@ -364,89 +310,79 @@ fn prepare_erosion_bind_groups(
     cpu_buffers: Res<ErosionCpuBuffers>,
     render_device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
+    existing: Option<Res<ErosionBuffers>>,
 ) {
-    let view_a = gpu_images.get(&images.height_a).unwrap();
-    let view_b = gpu_images.get(&images.height_b).unwrap();
     let view_display = gpu_images.get(&images.display).unwrap();
-    let view_dummy_r = gpu_images.get(&images.dummy_read).unwrap();
-    let view_dummy_w = gpu_images.get(&images.dummy_write).unwrap();
 
-    // Create buffers once
-    let mut uniform = UniformBuffer::from(params.clone());
-    uniform.write_buffer(&render_device, &queue);
+    match existing {
+        Some(buffers) => {
+            // Reuse existing buffers, just rebuild bind groups (safe across frames)
+            let erosion = render_device.create_bind_group(
+                None,
+                &pipeline.layout_erosion,
+                &BindGroupEntries::sequential((
+                    &buffers.height,
+                    &buffers.uniform,
+                    &buffers.random,
+                    &buffers.brush_idx,
+                    &buffers.brush_w,
+                )),
+            );
+            let blit = render_device.create_bind_group(
+                None,
+                &pipeline.layout_blit,
+                &BindGroupEntries::sequential((&view_display.texture_view,)),
+            );
+            commands.insert_resource(ErosionBindGroups { erosion, blit });
+        }
+        None => {
+            // Create buffers once
+            let mut uniform = UniformBuffer::from(params.clone());
+            uniform.write_buffer(&render_device, &queue);
 
-    let mut random = StorageBuffer::from(cpu_buffers.random_indices.clone());
-    random.write_buffer(&render_device, &queue);
+            let texels = (params.map_size.x * params.map_size.y) as usize;
+            let mut height = StorageBuffer::from(vec![0.0f32; texels]);
+            height.write_buffer(&render_device, &queue);
+            // Create and fill initial height once using FBM on CPU for now (optional: let GPU init and copy back)
 
-    let mut brush_idx = StorageBuffer::from(cpu_buffers.brush_indices.clone());
-    brush_idx.write_buffer(&render_device, &queue);
+            let mut random = StorageBuffer::from(cpu_buffers.random_indices.clone());
+            random.write_buffer(&render_device, &queue);
 
-    let mut brush_w = StorageBuffer::from(cpu_buffers.brush_weights.clone());
-    brush_w.write_buffer(&render_device, &queue);
+            let mut brush_idx = StorageBuffer::from(cpu_buffers.brush_indices.clone());
+            brush_idx.write_buffer(&render_device, &queue);
 
-    // Erosion bind groups (in=A,out=B) and (in=B,out=A)
-    let erosion_0 = render_device.create_bind_group(
-        None,
-        &pipeline.layout_erosion,
-        &BindGroupEntries::sequential((
-            &view_a.texture_view,
-            &view_b.texture_view,
-            &uniform,
-            &random,
-            &brush_idx,
-            &brush_w,
-        )),
-    );
-    let erosion_1 = render_device.create_bind_group(
-        None,
-        &pipeline.layout_erosion,
-        &BindGroupEntries::sequential((
-            &view_b.texture_view,
-            &view_a.texture_view,
-            &uniform,
-            &random,
-            &brush_idx,
-            &brush_w,
-        )),
-    );
+            let mut brush_w = StorageBuffer::from(cpu_buffers.brush_weights.clone());
+            brush_w.write_buffer(&render_device, &queue);
 
-    // Dummy group0 for blit: bind storage slots with dummy textures so shader's group0 bindings exist
-    let blit_g0_dummy = render_device.create_bind_group(
-        None,
-        &pipeline.layout_erosion,
-        &BindGroupEntries::sequential((
-            &view_dummy_r.texture_view,
-            &view_dummy_w.texture_view,
-            &uniform,
-            &random,
-            &brush_idx,
-            &brush_w,
-        )),
-    );
+            // Build bind groups using these buffers
+            let erosion = render_device.create_bind_group(
+                None,
+                &pipeline.layout_erosion,
+                &BindGroupEntries::sequential((
+                    &height,
+                    &uniform,
+                    &random,
+                    &brush_idx,
+                    &brush_w,
+                )),
+            );
+            let blit = render_device.create_bind_group(
+                None,
+                &pipeline.layout_blit,
+                &BindGroupEntries::sequential((&view_display.texture_view,)),
+            );
 
-    // Blit bind groups: source height (A/B) to display
-    let blit_a = render_device.create_bind_group(
-        None,
-        &pipeline.layout_blit,
-        &BindGroupEntries::sequential((&view_a.texture_view, &view_display.texture_view)),
-    );
-    let blit_b = render_device.create_bind_group(
-        None,
-        &pipeline.layout_blit,
-        &BindGroupEntries::sequential((&view_b.texture_view, &view_display.texture_view)),
-    );
+            // Insert buffers and groups as resources
+            commands.insert_resource(ErosionBuffers { uniform, height, random, brush_idx, brush_w });
+            commands.insert_resource(ErosionBindGroups { erosion, blit });
+        }
+    }
+}
 
-    commands.insert_resource(ErosionBuffers {
-        uniform,
-        random,
-        brush_idx,
-        brush_w,
-    });
-    commands.insert_resource(ErosionBindGroups {
-        erosion: [erosion_0, erosion_1],
-        blit: [blit_a, blit_b],
-        blit_g0_dummy,
-    });
+fn handle_reset_input(keys: Res<ButtonInput<KeyCode>>, mut reset: ResMut<ResetSim>) {
+    if keys.just_pressed(KeyCode::KeyR) {
+        reset.generation = reset.generation.wrapping_add(1);
+    }
 }
 
 enum ErosionState {
@@ -457,12 +393,14 @@ enum ErosionState {
 
 struct ErosionNode {
     state: ErosionState,
+    last_reset_gen: u32,
 }
 
 impl Default for ErosionNode {
     fn default() -> Self {
         Self {
             state: ErosionState::Loading,
+            last_reset_gen: 0,
         }
     }
 }
@@ -471,6 +409,11 @@ impl Node for ErosionNode {
     fn update(&mut self, world: &mut World) {
         let pipeline = world.resource::<ErosionPipeline>();
         let cache = world.resource::<PipelineCache>();
+        let reset = world.resource::<ResetSim>();
+        if reset.generation != self.last_reset_gen {
+            self.last_reset_gen = reset.generation;
+            self.state = ErosionState::Loading;
+        }
         match self.state {
             ErosionState::Loading => match cache.get_compute_pipeline_state(pipeline.pipeline_init)
             {
@@ -484,9 +427,7 @@ impl Node for ErosionNode {
                 _ => {}
             },
             ErosionState::Init => {
-                if let CachedPipelineState::Ok(_) =
-                    cache.get_compute_pipeline_state(pipeline.pipeline_erode)
-                {
+                if let CachedPipelineState::Ok(_) = cache.get_compute_pipeline_state(pipeline.pipeline_erode) {
                     self.state = ErosionState::Erode(0);
                 }
             }
@@ -515,31 +456,19 @@ impl Node for ErosionNode {
         match self.state {
             ErosionState::Loading => {}
             ErosionState::Init => {
-                // Pass 1: init FBM (writes storage)
+                // Pass 1: init FBM (writes buffer)
                 {
                     let mut pass = render_context
                         .command_encoder()
                         .begin_compute_pass(&ComputePassDescriptor::default());
                     let p_init = cache.get_compute_pipeline(pipes.pipeline_init).unwrap();
                     pass.set_pipeline(p_init);
-                    pass.set_bind_group(0, &groups.erosion[0], &[]);
+                    pass.set_bind_group(0, &groups.erosion, &[]);
                     let gx = (params.map_size.x + 7) / 8;
                     let gy = (params.map_size.y + 7) / 8;
                     pass.dispatch_workgroups(gx, gy, 1);
                 }
-                // Pass 1b: copy B->A so both ping-pong textures start identical
-                {
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    let p_copy = cache.get_compute_pipeline(pipes.pipeline_copy).unwrap();
-                    pass.set_pipeline(p_copy);
-                    // erosion[0] is (in=A, out=B) — we want copy from B to A
-                    pass.set_bind_group(0, &groups.erosion[1], &[]);
-                    let gx = (params.map_size.x + 7) / 8;
-                    let gy = (params.map_size.y + 7) / 8;
-                    pass.dispatch_workgroups(gx, gy, 1);
-                }
+                // No intermediate copy; initial FBM is in-place in height
                 // Pass 2: blit (samples)
                 {
                     let mut pass = render_context
@@ -547,28 +476,16 @@ impl Node for ErosionNode {
                         .begin_compute_pass(&ComputePassDescriptor::default());
                     let p_blit = cache.get_compute_pipeline(pipes.pipeline_blit).unwrap();
                     pass.set_pipeline(p_blit);
-                    // group 0: dummy storage + params to satisfy layout; group 1: blit textures
-                    pass.set_bind_group(0, &groups.blit_g0_dummy, &[]);
-                    pass.set_bind_group(1, &groups.blit[1], &[]);
+                    pass.set_bind_group(0, &groups.erosion, &[]);
+                    pass.set_bind_group(1, &groups.blit, &[]);
                     let gx = (params.map_size.x + 7) / 8;
                     let gy = (params.map_size.y + 7) / 8;
                     pass.dispatch_workgroups(gx, gy, 1);
                 }
             }
-            ErosionState::Erode(index) => {
-                // Pass 0: copy in -> out so untouched pixels persist this frame
-                {
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    let p_copy = cache.get_compute_pipeline(pipes.pipeline_copy).unwrap();
-                    pass.set_pipeline(p_copy);
-                    pass.set_bind_group(0, &groups.erosion[index], &[]);
-                    let gx = (params.map_size.x + 7) / 8;
-                    let gy = (params.map_size.y + 7) / 8;
-                    pass.dispatch_workgroups(gx, gy, 1);
-                }
-
+            ErosionState::Erode(_index) => {
+                // If reset happened recently, restore from initial before eroding
+                // (Handled via state transition to Loading/Init above)
                 // Pass 1: erode (writes storage)
                 {
                     let mut pass = render_context
@@ -576,7 +493,7 @@ impl Node for ErosionNode {
                         .begin_compute_pass(&ComputePassDescriptor::default());
                     let p_erode = cache.get_compute_pipeline(pipes.pipeline_erode).unwrap();
                     pass.set_pipeline(p_erode);
-                    pass.set_bind_group(0, &groups.erosion[index], &[]);
+                    pass.set_bind_group(0, &groups.erosion, &[]);
                     let workgroups = (params.num_particles + 1023) / 1024;
                     pass.dispatch_workgroups(workgroups, 1, 1);
                 }
@@ -587,10 +504,8 @@ impl Node for ErosionNode {
                         .begin_compute_pass(&ComputePassDescriptor::default());
                     let p_blit = cache.get_compute_pipeline(pipes.pipeline_blit).unwrap();
                     pass.set_pipeline(p_blit);
-                    // group 0: dummy storage + params to satisfy layout; group 1: blit textures
-                    pass.set_bind_group(0, &groups.blit_g0_dummy, &[]);
-                    let blit_src = if index == 0 { 1 } else { 0 };
-                    pass.set_bind_group(1, &groups.blit[blit_src], &[]);
+                    pass.set_bind_group(0, &groups.erosion, &[]);
+                    pass.set_bind_group(1, &groups.blit, &[]);
                     let gx = (params.map_size.x + 7) / 8;
                     let gy = (params.map_size.y + 7) / 8;
                     pass.dispatch_workgroups(gx, gy, 1);

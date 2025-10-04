@@ -59,7 +59,7 @@ fn vertex(v: VertexIn) -> VertexOut {
 @fragment
 fn fragment(v: VertexOut) -> @location(0) vec4<f32> {
     let color = v.normal * 0.5 + 0.5;
-    return vec4(color, 1.0);
+    return vec4(pow(color, vec3(2.2)), 1.0);
 }
 
 
