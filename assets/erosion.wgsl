@@ -87,8 +87,6 @@ fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     height[idx] = hval;
 }
 
-// No copy pass needed with in-place buffer
-
 fn load_height(p: vec2<i32>) -> f32 {
     let size = i32(params.map_size.x);
     let idx = u32(p.y * size + p.x);
@@ -119,7 +117,7 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     let size = i32(params.map_size.x);
     let index = i32(random_indices[gid.x]);
     var posX = f32(index % size);
-    var posY = f32(index / size);
+    var posY = f32(index) / f32(size);
     var dirX = 0.0;
     var dirY = 0.0;
     var speed = params.start_speed;
@@ -140,9 +138,11 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
         dirX /= len; dirY /= len;
         posX += dirX; posY += dirY;
 
+        // Stop if not moving or if leaving the safe interior region.
+        // Match reference: rely on a one-cell margin around edges for bilinear sampling.
         if ((dirX == 0.0 && dirY == 0.0) ||
-            posX < f32(params.border_size) || posX > f32(size - i32(params.border_size)) ||
-            posY < f32(params.border_size) || posY > f32(size - i32(params.border_size))) {
+            posX < f32(params.border_size) || posX >= f32(size - 1 - i32(params.border_size)) ||
+            posY < f32(params.border_size) || posY >= f32(size - 1 - i32(params.border_size))) {
             break;
         }
 
@@ -170,14 +170,18 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
             height[iSE] = height[iSE] + deposit * wSE;
         } else {
             let amountToErode = min((cap - sediment) * params.erode_speed, -deltaH);
+            let size_i = i32(params.map_size.x);
+            let map_len = size_i * size_i;
             for (var i: u32 = 0u; i < params.brush_length; i = i + 1u) {
                 let erodeIndex = dropletIndex + brush_indices[i];
-                let idx = u32(erodeIndex);
-                let current = height[idx];
-                let weighted = amountToErode * brush_weights[i];
-                let delta = select(weighted, current, current < weighted);
-                height[idx] = current - delta;
-                sediment += delta;
+                if (erodeIndex >= 0 && erodeIndex < map_len) {
+                    let idx = u32(erodeIndex);
+                    let current = height[idx];
+                    let weighted = amountToErode * brush_weights[i];
+                    let delta = select(weighted, current, current < weighted);
+                    height[idx] = current - delta;
+                    sediment += delta;
+                }
             }
         }
 

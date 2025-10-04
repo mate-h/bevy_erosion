@@ -37,7 +37,7 @@ fn main() {
         ))
         .add_plugins(terrain_pipeline::TerrainPlugin)
         .add_systems(Startup, (setup, spawn_terrain))
-        .add_systems(Update, handle_reset_input)
+        .add_systems(Update, (handle_reset_input, handle_sim_input))
         .run();
 }
 
@@ -76,6 +76,12 @@ struct ResetSim {
     generation: u32,
 }
 
+#[derive(Resource, Clone, ExtractResource, Default)]
+struct SimControl {
+    paused: bool,
+    step_counter: u64,
+}
+
 fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     // Display texture (rgba8unorm) written by compute blit
     let mut display = Image::new_target_texture(SIZE.x, SIZE.y, TextureFormat::Rgba8Unorm);
@@ -84,29 +90,19 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
     let display_handle = images.add(display);
 
-    // commands.spawn((
-    //     Sprite {
-    //         image: display_handle.clone(),
-    //         custom_size: Some(SIZE.as_vec2()),
-    //         ..default()
-    //     },
-    //     Transform::from_scale(Vec3::splat(DISPLAY_FACTOR as f32)),
-    // ));
-    // commands.spawn(Camera2d);
-
     commands.insert_resource(ErosionImages { display: display_handle });
 
     // Parameters
     let brush_radius: i32 = 3;
     let (brush_indices, brush_weights) = build_brush(SIZE.x as i32, brush_radius);
-    let num_particles: u32 = 60_000;
+    let num_particles: u32 = 10_000;
     let random_indices = generate_random_indices(num_particles, (SIZE.x * SIZE.y) as u32);
 
     commands.insert_resource(ErodeParams {
         map_size: SIZE,
         max_lifetime: 30,
-        border_size: brush_radius as u32,
-        inertia: 0.05,
+        border_size: 0,
+        inertia: 0.5,
         sediment_capacity_factor: 4.0,
         min_sediment_capacity: 0.01,
         deposit_speed: 0.3,
@@ -124,6 +120,7 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         brush_weights,
     });
     commands.insert_resource(ResetSim::default());
+    commands.insert_resource(SimControl::default());
 }
 
 fn spawn_terrain(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
@@ -171,11 +168,13 @@ fn build_brush(map_size: i32, radius: i32) -> (Vec<i32>, Vec<f32>) {
     let mut idx = Vec::new();
     let mut w = Vec::new();
     let r2 = (radius * radius) as f32;
+    let r = radius as f32;
     for y in -radius..=radius {
         for x in -radius..=radius {
             let d2 = (x * x + y * y) as f32;
             if d2 <= r2 {
-                let weight = 1.0 - (d2 / r2);
+                // Match Sebastian Lague's weighting: 1 - sqrt(distance) / radius
+                let weight = 1.0 - (d2.sqrt() / r);
                 idx.push(y * map_size + x);
                 w.push(weight.max(0.0));
             }
@@ -200,6 +199,7 @@ impl Plugin for ErosionComputePlugin {
             ExtractResourcePlugin::<ErodeParams>::default(),
             ExtractResourcePlugin::<ErosionCpuBuffers>::default(),
             ExtractResourcePlugin::<ResetSim>::default(),
+            ExtractResourcePlugin::<SimControl>::default(),
         ));
 
         let render_app = app.sub_app_mut(RenderApp);
@@ -385,6 +385,15 @@ fn handle_reset_input(keys: Res<ButtonInput<KeyCode>>, mut reset: ResMut<ResetSi
     }
 }
 
+fn handle_sim_input(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<SimControl>) {
+    if keys.just_pressed(KeyCode::Space) {
+        sim.paused = !sim.paused;
+    }
+    if sim.paused && keys.just_pressed(KeyCode::KeyE) {
+        sim.step_counter = sim.step_counter.wrapping_add(1);
+    }
+}
+
 enum ErosionState {
     Loading,
     Init,
@@ -394,6 +403,8 @@ enum ErosionState {
 struct ErosionNode {
     state: ErosionState,
     last_reset_gen: u32,
+    allow_erode_this_frame: bool,
+    last_step_seen: u64,
 }
 
 impl Default for ErosionNode {
@@ -401,6 +412,8 @@ impl Default for ErosionNode {
         Self {
             state: ErosionState::Loading,
             last_reset_gen: 0,
+            allow_erode_this_frame: true,
+            last_step_seen: 0,
         }
     }
 }
@@ -410,9 +423,20 @@ impl Node for ErosionNode {
         let pipeline = world.resource::<ErosionPipeline>();
         let cache = world.resource::<PipelineCache>();
         let reset = world.resource::<ResetSim>();
+        let sim = world.resource::<SimControl>();
         if reset.generation != self.last_reset_gen {
             self.last_reset_gen = reset.generation;
             self.state = ErosionState::Loading;
+        }
+        if sim.paused {
+            if sim.step_counter > self.last_step_seen {
+                self.allow_erode_this_frame = true;
+                self.last_step_seen = sim.step_counter;
+            } else {
+                self.allow_erode_this_frame = false;
+            }
+        } else {
+            self.allow_erode_this_frame = true;
         }
         match self.state {
             ErosionState::Loading => match cache.get_compute_pipeline_state(pipeline.pipeline_init)
@@ -486,8 +510,8 @@ impl Node for ErosionNode {
             ErosionState::Erode(_index) => {
                 // If reset happened recently, restore from initial before eroding
                 // (Handled via state transition to Loading/Init above)
-                // Pass 1: erode (writes storage)
-                {
+                // Pass 1: erode (writes storage) — gated by pause/step
+                if self.allow_erode_this_frame {
                     let mut pass = render_context
                         .command_encoder()
                         .begin_compute_pass(&ComputePassDescriptor::default());
