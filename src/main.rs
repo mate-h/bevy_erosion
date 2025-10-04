@@ -1,5 +1,6 @@
 use bevy::{
     asset::RenderAssetUsages,
+    pbr::{ExtendedMaterial, MaterialExtension, MaterialPlugin, OpaqueRendererMethod},
     prelude::*,
     render::{
         Render, RenderApp, RenderStartup, RenderSystems,
@@ -15,15 +16,13 @@ use bevy::{
         renderer::{RenderContext, RenderDevice, RenderQueue},
         texture::GpuImage,
     },
-    shader::PipelineCacheError,
+    shader::{PipelineCacheError, ShaderRef},
 };
 use std::borrow::Cow;
-mod terrain_pipeline;
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
 
-use crate::terrain_pipeline::TerrainMarker;
-
 const EROSION_SHADER: &str = "erosion.wgsl";
+const TERRAIN_SHADER: &str = "terrain_extended.wgsl";
 
 const SIZE: UVec2 = UVec2::new(512, 512);
 
@@ -34,9 +33,10 @@ fn main() {
             DefaultPlugins,
             ErosionComputePlugin,
             PanOrbitCameraPlugin,
+            MaterialPlugin::<TerrainMaterial>::default(),
         ))
-        .add_plugins(terrain_pipeline::TerrainPlugin)
-        .add_systems(Startup, (setup, spawn_terrain))
+        .add_systems(Startup, setup)
+        .add_systems(PostStartup, spawn_terrain)
         .add_systems(Update, (handle_reset_input, handle_sim_input))
         .run();
 }
@@ -44,6 +44,43 @@ fn main() {
 #[derive(Resource, Clone, ExtractResource)]
 struct ErosionImages {
     display: Handle<Image>,
+    color: Handle<Image>,
+}
+
+type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
+
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
+struct TerrainExtension {
+    // Height map sampled in vertex shader
+    #[texture(100)]
+    #[sampler(101)]
+    height_tex: Handle<Image>,
+    // Color map sampled in fragment shader
+    #[texture(102)]
+    #[sampler(103)]
+    color_tex: Handle<Image>,
+    // Displacement height scale
+    #[uniform(104)]
+    height_scale: f32,
+}
+
+impl Default for TerrainExtension {
+    fn default() -> Self {
+        Self {
+            height_tex: Default::default(),
+            color_tex: Default::default(),
+            height_scale: 50.0,
+        }
+    }
+}
+
+impl MaterialExtension for TerrainExtension {
+    fn vertex_shader() -> ShaderRef {
+        TERRAIN_SHADER.into()
+    }
+    fn fragment_shader() -> ShaderRef {
+        TERRAIN_SHADER.into()
+    }
 }
 
 #[derive(Resource, Clone, ExtractResource, ShaderType)]
@@ -90,7 +127,14 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
     let display_handle = images.add(display);
 
-    commands.insert_resource(ErosionImages { display: display_handle });
+    // Color texture (rgba8unorm) used as storage for color advection and sampled in terrain shader
+    let mut color = Image::new_target_texture(SIZE.x, SIZE.y, TextureFormat::Rgba8Unorm);
+    color.asset_usage = RenderAssetUsages::RENDER_WORLD;
+    color.texture_descriptor.usage =
+        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
+    let color_handle = images.add(color);
+
+    commands.insert_resource(ErosionImages { display: display_handle, color: color_handle });
 
     // Parameters
     let brush_radius: i32 = 3;
@@ -123,7 +167,12 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     commands.insert_resource(SimControl::default());
 }
 
-fn spawn_terrain(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
+fn spawn_terrain(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>, 
+    mut materials: ResMut<Assets<TerrainMaterial>>,
+    erosion_images: Res<ErosionImages>,
+) {
     // Spawn a subdivided plane with UVs
     let size = 256.0;
     let resolution = 255; // subdivisions
@@ -136,17 +185,35 @@ fn spawn_terrain(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     );
     let mesh_handle = meshes.add(plane);
 
-    commands.spawn((
-        TerrainMarker,
-        Mesh3d(mesh_handle),
-        Transform::from_xyz(0.0, 0.0, 0.0),
-    ));
+    let mat_handle = materials.add(ExtendedMaterial {
+        base: StandardMaterial {
+            base_color: Color::srgb(1.0, 1.0, 1.0),
+            perceptual_roughness: 0.8,
+            metallic: 0.0,
+            opaque_render_method: OpaqueRendererMethod::Auto,
+            ..Default::default()
+        },
+        extension: TerrainExtension {
+            height_tex: erosion_images.display.clone(),
+            color_tex: erosion_images.color.clone(),
+            height_scale: 50.0,
+        },
+    });
+
+    commands.spawn((Mesh3d(mesh_handle), MeshMaterial3d(mat_handle), Transform::from_xyz(0.0, 0.0, 0.0)));
 
     // 3D camera
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(150.0, 150.0, 150.0).looking_at(Vec3::ZERO, Vec3::Y),
         PanOrbitCamera::default(),
+    ));
+
+    // Directional light for PBR shading
+    commands.spawn((
+        DirectionalLight::default(),
+        Transform::from_xyz(0.0, 100.0, 0.0)
+            .looking_at(Vec3::new(-0.5, -1.0, -0.3), Vec3::Y),
     ));
 }
 
@@ -219,8 +286,10 @@ impl Plugin for ErosionComputePlugin {
 #[derive(Resource)]
 struct ErosionPipeline {
     layout_erosion: BindGroupLayout,
+    layout_color: BindGroupLayout,
     layout_blit: BindGroupLayout,
     pipeline_init: CachedComputePipelineId,
+    pipeline_init_color: CachedComputePipelineId,
     pipeline_erode: CachedComputePipelineId,
     pipeline_blit: CachedComputePipelineId,
 }
@@ -228,6 +297,7 @@ struct ErosionPipeline {
 #[derive(Resource)]
 struct ErosionBindGroups {
     erosion: BindGroup,
+    color: BindGroup,
     blit: BindGroup,
 }
 
@@ -272,6 +342,20 @@ fn init_erosion_pipeline(
         ),
     );
 
+    // Layout for color (group 1 for erosion/color init)
+    let layout_color = render_device.create_bind_group_layout(
+        "ErosionColorGroup1",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                texture_storage_2d(
+                    TextureFormat::Rgba8Unorm,
+                    StorageTextureAccess::ReadWrite,
+                ),
+            ),
+        ),
+    );
+
     let shader = asset_server.load(EROSION_SHADER);
     let pipeline_init = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         layout: vec![layout_erosion.clone()],
@@ -279,8 +363,14 @@ fn init_erosion_pipeline(
         entry_point: Some(Cow::from("init_fbm")),
         ..default()
     });
+    let pipeline_init_color = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        layout: vec![layout_erosion.clone(), layout_color.clone()],
+        shader: shader.clone(),
+        entry_point: Some(Cow::from("init_color_bands")),
+        ..default()
+    });
     let pipeline_erode = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        layout: vec![layout_erosion.clone()],
+        layout: vec![layout_erosion.clone(), layout_color.clone()],
         shader: shader.clone(),
         entry_point: Some(Cow::from("erode")),
         ..default()
@@ -294,8 +384,10 @@ fn init_erosion_pipeline(
 
     commands.insert_resource(ErosionPipeline {
         layout_erosion,
+        layout_color,
         layout_blit,
         pipeline_init,
+        pipeline_init_color,
         pipeline_erode,
         pipeline_blit,
     });
@@ -313,6 +405,7 @@ fn prepare_erosion_bind_groups(
     existing: Option<Res<ErosionBuffers>>,
 ) {
     let view_display = gpu_images.get(&images.display).unwrap();
+    let view_color = gpu_images.get(&images.color).unwrap();
 
     match existing {
         Some(buffers) => {
@@ -333,7 +426,12 @@ fn prepare_erosion_bind_groups(
                 &pipeline.layout_blit,
                 &BindGroupEntries::sequential((&view_display.texture_view,)),
             );
-            commands.insert_resource(ErosionBindGroups { erosion, blit });
+            let color = render_device.create_bind_group(
+                None,
+                &pipeline.layout_color,
+                &BindGroupEntries::sequential((&view_color.texture_view,)),
+            );
+            commands.insert_resource(ErosionBindGroups { erosion, color, blit });
         }
         None => {
             // Create buffers once
@@ -371,10 +469,15 @@ fn prepare_erosion_bind_groups(
                 &pipeline.layout_blit,
                 &BindGroupEntries::sequential((&view_display.texture_view,)),
             );
+            let color = render_device.create_bind_group(
+                None,
+                &pipeline.layout_color,
+                &BindGroupEntries::sequential((&view_color.texture_view,)),
+            );
 
             // Insert buffers and groups as resources
             commands.insert_resource(ErosionBuffers { uniform, height, random, brush_idx, brush_w });
-            commands.insert_resource(ErosionBindGroups { erosion, blit });
+            commands.insert_resource(ErosionBindGroups { erosion, color, blit });
         }
     }
 }
@@ -492,6 +595,21 @@ impl Node for ErosionNode {
                     let gy = (params.map_size.y + 7) / 8;
                     pass.dispatch_workgroups(gx, gy, 1);
                 }
+                // Pass 1b: init color bands (uses height as input, writes color storage texture)
+                if let Some(p_color_ok) = match cache.get_compute_pipeline_state(pipes.pipeline_init_color) {
+                    CachedPipelineState::Ok(_) => cache.get_compute_pipeline(pipes.pipeline_init_color),
+                    _ => None,
+                } {
+                    let mut pass = render_context
+                        .command_encoder()
+                        .begin_compute_pass(&ComputePassDescriptor::default());
+                    pass.set_pipeline(p_color_ok);
+                    pass.set_bind_group(0, &groups.erosion, &[]);
+                    pass.set_bind_group(1, &groups.color, &[]);
+                    let gx = (params.map_size.x + 7) / 8;
+                    let gy = (params.map_size.y + 7) / 8;
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
                 // No intermediate copy; initial FBM is in-place in height
                 // Pass 2: blit (samples)
                 {
@@ -518,6 +636,7 @@ impl Node for ErosionNode {
                     let p_erode = cache.get_compute_pipeline(pipes.pipeline_erode).unwrap();
                     pass.set_pipeline(p_erode);
                     pass.set_bind_group(0, &groups.erosion, &[]);
+                    pass.set_bind_group(1, &groups.color, &[]);
                     let workgroups = (params.num_particles + 1023) / 1024;
                     pass.dispatch_workgroups(workgroups, 1, 1);
                 }

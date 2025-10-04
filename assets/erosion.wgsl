@@ -30,6 +30,9 @@ struct ErodeParams {
 @group(0) @binding(3) var<storage, read> brush_indices: array<i32>;
 @group(0) @binding(4) var<storage, read> brush_weights: array<f32>;
 
+// Color image as read-write storage texture
+@group(1) @binding(0) var color_image: texture_storage_2d<rgba8unorm, read_write>;
+
 fn rand_hash(v: u32) -> u32 {
     var x = v;
     x ^= 2747636419u;
@@ -87,6 +90,31 @@ fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     height[idx] = hval;
 }
 
+fn band_color_from_height(h: f32) -> vec3<f32> {
+    // Simple banding: water/sand/grass/rock/snow
+    if (h < 0.25) {
+        return vec3<f32>(0.08, 0.35, 0.65); // water/deep
+    } else if (h < 0.35) {
+        return vec3<f32>(0.76, 0.70, 0.50); // sand
+    } else if (h < 0.60) {
+        return vec3<f32>(0.20, 0.55, 0.25); // grass
+    } else if (h < 0.80) {
+        return vec3<f32>(0.40, 0.40, 0.40); // rock
+    } else {
+        return vec3<f32>(0.95, 0.95, 0.95); // snow
+    }
+}
+
+@compute @workgroup_size(8,8,1)
+fn init_color_bands(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
+    let size = i32(params.map_size.x);
+    let idx = u32(gid.y * params.map_size.x + gid.x);
+    let h = clamp(height[idx], 0.0, 1.0);
+    let c = band_color_from_height(h);
+    textureStore(color_image, vec2<i32>(gid.xy), vec4<f32>(c, 1.0));
+}
+
 fn load_height(p: vec2<i32>) -> f32 {
     let size = i32(params.map_size.x);
     let idx = u32(p.y * size + p.x);
@@ -124,6 +152,12 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     var water = params.start_water;
     var sediment = 0.0;
 
+    // droplet carries color sampled from the initial position
+    var droplet_color = textureLoad(
+        color_image,
+        vec2<i32>(i32(floor(posX)), i32(floor(posY)))
+    ).xyz;
+
     for (var life: u32 = 0u; life < params.max_lifetime; life = life + 1u) {
         let nodeX = i32(floor(posX));
         let nodeY = i32(floor(posY));
@@ -136,6 +170,7 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
         dirY = dirY * params.inertia - hg.y * (1.0 - params.inertia);
         let len = max(0.01, length(vec2<f32>(dirX, dirY)));
         dirX /= len; dirY /= len;
+        let prevX = posX; let prevY = posY;
         posX += dirX; posY += dirY;
 
         // Stop if not moving or if leaving the safe interior region.
@@ -168,6 +203,21 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
             height[iNE] = height[iNE] + deposit * wNE;
             height[iSW] = height[iSW] + deposit * wSW;
             height[iSE] = height[iSE] + deposit * wSE;
+
+            // Blend carried color into deposited texels
+            let pNW = vec2<i32>(nodeX, nodeY);
+            let pNE = vec2<i32>(nodeX + 1, nodeY);
+            let pSW = vec2<i32>(nodeX, nodeY + 1);
+            let pSE = vec2<i32>(nodeX + 1, nodeY + 1);
+            let cNW = textureLoad(color_image, pNW).xyz;
+            let cNE = textureLoad(color_image, pNE).xyz;
+            let cSW = textureLoad(color_image, pSW).xyz;
+            let cSE = textureLoad(color_image, pSE).xyz;
+            let blend = clamp(deposit * 4.0, 0.0, 1.0);
+            textureStore(color_image, pNW, vec4<f32>(mix(cNW, droplet_color, blend * wNW), 1.0));
+            textureStore(color_image, pNE, vec4<f32>(mix(cNE, droplet_color, blend * wNE), 1.0));
+            textureStore(color_image, pSW, vec4<f32>(mix(cSW, droplet_color, blend * wSW), 1.0));
+            textureStore(color_image, pSE, vec4<f32>(mix(cSE, droplet_color, blend * wSE), 1.0));
         } else {
             let amountToErode = min((cap - sediment) * params.erode_speed, -deltaH);
             let size_i = i32(params.map_size.x);
@@ -183,6 +233,12 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
                     sediment += delta;
                 }
             }
+            // Pull color from eroded neighborhood toward carried color
+            let p = vec2<i32>(nodeX, nodeY);
+            let c_here = textureLoad(color_image, p).xyz;
+            let pull = clamp(amountToErode * 2.0, 0.0, 1.0);
+            droplet_color = mix(droplet_color, c_here, 0.25);
+            textureStore(color_image, p, vec4<f32>(mix(c_here, droplet_color, pull), 1.0));
         }
 
         speed = sqrt(max(0.0, speed * speed + deltaH * params.gravity));
