@@ -31,7 +31,7 @@ struct ErodeParams {
 @group(0) @binding(4) var<storage, read> brush_weights: array<f32>;
 
 // Color image as read-write storage texture
-@group(1) @binding(0) var color_image: texture_storage_2d<rgba8unorm, read_write>;
+@group(1) @binding(0) var color_image: texture_storage_2d<rgba16float, read_write>;
 
 fn rand_hash(v: u32) -> u32 {
     var x = v;
@@ -97,9 +97,9 @@ fn band_color_from_height(h: f32) -> vec3<f32> {
     } else if (h < 0.35) {
         return vec3<f32>(0.76, 0.70, 0.50); // sand
     } else if (h < 0.60) {
-        return vec3<f32>(0.20, 0.55, 0.25); // grass
+        return vec3<f32>(0.20, 0.55, 0.25) * 0.5; // grass
     } else if (h < 0.80) {
-        return vec3<f32>(0.40, 0.40, 0.40); // rock
+        return vec3<f32>(0.40, 0.40, 0.40) * 0.5; // rock
     } else {
         return vec3<f32>(0.95, 0.95, 0.95); // snow
     }
@@ -213,7 +213,7 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
             let cNE = textureLoad(color_image, pNE).xyz;
             let cSW = textureLoad(color_image, pSW).xyz;
             let cSE = textureLoad(color_image, pSE).xyz;
-            let blend = clamp(deposit * 4.0, 0.0, 1.0);
+            let blend = clamp(deposit * 100.0, 0.0, 1.0);
             textureStore(color_image, pNW, vec4<f32>(mix(cNW, droplet_color, blend * wNW), 1.0));
             textureStore(color_image, pNE, vec4<f32>(mix(cNE, droplet_color, blend * wNE), 1.0));
             textureStore(color_image, pSW, vec4<f32>(mix(cSW, droplet_color, blend * wSW), 1.0));
@@ -236,8 +236,8 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
             // Pull color from eroded neighborhood toward carried color
             let p = vec2<i32>(nodeX, nodeY);
             let c_here = textureLoad(color_image, p).xyz;
-            let pull = clamp(amountToErode * 2.0, 0.0, 1.0);
-            droplet_color = mix(droplet_color, c_here, 0.25);
+            let pull = clamp(amountToErode * 6.0, 0.0, 1.0);
+            droplet_color = mix(droplet_color, c_here, 0.10);
             textureStore(color_image, p, vec4<f32>(mix(c_here, droplet_color, pull), 1.0));
         }
 
@@ -246,17 +246,39 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
-@group(1) @binding(0) var display_out: texture_storage_2d<rgba8unorm, write>;
+@group(1) @binding(0) var display_out: texture_storage_2d<rgba16float, write>;
+@group(1) @binding(1) var normal_out: texture_storage_2d<rgba16float, write>;
 
 @compute @workgroup_size(8,8,1)
 fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
-    let size = i32(params.map_size.x);
-    let p = vec2<i32>(gid.xy);
-    let idx = u32(p.y * size + p.x);
+    let size_x = i32(params.map_size.x);
+    let size_y = i32(params.map_size.y);
+    let px = i32(gid.x);
+    let py = i32(gid.y);
+    let idx = u32(py * size_x + px);
     let h = height[idx];
+
+    // grayscale height to display
     let c = clamp(h, 0.0, 1.0);
-    textureStore(display_out, vec2<i32>(gid.xy), vec4<f32>(c, c, c, 1.0));
+    textureStore(display_out, vec2<i32>(px, py), vec4<f32>(c, c, c, 1.0));
+
+    // compute normals from central differences of height field
+    let xm1 = max(px - 1, 0);
+    let xp1 = min(px + 1, size_x - 1);
+    let ym1 = max(py - 1, 0);
+    let yp1 = min(py + 1, size_y - 1);
+
+    let hL = height[u32(py * size_x + xm1)];
+    let hR = height[u32(py * size_x + xp1)];
+    let hD = height[u32(ym1 * size_x + px)];
+    let hU = height[u32(yp1 * size_x + px)];
+
+    let dx = hR - hL;
+    let dy = hU - hD;
+    let n = normalize(vec3<f32>(-dx, 1.0, -dy));
+    let enc = n * 0.5 + vec3<f32>(0.5, 0.5, 0.5);
+    textureStore(normal_out, vec2<i32>(px, py), vec4<f32>(enc, 1.0));
 }
 
 

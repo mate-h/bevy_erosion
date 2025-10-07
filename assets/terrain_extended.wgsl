@@ -68,6 +68,18 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     var out: FragmentOutput;
     out.color = apply_pbr_lighting(pbr_input);
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
+
+    // Transform to view space by differencing two nearby points in view space
+    let n_world = in.world_normal;
+    let p0_view = position_world_to_view(in.world_position.xyz).xyz;
+    let p1_view = position_world_to_view(in.world_position.xyz + n_world * 0.01).xyz;
+    let n_view = normalize(p1_view - p0_view);
+
+    // color by the view normal
+    // let color = n_view * 0.5 + 0.5;
+    // out.color = vec4(pow(color, vec3(2.2)), 1.0);
+
+    // out.color = albedo;
     return out;
 }
 

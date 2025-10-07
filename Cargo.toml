@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = "0.17.0"
+bevy = { git = "https://github.com/mate-h/bevy", branch = "m/atmosphere-occlusion" }
 bevy_panorbit_camera = { git = "https://github.com/kristoff3r/bevy_panorbit_camera", branch = "master" }
