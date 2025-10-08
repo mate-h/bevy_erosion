@@ -87,18 +87,19 @@ fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uv = vec2<f32>(gid.xy);
     let hval = fbm(uv);
     let idx = gid.y * params.map_size.x + gid.x;
-    height[idx] = hval;
+    height[idx] = hval * 1.0;
 }
 
 fn band_color_from_height(h: f32) -> vec3<f32> {
     // Simple banding: water/sand/grass/rock/snow
-    if (h < 0.25) {
+    let o = 0.0;
+    if (h < 0.25 + o) {
         return vec3<f32>(0.08, 0.35, 0.65); // water/deep
-    } else if (h < 0.35) {
+    } else if (h < 0.35 + o) {
         return vec3<f32>(0.76, 0.70, 0.50); // sand
-    } else if (h < 0.60) {
+    } else if (h < 0.60 + o) {
         return vec3<f32>(0.20, 0.55, 0.25) * 0.5; // grass
-    } else if (h < 0.80) {
+    } else if (h < 0.80 + o) {
         return vec3<f32>(0.40, 0.40, 0.40) * 0.5; // rock
     } else {
         return vec3<f32>(0.95, 0.95, 0.95); // snow
@@ -110,7 +111,7 @@ fn init_color_bands(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
     let size = i32(params.map_size.x);
     let idx = u32(gid.y * params.map_size.x + gid.x);
-    let h = clamp(height[idx], 0.0, 1.0);
+    let h = height[idx];
     let c = band_color_from_height(h);
     textureStore(color_image, vec2<i32>(gid.xy), vec4<f32>(c, 1.0));
 }
@@ -260,7 +261,7 @@ fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
     let h = height[idx];
 
     // grayscale height to display
-    let c = clamp(h, 0.0, 1.0);
+    let c = h;
     textureStore(display_out, vec2<i32>(px, py), vec4<f32>(c, c, c, 1.0));
 
     // compute normals from central differences of height field

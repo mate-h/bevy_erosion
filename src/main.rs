@@ -157,16 +157,16 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     });
 
     // Parameters
-    let brush_radius: i32 = 3;
+    let brush_radius: i32 = 16;
     let (brush_indices, brush_weights) = build_brush(SIZE.x as i32, brush_radius);
-    let num_particles: u32 = 10_000;
+    let num_particles: u32 = 1024 * 8;
     let random_indices = generate_random_indices(num_particles, (SIZE.x * SIZE.y) as u32);
 
     commands.insert_resource(ErodeParams {
         map_size: SIZE,
-        max_lifetime: 30,
+        max_lifetime: 60,
         border_size: 0,
-        inertia: 0.5,
+        inertia: 0.05,
         sediment_capacity_factor: 4.0,
         min_sediment_capacity: 0.01,
         deposit_speed: 0.3,
@@ -295,6 +295,19 @@ fn generate_random_indices(count: u32, max_index: u32) -> Vec<u32> {
     v
 }
 
+fn generate_random_indices_seeded(count: u32, max_index: u32, mut state: u64) -> Vec<u32> {
+    let mut v = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        // xorshift64*
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let r = (state.wrapping_mul(2685821657736338717) >> 32) as u32;
+        v.push(if max_index == 0 { 0 } else { r % max_index });
+    }
+    v
+}
+
 fn build_brush(map_size: i32, radius: i32) -> (Vec<i32>, Vec<f32>) {
     let mut idx = Vec::new();
     let mut w = Vec::new();
@@ -372,6 +385,11 @@ struct ErosionBuffers {
     random: StorageBuffer<Vec<u32>>,
     brush_idx: StorageBuffer<Vec<i32>>,
     brush_w: StorageBuffer<Vec<f32>>,
+}
+
+#[derive(Resource, Clone)]
+struct ErosionRngState {
+    state: u64,
 }
 
 fn init_erosion_pipeline(
@@ -465,14 +483,34 @@ fn prepare_erosion_bind_groups(
     cpu_buffers: Res<ErosionCpuBuffers>,
     render_device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
-    existing: Option<Res<ErosionBuffers>>,
+    existing: Option<ResMut<ErosionBuffers>>,
+    mut rng_state: Option<ResMut<ErosionRngState>>,
 ) {
     let view_height = gpu_images.get(&images.height).unwrap();
     let view_color = gpu_images.get(&images.color).unwrap();
     let view_normal = gpu_images.get(&images.normal).unwrap();
 
     match existing {
-        Some(buffers) => {
+        Some(mut buffers) => {
+            // Ensure we have RNG state
+            let mut seed = if let Some(ref rs) = rng_state { rs.state } else { 0xCAFEBABE_1234_5678 };
+            // Regenerate start positions every frame using evolving RNG state
+            let new_random = generate_random_indices_seeded(
+                params.num_particles,
+                params.map_size.x * params.map_size.y,
+                seed,
+            );
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1);
+            if let Some(mut rs) = rng_state {
+                rs.state = seed;
+            } else {
+                commands.insert_resource(ErosionRngState { state: seed });
+            }
+            buffers.random = StorageBuffer::from(new_random);
+            buffers.random.write_buffer(&render_device, &queue);
+
             // Reuse existing buffers, just rebuild bind groups (safe across frames)
             let erosion = render_device.create_bind_group(
                 None,
@@ -514,7 +552,22 @@ fn prepare_erosion_bind_groups(
             height.write_buffer(&render_device, &queue);
             // Create and fill initial height once using FBM on CPU for now (optional: let GPU init and copy back)
 
-            let mut random = StorageBuffer::from(cpu_buffers.random_indices.clone());
+            // Initialize RNG state
+            let mut seed = if let Some(ref rs) = rng_state { rs.state } else { 0xCAFEBABE_1234_5678 };
+            let first_random = generate_random_indices_seeded(
+                params.num_particles,
+                params.map_size.x * params.map_size.y,
+                seed,
+            );
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1);
+            if let Some(mut rs) = rng_state {
+                rs.state = seed;
+            } else {
+                commands.insert_resource(ErosionRngState { state: seed });
+            }
+            let mut random = StorageBuffer::from(first_random);
             random.write_buffer(&render_device, &queue);
 
             let mut brush_idx = StorageBuffer::from(cpu_buffers.brush_indices.clone());
