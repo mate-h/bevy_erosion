@@ -2,6 +2,9 @@
 
 Real-time GPU-accelerated hydraulic erosion simulation built with Bevy.
 
+<img width="688" height="404" alt="Group" src="https://github.com/user-attachments/assets/25b434a1-98d8-4ca7-b5bc-78e681b1b608" />
+
+
 ## Features
 
 - **Particle-based erosion simulation** running entirely on GPU compute shaders
