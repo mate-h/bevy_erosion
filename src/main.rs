@@ -45,7 +45,14 @@ fn main() {
         ))
         .add_systems(Startup, (setup, print_controls))
         .add_systems(PostStartup, spawn_terrain)
-        .add_systems(Update, (handle_reset_input, handle_sim_input))
+        .add_systems(
+            Update,
+            (
+                handle_reset_input,
+                handle_sim_input,
+                handle_preview_mode_input,
+            ),
+        )
         .run();
 }
 
@@ -54,9 +61,21 @@ struct ErosionImages {
     height: Handle<Image>,
     color: Handle<Image>,
     normal: Handle<Image>,
+    analysis: Handle<Image>, // Combined: R=flow_mag, G=sediment, B=erosion, A=flow_dir_encoded
 }
 
 type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Reflect)]
+enum PreviewMode {
+    #[default]
+    Pbr,
+    Flow,
+    Sediment,
+    Erosion,
+    Height,
+    ViewSpaceNormals,
+}
 
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
 struct TerrainExtension {
@@ -68,9 +87,16 @@ struct TerrainExtension {
     #[texture(102)]
     #[sampler(103)]
     color_tex: Handle<Image>,
+    // Analysis texture: R=flow_mag, G=sediment, B=erosion, A=flow_dir_angle
+    #[texture(105)]
+    #[sampler(106)]
+    analysis_tex: Handle<Image>,
     // Displacement height scale
     #[uniform(104)]
     height_scale: f32,
+    // Preview mode: 0=PBR, 1=Flow, 2=Sediment, 3=Erosion, 4=Height, 5=ViewSpaceNormals
+    #[uniform(107)]
+    preview_mode: u32,
 }
 
 impl Default for TerrainExtension {
@@ -78,7 +104,9 @@ impl Default for TerrainExtension {
         Self {
             height_tex: Default::default(),
             color_tex: Default::default(),
+            analysis_tex: Default::default(),
             height_scale: 50.0,
+            preview_mode: 0,
         }
     }
 }
@@ -128,6 +156,11 @@ struct SimControl {
     step_counter: u64,
 }
 
+#[derive(Resource, Default)]
+struct CurrentPreviewMode {
+    mode: PreviewMode,
+}
+
 fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     // Height texture (rgba16float) written by compute blit
     let mut height = Image::new_target_texture(SIZE.x, SIZE.y, TextureFormat::Rgba16Float);
@@ -150,10 +183,19 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
     let normal_handle = images.add(normal);
 
+    // Analysis texture (Rgba16Float) - combined flow/sediment/erosion data
+    // R channel: flow magnitude, G channel: sediment, B channel: erosion, A channel: flow direction encoded
+    let mut analysis = Image::new_target_texture(SIZE.x, SIZE.y, TextureFormat::Rgba16Float);
+    analysis.asset_usage = RenderAssetUsages::RENDER_WORLD;
+    analysis.texture_descriptor.usage =
+        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
+    let analysis_handle = images.add(analysis);
+
     commands.insert_resource(ErosionImages {
         height: height_handle,
         color: color_handle,
         normal: normal_handle,
+        analysis: analysis_handle,
     });
 
     // Parameters
@@ -164,7 +206,7 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
 
     commands.insert_resource(ErodeParams {
         map_size: SIZE,
-        max_lifetime: 60,
+        max_lifetime: 32,
         border_size: 0,
         inertia: 0.05,
         sediment_capacity_factor: 4.0,
@@ -185,6 +227,7 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     });
     commands.insert_resource(ResetSim::default());
     commands.insert_resource(SimControl::default());
+    commands.insert_resource(CurrentPreviewMode::default());
 
     commands.insert_resource(AmbientLight::NONE);
 }
@@ -194,6 +237,12 @@ fn print_controls() {
     println!("  R - reset simulation");
     println!("  Space - pause/resume");
     println!("  E - step one iteration (when paused)");
+    println!("  1 - PBR shading mode (default)");
+    println!("  2 - Flow map preview");
+    println!("  3 - Sediment mask preview");
+    println!("  4 - Erosion mask preview");
+    println!("  5 - Height map preview");
+    println!("  6 - View-space normals preview");
 }
 
 fn spawn_terrain(
@@ -225,7 +274,9 @@ fn spawn_terrain(
         extension: TerrainExtension {
             height_tex: erosion_images.height.clone(),
             color_tex: erosion_images.color.clone(),
+            analysis_tex: erosion_images.analysis.clone(),
             height_scale: 50.0,
+            preview_mode: 0, // Default to PBR
         },
     });
 
@@ -251,7 +302,7 @@ fn spawn_terrain(
             ..Default::default()
         },
         AtmosphereEnvironmentMapLight::default(),
-        Exposure { ev100: 12.0 },
+        Exposure { ev100: 13.0 },
         Tonemapping::AcesFitted,
         Bloom::NATURAL,
     ));
@@ -385,6 +436,9 @@ struct ErosionBuffers {
     random: StorageBuffer<Vec<u32>>,
     brush_idx: StorageBuffer<Vec<i32>>,
     brush_w: StorageBuffer<Vec<f32>>,
+    flow: StorageBuffer<Vec<u32>>,     // atomic<u32> in shader
+    sediment: StorageBuffer<Vec<u32>>, // atomic<u32> in shader
+    erosion: StorageBuffer<Vec<u32>>,  // atomic<u32> in shader
 }
 
 #[derive(Resource, Clone)]
@@ -404,11 +458,14 @@ fn init_erosion_pipeline(
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                storage_buffer::<f32>(false),
+                storage_buffer::<f32>(false), // height
                 uniform_buffer::<ErodeParams>(false),
-                storage_buffer_read_only::<u32>(false),
-                storage_buffer_read_only::<i32>(false),
-                storage_buffer_read_only::<f32>(false),
+                storage_buffer_read_only::<u32>(false), // random_indices
+                storage_buffer_read_only::<i32>(false), // brush_indices
+                storage_buffer_read_only::<f32>(false), // brush_weights
+                storage_buffer::<u32>(false),           // flow (atomic<u32> in shader)
+                storage_buffer::<u32>(false),           // sediment (atomic<u32> in shader)
+                storage_buffer::<u32>(false),           // erosion (atomic<u32> in shader)
             ),
         ),
     );
@@ -419,8 +476,9 @@ fn init_erosion_pipeline(
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
-                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
+                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly), // height display
+                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly), // normal
+                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly), // analysis (flow+sediment+erosion combined)
             ),
         ),
     );
@@ -483,26 +541,45 @@ fn prepare_erosion_bind_groups(
     cpu_buffers: Res<ErosionCpuBuffers>,
     render_device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
-    existing: Option<ResMut<ErosionBuffers>>,
-    mut rng_state: Option<ResMut<ErosionRngState>>,
+    mut existing: Option<ResMut<ErosionBuffers>>,
+    rng_state: Option<ResMut<ErosionRngState>>,
 ) {
     let view_height = gpu_images.get(&images.height).unwrap();
     let view_color = gpu_images.get(&images.color).unwrap();
     let view_normal = gpu_images.get(&images.normal).unwrap();
+    let view_analysis = gpu_images.get(&images.analysis).unwrap();
+
+    // Check if we need to verify buffer structure
+    let needs_recreation = if let Some(ref buffers) = existing {
+        // Check if buffers have correct size for new fields
+        // If any of the analysis buffers are empty/wrong size, recreate
+        buffers.flow.buffer().is_none()
+            || buffers.sediment.buffer().is_none()
+            || buffers.erosion.buffer().is_none()
+    } else {
+        false
+    };
+
+    if needs_recreation {
+        // Force recreation by removing the resource
+        existing = None;
+    }
 
     match existing {
         Some(mut buffers) => {
             // Ensure we have RNG state
-            let mut seed = if let Some(ref rs) = rng_state { rs.state } else { 0xCAFEBABE_1234_5678 };
+            let mut seed = if let Some(ref rs) = rng_state {
+                rs.state
+            } else {
+                0xCAFEBABE_1234_5678
+            };
             // Regenerate start positions every frame using evolving RNG state
             let new_random = generate_random_indices_seeded(
                 params.num_particles,
                 params.map_size.x * params.map_size.y,
                 seed,
             );
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1);
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
             if let Some(mut rs) = rng_state {
                 rs.state = seed;
             } else {
@@ -521,6 +598,9 @@ fn prepare_erosion_bind_groups(
                     &buffers.random,
                     &buffers.brush_idx,
                     &buffers.brush_w,
+                    &buffers.flow,
+                    &buffers.sediment,
+                    &buffers.erosion,
                 )),
             );
             let blit = render_device.create_bind_group(
@@ -529,6 +609,7 @@ fn prepare_erosion_bind_groups(
                 &BindGroupEntries::sequential((
                     &view_height.texture_view,
                     &view_normal.texture_view,
+                    &view_analysis.texture_view,
                 )),
             );
             let color = render_device.create_bind_group(
@@ -553,15 +634,17 @@ fn prepare_erosion_bind_groups(
             // Create and fill initial height once using FBM on CPU for now (optional: let GPU init and copy back)
 
             // Initialize RNG state
-            let mut seed = if let Some(ref rs) = rng_state { rs.state } else { 0xCAFEBABE_1234_5678 };
+            let mut seed = if let Some(ref rs) = rng_state {
+                rs.state
+            } else {
+                0xCAFEBABE_1234_5678
+            };
             let first_random = generate_random_indices_seeded(
                 params.num_particles,
                 params.map_size.x * params.map_size.y,
                 seed,
             );
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1);
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
             if let Some(mut rs) = rng_state {
                 rs.state = seed;
             } else {
@@ -576,11 +659,23 @@ fn prepare_erosion_bind_groups(
             let mut brush_w = StorageBuffer::from(cpu_buffers.brush_weights.clone());
             brush_w.write_buffer(&render_device, &queue);
 
+            // Initialize flow, sediment, erosion buffers (3 u32 per pixel for atomic operations)
+            let mut flow = StorageBuffer::from(vec![0u32; texels * 3]);
+            flow.write_buffer(&render_device, &queue);
+
+            let mut sediment = StorageBuffer::from(vec![0u32; texels * 3]);
+            sediment.write_buffer(&render_device, &queue);
+
+            let mut erosion = StorageBuffer::from(vec![0u32; texels * 3]);
+            erosion.write_buffer(&render_device, &queue);
+
             // Build bind groups using these buffers
-            let erosion = render_device.create_bind_group(
+            let erosion_bg = render_device.create_bind_group(
                 None,
                 &pipeline.layout_erosion,
-                &BindGroupEntries::sequential((&height, &uniform, &random, &brush_idx, &brush_w)),
+                &BindGroupEntries::sequential((
+                    &height, &uniform, &random, &brush_idx, &brush_w, &flow, &sediment, &erosion,
+                )),
             );
             let blit = render_device.create_bind_group(
                 None,
@@ -588,6 +683,7 @@ fn prepare_erosion_bind_groups(
                 &BindGroupEntries::sequential((
                     &view_height.texture_view,
                     &view_normal.texture_view,
+                    &view_analysis.texture_view,
                 )),
             );
             let color = render_device.create_bind_group(
@@ -603,9 +699,12 @@ fn prepare_erosion_bind_groups(
                 random,
                 brush_idx,
                 brush_w,
+                flow,
+                sediment,
+                erosion,
             });
             commands.insert_resource(ErosionBindGroups {
-                erosion,
+                erosion: erosion_bg,
                 color,
                 blit,
             });
@@ -628,10 +727,69 @@ fn handle_sim_input(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<SimControl>
     }
 }
 
+fn handle_preview_mode_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut preview_mode: ResMut<CurrentPreviewMode>,
+    mut materials: ResMut<Assets<TerrainMaterial>>,
+    mut cameras: Query<(&mut Atmosphere, &mut Tonemapping), With<Camera3d>>,
+) {
+    let new_mode = if keys.just_pressed(KeyCode::Digit1) {
+        Some(PreviewMode::Pbr)
+    } else if keys.just_pressed(KeyCode::Digit2) {
+        Some(PreviewMode::Flow)
+    } else if keys.just_pressed(KeyCode::Digit3) {
+        Some(PreviewMode::Sediment)
+    } else if keys.just_pressed(KeyCode::Digit4) {
+        Some(PreviewMode::Erosion)
+    } else if keys.just_pressed(KeyCode::Digit5) {
+        Some(PreviewMode::Height)
+    } else if keys.just_pressed(KeyCode::Digit6) {
+        Some(PreviewMode::ViewSpaceNormals)
+    } else {
+        None
+    };
+
+    if let Some(mode) = new_mode {
+        if preview_mode.mode != mode {
+            preview_mode.mode = mode;
+            println!("Preview mode: {:?}", mode);
+
+            // Update all terrain materials
+            for (_, mat) in materials.iter_mut() {
+                mat.extension.preview_mode = match mode {
+                    PreviewMode::Pbr => 0,
+                    PreviewMode::Flow => 1,
+                    PreviewMode::Sediment => 2,
+                    PreviewMode::Erosion => 3,
+                    PreviewMode::Height => 4,
+                    PreviewMode::ViewSpaceNormals => 5,
+                };
+            }
+
+            // Toggle atmosphere and tonemapping based on mode
+            for (mut atmosphere, mut tonemapping) in cameras.iter_mut() {
+                if mode == PreviewMode::Pbr {
+                    // Enable atmosphere for PBR
+                    *atmosphere = Atmosphere::EARTH;
+                    *tonemapping = Tonemapping::AcesFitted;
+                } else {
+                    // Disable atmosphere for debug modes by setting scattering to 0
+                    *atmosphere = Atmosphere {
+                        rayleigh_scattering: Vec3::ZERO,
+                        mie_scattering: 0.0,
+                        ..default()
+                    };
+                    *tonemapping = Tonemapping::None;
+                }
+            }
+        }
+    }
+}
+
 enum ErosionState {
     Loading,
     Init,
-    Erode(usize),
+    Erode,
 }
 
 struct ErosionNode {
@@ -696,16 +854,10 @@ impl Node for ErosionNode {
                     CachedPipelineState::Ok(_)
                 );
                 if color_ready && erode_ready {
-                    self.state = ErosionState::Erode(0);
+                    self.state = ErosionState::Erode;
                 }
             }
-            ErosionState::Erode(0) => {
-                self.state = ErosionState::Erode(1);
-            }
-            ErosionState::Erode(1) => {
-                self.state = ErosionState::Erode(0);
-            }
-            ErosionState::Erode(_) => {}
+            ErosionState::Erode => {}
         }
     }
 
@@ -769,20 +921,23 @@ impl Node for ErosionNode {
                     pass.dispatch_workgroups(gx, gy, 1);
                 }
             }
-            ErosionState::Erode(_index) => {
+            ErosionState::Erode => {
                 // If reset happened recently, restore from initial before eroding
                 // (Handled via state transition to Loading/Init above)
                 // Pass 1: erode (writes storage) — gated by pause/step
                 if self.allow_erode_this_frame {
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    let p_erode = cache.get_compute_pipeline(pipes.pipeline_erode).unwrap();
-                    pass.set_pipeline(p_erode);
-                    pass.set_bind_group(0, &groups.erosion, &[]);
-                    pass.set_bind_group(1, &groups.color, &[]);
-                    let workgroups = (params.num_particles + 1023) / 1024;
-                    pass.dispatch_workgroups(workgroups, 1, 1);
+                    if let Some(p_erode) = cache.get_compute_pipeline(pipes.pipeline_erode) {
+                        let mut pass = render_context
+                            .command_encoder()
+                            .begin_compute_pass(&ComputePassDescriptor::default());
+                        pass.set_pipeline(p_erode);
+                        pass.set_bind_group(0, &groups.erosion, &[]);
+                        pass.set_bind_group(1, &groups.color, &[]);
+                        let workgroups = (params.num_particles + 1023) / 1024;
+                        pass.dispatch_workgroups(workgroups, 1, 1);
+                    } else {
+                        error!("Erode pipeline not ready!");
+                    }
                 }
                 // Pass 2: blit (samples)
                 {

@@ -30,6 +30,12 @@ struct ErodeParams {
 @group(0) @binding(3) var<storage, read> brush_indices: array<i32>;
 @group(0) @binding(4) var<storage, read> brush_weights: array<f32>;
 
+// Flow, sediment, and erosion accumulation buffers (vec3 per pixel stored as 3 consecutive atomics)
+// Using atomic<u32> to store fixed-point float values (multiply by 10000 to preserve precision)
+@group(0) @binding(5) var<storage, read_write> flow_buffer: array<atomic<u32>>;
+@group(0) @binding(6) var<storage, read_write> sediment_buffer: array<atomic<u32>>;
+@group(0) @binding(7) var<storage, read_write> erosion_buffer: array<atomic<u32>>;
+
 // Color image as read-write storage texture
 @group(1) @binding(0) var color_image: texture_storage_2d<rgba16float, read_write>;
 
@@ -88,6 +94,18 @@ fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     let hval = fbm(uv);
     let idx = gid.y * params.map_size.x + gid.x;
     height[idx] = hval * 1.0;
+    
+    // Clear flow, sediment, and erosion buffers
+    let idx3 = idx * 3u;
+    atomicStore(&flow_buffer[idx3], 0u);
+    atomicStore(&flow_buffer[idx3 + 1u], 0u);
+    atomicStore(&flow_buffer[idx3 + 2u], 0u);
+    atomicStore(&sediment_buffer[idx3], 0u);
+    atomicStore(&sediment_buffer[idx3 + 1u], 0u);
+    atomicStore(&sediment_buffer[idx3 + 2u], 0u);
+    atomicStore(&erosion_buffer[idx3], 0u);
+    atomicStore(&erosion_buffer[idx3 + 1u], 0u);
+    atomicStore(&erosion_buffer[idx3 + 2u], 0u);
 }
 
 fn band_color_from_height(h: f32) -> vec3<f32> {
@@ -152,6 +170,8 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     var speed = params.start_speed;
     var water = params.start_water;
     var sediment = 0.0;
+    var total_erosion = 0.0;
+    var total_deposition = 0.0;
 
     // droplet carries color sampled from the initial position
     var droplet_color = textureLoad(
@@ -189,6 +209,8 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (sediment > cap || deltaH > 0.0) {
             var deposit = select((sediment - cap) * params.deposit_speed, min(deltaH, sediment), deltaH > 0.0);
             sediment -= deposit;
+            total_deposition += deposit;
+            
             // bilinear deposit to 4 corners
             let wNW = (1.0 - cellOffsetX) * (1.0 - cellOffsetY);
             let wNE = cellOffsetX * (1.0 - cellOffsetY);
@@ -204,6 +226,12 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
             height[iNE] = height[iNE] + deposit * wNE;
             height[iSW] = height[iSW] + deposit * wSW;
             height[iSE] = height[iSE] + deposit * wSE;
+            
+            // Accumulate sediment deposition (convert to fixed-point: multiply by 10000)
+            atomicAdd(&sediment_buffer[iNW * 3u], u32(deposit * wNW * 10000.0));
+            atomicAdd(&sediment_buffer[iNE * 3u], u32(deposit * wNE * 10000.0));
+            atomicAdd(&sediment_buffer[iSW * 3u], u32(deposit * wSW * 10000.0));
+            atomicAdd(&sediment_buffer[iSE * 3u], u32(deposit * wSE * 10000.0));
 
             // Blend carried color into deposited texels
             let pNW = vec2<i32>(nodeX, nodeY);
@@ -221,6 +249,7 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
             textureStore(color_image, pSE, vec4<f32>(mix(cSE, droplet_color, blend * wSE), 1.0));
         } else {
             let amountToErode = min((cap - sediment) * params.erode_speed, -deltaH);
+            total_erosion += amountToErode;
             let size_i = i32(params.map_size.x);
             let map_len = size_i * size_i;
             for (var i: u32 = 0u; i < params.brush_length; i = i + 1u) {
@@ -232,6 +261,9 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let delta = select(weighted, current, current < weighted);
                     height[idx] = current - delta;
                     sediment += delta;
+                    
+                    // Accumulate erosion (convert to fixed-point: multiply by 10000)
+                    atomicAdd(&erosion_buffer[idx * 3u], u32(delta * 10000.0));
                 }
             }
             // Pull color from eroded neighborhood toward carried color
@@ -244,11 +276,24 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         speed = sqrt(max(0.0, speed * speed + deltaH * params.gravity));
         water *= (1.0 - params.evaporate_speed);
+        
+        // Accumulate flow (direction + magnitude) at current position
+        // Ensure dropletIndex is valid for the buffer size
+        let map_size_total = i32(params.map_size.x * params.map_size.y);
+        if (dropletIndex >= 0 && dropletIndex < map_size_total) {
+            let flowIdx = u32(dropletIndex) * 3u;
+            let flow_magnitude = speed * water;
+        //     // Convert to fixed-point with offset for signed values: (value + 1000) * 10
+        //     atomicAdd(&flow_buffer[flowIdx], u32((dirX * flow_magnitude + 1000.0) * 10.0));       // x direction
+        //     atomicAdd(&flow_buffer[flowIdx + 1u], u32((dirY * flow_magnitude + 1000.0) * 10.0));  // y direction
+        //     atomicAdd(&flow_buffer[flowIdx + 2u], u32(flow_magnitude * 10000.0));                 // magnitude
+        }
     }
 }
 
 @group(1) @binding(0) var display_out: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(1) var normal_out: texture_storage_2d<rgba16float, write>;
+@group(1) @binding(2) var analysis_out: texture_storage_2d<rgba16float, write>;  // R=flow_mag, G=sediment, B=erosion, A=flow_angle
 
 @compute @workgroup_size(8,8,1)
 fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -280,6 +325,34 @@ fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = normalize(vec3<f32>(-dx, 1.0, -dy));
     let enc = n * 0.5 + vec3<f32>(0.5, 0.5, 0.5);
     textureStore(normal_out, vec2<i32>(px, py), vec4<f32>(enc, 1.0));
+    
+    // Pack flow, sediment, and erosion into single analysis texture
+    let idx3 = idx * 3u;
+    // Convert from fixed-point back to float
+    let flow_x_raw = f32(atomicLoad(&flow_buffer[idx3])) / 10.0 - 1000.0;
+    let flow_y_raw = f32(atomicLoad(&flow_buffer[idx3 + 1u])) / 10.0 - 1000.0;
+    let flow_mag = f32(atomicLoad(&flow_buffer[idx3 + 2u])) / 10000.0;
+    
+    // Calculate flow direction angle (0-1 normalized from 0-2π)
+    var flow_angle = 0.5;  // default to 0.5 (no flow)
+    if (flow_mag > 0.001) {
+        let angle_rad = atan2(flow_y_raw, flow_x_raw);
+        flow_angle = (angle_rad + 3.14159265) / (2.0 * 3.14159265);  // normalize to 0-1
+    }
+    
+    // Sediment and erosion values (convert from fixed-point: divide by 10000, then scale for visibility)
+    // These values accumulate over multiple frames, so we scale them for better visualization
+    let sediment = f32(atomicLoad(&sediment_buffer[idx3])) / 10000.0;
+    let erosion = f32(atomicLoad(&erosion_buffer[idx3])) / 10000.0;
+    
+    // Pack into analysis texture: R=flow_mag, G=sediment, B=erosion, A=flow_angle
+    let analysis = vec4<f32>(
+        clamp(flow_mag * 0.1, 0.0, 1.0),
+        sediment,
+        erosion,
+        flow_angle
+    );
+    textureStore(analysis_out, vec2<i32>(px, py), analysis);
 }
 
 
