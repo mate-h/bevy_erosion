@@ -30,8 +30,8 @@ struct ErodeParams {
 @group(0) @binding(3) var<storage, read> brush_indices: array<i32>;
 @group(0) @binding(4) var<storage, read> brush_weights: array<f32>;
 
-// Flow, sediment, and erosion accumulation buffers (vec3 per pixel stored as 3 consecutive atomics)
-// Using atomic<u32> to store fixed-point float values (multiply by 10000 to preserve precision)
+// Accumulation buffers using atomic<u32> to store fixed-point float values (multiply by 10000)
+// All buffers store 1 u32 per pixel (single scalar value)
 @group(0) @binding(5) var<storage, read_write> flow_buffer: array<atomic<u32>>;
 @group(0) @binding(6) var<storage, read_write> sediment_buffer: array<atomic<u32>>;
 @group(0) @binding(7) var<storage, read_write> erosion_buffer: array<atomic<u32>>;
@@ -95,32 +95,52 @@ fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.y * params.map_size.x + gid.x;
     height[idx] = hval * 1.0;
     
-    // Clear flow, sediment, and erosion buffers
-    let idx3 = idx * 3u;
-    atomicStore(&flow_buffer[idx3], 0u);
-    atomicStore(&flow_buffer[idx3 + 1u], 0u);
-    atomicStore(&flow_buffer[idx3 + 2u], 0u);
-    atomicStore(&sediment_buffer[idx3], 0u);
-    atomicStore(&sediment_buffer[idx3 + 1u], 0u);
-    atomicStore(&sediment_buffer[idx3 + 2u], 0u);
-    atomicStore(&erosion_buffer[idx3], 0u);
-    atomicStore(&erosion_buffer[idx3 + 1u], 0u);
-    atomicStore(&erosion_buffer[idx3 + 2u], 0u);
+    // Clear flow, sediment, and erosion buffers (all store 1 value per pixel)
+    atomicStore(&flow_buffer[idx], 0u);
+    atomicStore(&sediment_buffer[idx], 0u);
+    atomicStore(&erosion_buffer[idx], 0u);
 }
 
 fn band_color_from_height(h: f32) -> vec3<f32> {
-    // Simple banding: water/sand/grass/rock/snow
+    // Smooth banding with feathering: water/sand/grass/rock/snow
     let o = 0.0;
-    if (h < 0.25 + o) {
-        return vec3<f32>(0.08, 0.35, 0.65); // water/deep
-    } else if (h < 0.35 + o) {
-        return vec3<f32>(0.76, 0.70, 0.50); // sand
-    } else if (h < 0.60 + o) {
-        return vec3<f32>(0.20, 0.55, 0.25) * 0.5; // grass
-    } else if (h < 0.80 + o) {
-        return vec3<f32>(0.40, 0.40, 0.40) * 0.5; // rock
+    let feather = 0.05; // feather width for blending between layers
+    
+    let water = vec3<f32>(0.08, 0.35, 0.65);
+    let sand = vec3<f32>(0.76, 0.70, 0.50);
+    let grass = vec3<f32>(0.20, 0.55, 0.25) * 0.5;
+    let rock = vec3<f32>(0.40, 0.40, 0.40) * 0.5;
+    let snow = vec3<f32>(0.95, 0.95, 0.95);
+    
+    // Define thresholds
+    let t1 = 0.25 + o; // water -> sand
+    let t2 = 0.35 + o; // sand -> grass
+    let t3 = 0.60 + o; // grass -> rock
+    let t4 = 0.80 + o; // rock -> snow
+    
+    // Blend between adjacent colors
+    if (h < t1 - feather) {
+        return water;
+    } else if (h < t1 + feather) {
+        let t = (h - (t1 - feather)) / (2.0 * feather);
+        return mix(water, sand, smoothstep(0.0, 1.0, t));
+    } else if (h < t2 - feather) {
+        return sand;
+    } else if (h < t2 + feather) {
+        let t = (h - (t2 - feather)) / (2.0 * feather);
+        return mix(sand, grass, smoothstep(0.0, 1.0, t));
+    } else if (h < t3 - feather) {
+        return grass;
+    } else if (h < t3 + feather) {
+        let t = (h - (t3 - feather)) / (2.0 * feather);
+        return mix(grass, rock, smoothstep(0.0, 1.0, t));
+    } else if (h < t4 - feather) {
+        return rock;
+    } else if (h < t4 + feather) {
+        let t = (h - (t4 - feather)) / (2.0 * feather);
+        return mix(rock, snow, smoothstep(0.0, 1.0, t));
     } else {
-        return vec3<f32>(0.95, 0.95, 0.95); // snow
+        return snow;
     }
 }
 
@@ -164,7 +184,7 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     let size = i32(params.map_size.x);
     let index = i32(random_indices[gid.x]);
     var posX = f32(index % size);
-    var posY = f32(index) / f32(size);
+    var posY = f32(index / size);  // Use integer division before float conversion
     var dirX = 0.0;
     var dirY = 0.0;
     var speed = params.start_speed;
@@ -228,10 +248,10 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
             height[iSE] = height[iSE] + deposit * wSE;
             
             // Accumulate sediment deposition (convert to fixed-point: multiply by 10000)
-            atomicAdd(&sediment_buffer[iNW * 3u], u32(deposit * wNW * 10000.0));
-            atomicAdd(&sediment_buffer[iNE * 3u], u32(deposit * wNE * 10000.0));
-            atomicAdd(&sediment_buffer[iSW * 3u], u32(deposit * wSW * 10000.0));
-            atomicAdd(&sediment_buffer[iSE * 3u], u32(deposit * wSE * 10000.0));
+            atomicAdd(&sediment_buffer[iNW], u32(deposit * wNW * 10000.0));
+            atomicAdd(&sediment_buffer[iNE], u32(deposit * wNE * 10000.0));
+            atomicAdd(&sediment_buffer[iSW], u32(deposit * wSW * 10000.0));
+            atomicAdd(&sediment_buffer[iSE], u32(deposit * wSE * 10000.0));
 
             // Blend carried color into deposited texels
             let pNW = vec2<i32>(nodeX, nodeY);
@@ -262,8 +282,9 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
                     height[idx] = current - delta;
                     sediment += delta;
                     
-                    // Accumulate erosion (convert to fixed-point: multiply by 10000)
-                    atomicAdd(&erosion_buffer[idx * 3u], u32(delta * 10000.0));
+                    // Accumulate erosion - use larger multiplier to avoid truncation with fine brush
+                    // With brush radius 16, delta can be ~1/800th of amountToErode, so we need a bigger scale
+                    atomicAdd(&erosion_buffer[idx], u32(delta * 100000.0));
                 }
             }
             // Pull color from eroded neighborhood toward carried color
@@ -277,17 +298,8 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
         speed = sqrt(max(0.0, speed * speed + deltaH * params.gravity));
         water *= (1.0 - params.evaporate_speed);
         
-        // Accumulate flow (direction + magnitude) at current position
-        // Ensure dropletIndex is valid for the buffer size
-        let map_size_total = i32(params.map_size.x * params.map_size.y);
-        if (dropletIndex >= 0 && dropletIndex < map_size_total) {
-            let flowIdx = u32(dropletIndex) * 3u;
-            let flow_magnitude = speed * water;
-        //     // Convert to fixed-point with offset for signed values: (value + 1000) * 10
-        //     atomicAdd(&flow_buffer[flowIdx], u32((dirX * flow_magnitude + 1000.0) * 10.0));       // x direction
-        //     atomicAdd(&flow_buffer[flowIdx + 1u], u32((dirY * flow_magnitude + 1000.0) * 10.0));  // y direction
-        //     atomicAdd(&flow_buffer[flowIdx + 2u], u32(flow_magnitude * 10000.0));                 // magnitude
-        }
+        let flow_magnitude = speed * water;
+        atomicAdd(&flow_buffer[dropletIndex], u32(flow_magnitude * 10000.0));
     }
 }
 
@@ -327,30 +339,16 @@ fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(normal_out, vec2<i32>(px, py), vec4<f32>(enc, 1.0));
     
     // Pack flow, sediment, and erosion into single analysis texture
-    let idx3 = idx * 3u;
-    // Convert from fixed-point back to float
-    let flow_x_raw = f32(atomicLoad(&flow_buffer[idx3])) / 10.0 - 1000.0;
-    let flow_y_raw = f32(atomicLoad(&flow_buffer[idx3 + 1u])) / 10.0 - 1000.0;
-    let flow_mag = f32(atomicLoad(&flow_buffer[idx3 + 2u])) / 10000.0;
+    let flow_mag = f32(atomicLoad(&flow_buffer[idx])) / 10000.0;
+    let sediment = f32(atomicLoad(&sediment_buffer[idx])) / 10000.0;
+    let erosion = f32(atomicLoad(&erosion_buffer[idx])) / 100000.0;
     
-    // Calculate flow direction angle (0-1 normalized from 0-2π)
-    var flow_angle = 0.5;  // default to 0.5 (no flow)
-    if (flow_mag > 0.001) {
-        let angle_rad = atan2(flow_y_raw, flow_x_raw);
-        flow_angle = (angle_rad + 3.14159265) / (2.0 * 3.14159265);  // normalize to 0-1
-    }
-    
-    // Sediment and erosion values (convert from fixed-point: divide by 10000, then scale for visibility)
-    // These values accumulate over multiple frames, so we scale them for better visualization
-    let sediment = f32(atomicLoad(&sediment_buffer[idx3])) / 10000.0;
-    let erosion = f32(atomicLoad(&erosion_buffer[idx3])) / 10000.0;
-    
-    // Pack into analysis texture: R=flow_mag, G=sediment, B=erosion, A=flow_angle
+    // Pack into analysis texture: R=flow_mag, G=sediment, B=erosion
     let analysis = vec4<f32>(
-        clamp(flow_mag * 0.1, 0.0, 1.0),
+        flow_mag,
         sediment,
         erosion,
-        flow_angle
+        0.0
     );
     textureStore(analysis_out, vec2<i32>(px, py), analysis);
 }

@@ -103,7 +103,12 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
 
 // Generate a heat map color from a normalized value [0, 1]
 // gradient_colors: array of colors to interpolate between
-fn heat_map(value: f32, color0: vec3<f32>, color1: vec3<f32>, color2: vec3<f32>, color3: vec3<f32>, color4: vec3<f32>) -> vec3<f32> {
+fn heat_map(value: f32) -> vec3<f32> {
+    let color0 = vec3<f32>(0.0, 0.0, 0.5);  // dark blue
+    let color1 = vec3<f32>(0.0, 0.0, 1.0);  // blue
+    let color2 = vec3<f32>(0.0, 1.0, 1.0);  // cyan
+    let color3 = vec3<f32>(1.0, 1.0, 0.0);  // yellow
+    let color4 = vec3<f32>(1.0, 0.0, 0.0);  // red
     let clamped = clamp(value, 0.0, 1.0);
     let scaled = clamped * 4.0;
     
@@ -131,46 +136,29 @@ fn apply_lambert_shading(base_color: vec4<f32>, world_normal: vec3<f32>) -> vec4
 fn get_preview_color(mode: u32, uv: vec2<f32>, world_normal: vec3<f32>) -> vec4<f32> {
     switch (mode) {
         case MODE_FLOW: {
-            // Flow map: direction as hue, magnitude as brightness
             let analysis = textureSample(analysis_tex, analysis_sampler, uv);
-            let flow_mag = analysis.r;
-            let flow_angle = analysis.a;
-            return vec4<f32>(hsv_to_rgb(flow_angle, 1.0, flow_mag), 1.0);
+            let flow_mag = analysis.r * 0.01;
+            let color = heat_map(flow_mag);
+            return vec4<f32>(color, 1.0);
         }
         case MODE_SEDIMENT: {
-            // Sediment: cool to warm heat map (blue -> cyan -> yellow -> red)
             let analysis = textureSample(analysis_tex, analysis_sampler, uv);
             let sediment = analysis.g * 20.0;
-            let color = heat_map(
-                sediment,
-                vec3<f32>(0.0, 0.0, 0.5),  // dark blue
-                vec3<f32>(0.0, 0.0, 1.0),  // blue
-                vec3<f32>(0.0, 1.0, 1.0),  // cyan
-                vec3<f32>(1.0, 1.0, 0.0),  // yellow
-                vec3<f32>(1.0, 0.0, 0.0)   // red
-            );
+            let color = heat_map(sediment);
             return vec4<f32>(color, 1.0);
         }
         case MODE_EROSION: {
-            // Erosion: dark to bright heat map (black -> purple -> red -> orange -> yellow)
             let analysis = textureSample(analysis_tex, analysis_sampler, uv);
-            let erosion = analysis.b;
-            let color = heat_map(
-                erosion,
-                vec3<f32>(0.0, 0.0, 0.0),  // black
-                vec3<f32>(0.5, 0.0, 0.5),  // purple
-                vec3<f32>(1.0, 0.0, 0.0),  // red
-                vec3<f32>(1.0, 0.5, 0.0),  // orange
-                vec3<f32>(1.0, 1.0, 0.0)   // yellow
-            );
+            let erosion = analysis.b * 100.0;
+            let color = heat_map(erosion);
             return vec4<f32>(color, 1.0);
         }
         case MODE_HEIGHT: {
             // Height: repeating black/white bands for high contrast visualization
             let height = textureSample(height_tex, height_sampler, uv).x;
-            let bands = fract(height * 100.0); // 10 repeating bands
+            let bands = fract(height * 100.0); // 100 repeating bands
             let color = step(0.5, bands); // Black (0) or white (1)
-            return vec4(vec3(height + (color * .1)), 1.0);
+            return vec4(vec3(height + (color * .2)), 1.0);
         }
         default: {
             // PBR mode: use computed color texture

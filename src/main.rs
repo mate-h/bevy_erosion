@@ -74,7 +74,7 @@ enum PreviewMode {
     Sediment,
     Erosion,
     Height,
-    ViewSpaceNormals,
+    Normals,
 }
 
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
@@ -87,14 +87,14 @@ struct TerrainExtension {
     #[texture(102)]
     #[sampler(103)]
     color_tex: Handle<Image>,
-    // Analysis texture: R=flow_mag, G=sediment, B=erosion, A=flow_dir_angle
+    // Analysis texture: R=flow_mag, G=sediment, B=erosion
     #[texture(105)]
     #[sampler(106)]
     analysis_tex: Handle<Image>,
     // Displacement height scale
     #[uniform(104)]
     height_scale: f32,
-    // Preview mode: 0=PBR, 1=Flow, 2=Sediment, 3=Erosion, 4=Height, 5=ViewSpaceNormals
+    // Preview mode: 0=PBR, 1=Flow, 2=Sediment, 3=Erosion, 4=Height, 5=Normals
     #[uniform(107)]
     preview_mode: u32,
 }
@@ -550,12 +550,17 @@ fn prepare_erosion_bind_groups(
     let view_analysis = gpu_images.get(&images.analysis).unwrap();
 
     // Check if we need to verify buffer structure
+    let texels = (params.map_size.x * params.map_size.y) as usize;
     let needs_recreation = if let Some(ref buffers) = existing {
         // Check if buffers have correct size for new fields
         // If any of the analysis buffers are empty/wrong size, recreate
         buffers.flow.buffer().is_none()
             || buffers.sediment.buffer().is_none()
             || buffers.erosion.buffer().is_none()
+            // Check if all buffers have correct size (should all be texels, 1 u32 per pixel)
+            || buffers.flow.get().len() != texels
+            || buffers.sediment.get().len() != texels
+            || buffers.erosion.get().len() != texels
     } else {
         false
     };
@@ -659,14 +664,15 @@ fn prepare_erosion_bind_groups(
             let mut brush_w = StorageBuffer::from(cpu_buffers.brush_weights.clone());
             brush_w.write_buffer(&render_device, &queue);
 
-            // Initialize flow, sediment, erosion buffers (3 u32 per pixel for atomic operations)
-            let mut flow = StorageBuffer::from(vec![0u32; texels * 3]);
+            // Initialize buffers for atomic operations
+            // All buffers store single scalar per pixel (1 u32 per pixel)
+            let mut flow = StorageBuffer::from(vec![0u32; texels]);
             flow.write_buffer(&render_device, &queue);
 
-            let mut sediment = StorageBuffer::from(vec![0u32; texels * 3]);
+            let mut sediment = StorageBuffer::from(vec![0u32; texels]);
             sediment.write_buffer(&render_device, &queue);
 
-            let mut erosion = StorageBuffer::from(vec![0u32; texels * 3]);
+            let mut erosion = StorageBuffer::from(vec![0u32; texels]);
             erosion.write_buffer(&render_device, &queue);
 
             // Build bind groups using these buffers
@@ -731,7 +737,7 @@ fn handle_preview_mode_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut preview_mode: ResMut<CurrentPreviewMode>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
-    mut cameras: Query<(&mut Atmosphere, &mut Tonemapping), With<Camera3d>>,
+    mut cameras: Query<(&mut Atmosphere, &mut Tonemapping, &mut Bloom), With<Camera3d>>,
 ) {
     let new_mode = if keys.just_pressed(KeyCode::Digit1) {
         Some(PreviewMode::Pbr)
@@ -744,7 +750,7 @@ fn handle_preview_mode_input(
     } else if keys.just_pressed(KeyCode::Digit5) {
         Some(PreviewMode::Height)
     } else if keys.just_pressed(KeyCode::Digit6) {
-        Some(PreviewMode::ViewSpaceNormals)
+        Some(PreviewMode::Normals)
     } else {
         None
     };
@@ -762,24 +768,26 @@ fn handle_preview_mode_input(
                     PreviewMode::Sediment => 2,
                     PreviewMode::Erosion => 3,
                     PreviewMode::Height => 4,
-                    PreviewMode::ViewSpaceNormals => 5,
+                    PreviewMode::Normals => 5,
                 };
             }
 
-            // Toggle atmosphere and tonemapping based on mode
-            for (mut atmosphere, mut tonemapping) in cameras.iter_mut() {
+            // Toggle atmosphere, tonemapping, and bloom based on mode
+            for (mut atmosphere, mut tonemapping, mut bloom) in cameras.iter_mut() {
                 if mode == PreviewMode::Pbr {
-                    // Enable atmosphere for PBR
+                    // Enable atmosphere and bloom for PBR
                     *atmosphere = Atmosphere::EARTH;
                     *tonemapping = Tonemapping::AcesFitted;
+                    *bloom = Bloom::NATURAL;
                 } else {
-                    // Disable atmosphere for debug modes by setting scattering to 0
+                    // Disable atmosphere and bloom for debug modes
                     *atmosphere = Atmosphere {
                         rayleigh_scattering: Vec3::ZERO,
                         mie_scattering: 0.0,
                         ..default()
                     };
                     *tonemapping = Tonemapping::None;
+                    bloom.intensity = 0.0;
                 }
             }
         }
