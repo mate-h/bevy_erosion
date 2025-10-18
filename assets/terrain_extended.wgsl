@@ -27,6 +27,16 @@ struct PreviewParams {
 }
 @group(#{MATERIAL_BIND_GROUP}) @binding(107) var<uniform> preview_params: PreviewParams;
 
+struct UVCrop {
+    uv_min: vec2<f32>,
+}
+@group(#{MATERIAL_BIND_GROUP}) @binding(108) var<uniform> uv_crop_min: UVCrop;
+
+struct UVCropMax {
+    uv_max: vec2<f32>,
+}
+@group(#{MATERIAL_BIND_GROUP}) @binding(109) var<uniform> uv_crop_max: UVCropMax;
+
 struct VertexIn {
     @builtin(instance_index) instance_index: u32,
     @location(0) position: vec3<f32>,
@@ -37,8 +47,11 @@ struct VertexIn {
 
 @vertex
 fn vertex(v: VertexIn) -> VertexOutput {
-    // Sample height at UV to displace along local +Y
-    let h = textureSampleLevel(height_tex, height_sampler, v.uv, 0.0).x;
+    // Remap UV from [0,1] to [uv_min, uv_max] to crop out overlap borders
+    let cropped_uv = mix(uv_crop_min.uv_min, uv_crop_max.uv_max, v.uv);
+    
+    // Sample height at cropped UV to displace along local +Y
+    let h = textureSampleLevel(height_tex, height_sampler, cropped_uv, 0.0).x;
     let displaced_local = vec3<f32>(v.position.x, v.position.y + h * terrain_params.height_scale, v.position.z);
 
     var out: VertexOutput;
@@ -46,13 +59,14 @@ fn vertex(v: VertexIn) -> VertexOutput {
     let world_pos4 = mesh_functions::mesh_position_local_to_world(world_from_local, vec4(displaced_local, 1.0));
     out.world_position = world_pos4;
     out.position = position_world_to_clip(world_pos4.xyz);
+    
     // Compute normal from height gradients in UV space
     let dims = vec2<f32>(textureDimensions(height_tex, 0));
     let texel = 1.0 / max(dims, vec2(1.0, 1.0));
-    let h_l = textureSampleLevel(height_tex, height_sampler, v.uv - vec2(texel.x, 0.0), 0.0).x;
-    let h_r = textureSampleLevel(height_tex, height_sampler, v.uv + vec2(texel.x, 0.0), 0.0).x;
-    let h_d = textureSampleLevel(height_tex, height_sampler, v.uv - vec2(0.0, texel.y), 0.0).x;
-    let h_u = textureSampleLevel(height_tex, height_sampler, v.uv + vec2(0.0, texel.y), 0.0).x;
+    let h_l = textureSampleLevel(height_tex, height_sampler, cropped_uv - vec2(texel.x, 0.0), 0.0).x;
+    let h_r = textureSampleLevel(height_tex, height_sampler, cropped_uv + vec2(texel.x, 0.0), 0.0).x;
+    let h_d = textureSampleLevel(height_tex, height_sampler, cropped_uv - vec2(0.0, texel.y), 0.0).x;
+    let h_u = textureSampleLevel(height_tex, height_sampler, cropped_uv + vec2(0.0, texel.y), 0.0).x;
     let d_hx = (h_r - h_l) * terrain_params.height_scale;
     let d_hz = (h_u - h_d) * terrain_params.height_scale;
     let n_local = normalize(vec3<f32>(-d_hx, 1.0, -d_hz));
@@ -63,7 +77,7 @@ fn vertex(v: VertexIn) -> VertexOutput {
     );
     let n_world = normalize(nmat * n_local);
     out.world_normal = n_world;
-    out.uv = v.uv;
+    out.uv = cropped_uv; // Pass cropped UV to fragment shader
     return out;
 }
 

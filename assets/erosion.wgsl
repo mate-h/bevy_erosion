@@ -5,7 +5,11 @@
 
 @group(0) @binding(0) var<storage, read_write> height: array<f32>;
 
-// For init_fbm we only need output; height_in is ignored.
+// Neighbor height buffers for seamless tiling (read-only)
+@group(0) @binding(8) var<storage, read> height_left: array<f32>;
+@group(0) @binding(9) var<storage, read> height_right: array<f32>;
+@group(0) @binding(10) var<storage, read> height_top: array<f32>;
+@group(0) @binding(11) var<storage, read> height_bottom: array<f32>;
 
 struct ErodeParams {
     map_size: vec2<u32>,
@@ -22,6 +26,8 @@ struct ErodeParams {
     start_water: f32,
     brush_length: u32,
     num_particles: u32,
+    tile_world_offset: vec2<f32>, // World-space offset for noise sampling
+    _padding: vec2<f32>,          // Align to 16 bytes
 }
 
 @group(0) @binding(1) var<uniform> params: ErodeParams;
@@ -90,8 +96,10 @@ fn fbm(p: vec2<f32>) -> f32 {
 @compute @workgroup_size(8,8,1)
 fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
-    let uv = vec2<f32>(gid.xy);
-    let hval = fbm(uv);
+    
+    // Apply world offset to create continuous noise across tiles
+    let world_uv = vec2<f32>(gid.xy) + params.tile_world_offset;
+    let hval = fbm(world_uv);
     let idx = gid.y * params.map_size.x + gid.x;
     height[idx] = hval * 1.0;
     
@@ -156,24 +164,38 @@ fn init_color_bands(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 fn load_height(p: vec2<i32>) -> f32 {
     let size = i32(params.map_size.x);
-    let idx = u32(p.y * size + p.x);
+    
+    // Clamp to valid range - halo region already contains neighbor data
+    let px = clamp(p.x, 0, size - 1);
+    let py = clamp(p.y, 0, size - 1);
+    
+    // Read from current buffer only (halo exchange pre-fills neighbor data)
+    let idx = u32(py * size + px);
     return height[idx];
 }
 
 fn sample_height_and_gradient(pos: vec2<f32>) -> vec3<f32> {
     let size = vec2<i32>(i32(params.map_size.x), i32(params.map_size.y));
-    let cx = clamp(i32(floor(pos.x)), 0, size.x - 2);
-    let cy = clamp(i32(floor(pos.y)), 0, size.y - 2);
+    
+    // Don't clamp - allow sampling beyond tile boundaries (will read from neighbors)
+    let cx = i32(floor(pos.x));
+    let cy = i32(floor(pos.y));
     let x = pos.x - f32(cx);
     let y = pos.y - f32(cy);
+    
     let idx = vec2<i32>(cx, cy);
+    
+    // Sample 4 corners (may be from neighbor tiles via load_height)
     let hNW = load_height(idx);
     let hNE = load_height(idx + vec2<i32>(1,0));
     let hSW = load_height(idx + vec2<i32>(0,1));
     let hSE = load_height(idx + vec2<i32>(1,1));
+    
+    // Bilinear interpolation
     let gradX = (hNE - hNW) * (1.0 - y) + (hSE - hSW) * y;
     let gradY = (hSW - hNW) * (1.0 - x) + (hSE - hNE) * x;
     let h = hNW * (1.0 - x) * (1.0 - y) + hNE * x * (1.0 - y) + hSW * (1.0 - x) * y + hSE * x * y;
+    
     return vec3<f32>(gradX, gradY, h);
 }
 
@@ -353,4 +375,58 @@ fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(analysis_out, vec2<i32>(px, py), analysis);
 }
 
-
+// Halo Exchange: Copy edge data from neighbors into this tile's halo region
+// This shader copies data FROM neighbor buffers INTO this tile's halo (overlap) region
+// Run this AFTER erosion to prepare data for the next frame
+@compute @workgroup_size(8,8,1)
+fn halo_exchange(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let size = i32(params.map_size.x);
+    let overlap = i32(params.border_size);
+    
+    // Only process halo region pixels
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    
+    if (x >= size || y >= size) { return; }
+    
+    // Check if we're in a halo region
+    let in_left_halo = (x < overlap);
+    let in_right_halo = (x >= size - overlap);
+    let in_top_halo = (y < overlap);
+    let in_bottom_halo = (y >= size - overlap);
+    
+    let in_halo = in_left_halo || in_right_halo || in_top_halo || in_bottom_halo;
+    
+    if (!in_halo) { return; }
+    
+    let idx = u32(y * size + x);
+    
+    // Copy from appropriate neighbor
+    // Left halo: copy from left neighbor's right edge
+    if (in_left_halo && !in_top_halo && !in_bottom_halo) {
+        let neighbor_x = size - overlap + x;
+        let neighbor_idx = u32(y * size + neighbor_x);
+        height[idx] = height_left[neighbor_idx];
+    }
+    
+    // Right halo: copy from right neighbor's left edge
+    if (in_right_halo && !in_top_halo && !in_bottom_halo) {
+        let neighbor_x = x - (size - overlap);
+        let neighbor_idx = u32(y * size + neighbor_x);
+        height[idx] = height_right[neighbor_idx];
+    }
+    
+    // Top halo: copy from top neighbor's bottom edge
+    if (in_top_halo && !in_left_halo && !in_right_halo) {
+        let neighbor_y = size - overlap + y;
+        let neighbor_idx = u32(neighbor_y * size + x);
+        height[idx] = height_top[neighbor_idx];
+    }
+    
+    // Bottom halo: copy from bottom neighbor's top edge
+    if (in_bottom_halo && !in_left_halo && !in_right_halo) {
+        let neighbor_y = y - (size - overlap);
+        let neighbor_idx = u32(neighbor_y * size + x);
+        height[idx] = height_bottom[neighbor_idx];
+    }
+}

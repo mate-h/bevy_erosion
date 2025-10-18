@@ -32,7 +32,9 @@ use camera::{OrbitCameraPlugin, OrbitController};
 const EROSION_SHADER: &str = "erosion.wgsl";
 const TERRAIN_SHADER: &str = "terrain_extended.wgsl";
 
-const SIZE: UVec2 = UVec2::new(512, 512);
+const BASE_TILE_SIZE: UVec2 = UVec2::new(512, 512);
+const OVERLAP_SIZE: u32 = 4; // Halo region for neighbor data exchange
+const TILE_COUNT: UVec2 = UVec2::new(2, 2); // 2x2 grid of tiles
 
 fn main() {
     App::new()
@@ -56,8 +58,90 @@ fn main() {
         .run();
 }
 
+#[derive(Resource, Clone, ExtractResource, ShaderType)]
+struct TileConfig {
+    base_tile_size: UVec2,
+    overlap_size: u32,
+    tile_count: UVec2,
+    // Derived values (computed in setup)
+    tile_size_with_overlap: UVec2,
+    total_world_size: UVec2,
+}
+
+impl TileConfig {
+    fn new(base_tile_size: UVec2, overlap_size: u32, tile_count: UVec2) -> Self {
+        let tile_size_with_overlap = base_tile_size + UVec2::splat(overlap_size * 2);
+        let total_world_size = base_tile_size * tile_count;
+        Self {
+            base_tile_size,
+            overlap_size,
+            tile_count,
+            tile_size_with_overlap,
+            total_world_size,
+        }
+    }
+
+    fn tile_index_to_coord(&self, tile_idx: usize) -> UVec2 {
+        let tx = (tile_idx as u32) % self.tile_count.x;
+        let ty = (tile_idx as u32) / self.tile_count.x;
+        UVec2::new(tx, ty)
+    }
+
+    fn coord_to_tile_index(&self, coord: UVec2) -> Option<usize> {
+        if coord.x >= self.tile_count.x || coord.y >= self.tile_count.y {
+            None
+        } else {
+            Some((coord.y * self.tile_count.x + coord.x) as usize)
+        }
+    }
+
+    fn total_tiles(&self) -> usize {
+        (self.tile_count.x * self.tile_count.y) as usize
+    }
+
+    // Get neighbor tile indices: [left, right, top, bottom]
+    // Returns None for edges where there's no neighbor
+    fn get_neighbor_indices(&self, tile_idx: usize) -> [Option<usize>; 4] {
+        let coord = self.tile_index_to_coord(tile_idx);
+        let tx = coord.x as i32;
+        let ty = coord.y as i32;
+
+        [
+            // Left
+            if tx > 0 {
+                self.coord_to_tile_index(UVec2::new((tx - 1) as u32, ty as u32))
+            } else {
+                None
+            },
+            // Right
+            if tx < (self.tile_count.x as i32 - 1) {
+                self.coord_to_tile_index(UVec2::new((tx + 1) as u32, ty as u32))
+            } else {
+                None
+            },
+            // Top
+            if ty > 0 {
+                self.coord_to_tile_index(UVec2::new(tx as u32, (ty - 1) as u32))
+            } else {
+                None
+            },
+            // Bottom
+            if ty < (self.tile_count.y as i32 - 1) {
+                self.coord_to_tile_index(UVec2::new(tx as u32, (ty + 1) as u32))
+            } else {
+                None
+            },
+        ]
+    }
+}
+
 #[derive(Resource, Clone, ExtractResource)]
 struct ErosionImages {
+    tiles: Vec<TileImages>,
+}
+
+#[derive(Clone)]
+struct TileImages {
     height: Handle<Image>,
     color: Handle<Image>,
     normal: Handle<Image>,
@@ -97,6 +181,11 @@ struct TerrainExtension {
     // Preview mode: 0=PBR, 1=Flow, 2=Sediment, 3=Erosion, 4=Height, 5=Normals
     #[uniform(107)]
     preview_mode: u32,
+    // UV crop region to exclude overlap borders: min UV and max UV
+    #[uniform(108)]
+    uv_min: Vec2,
+    #[uniform(109)]
+    uv_max: Vec2,
 }
 
 impl Default for TerrainExtension {
@@ -107,6 +196,8 @@ impl Default for TerrainExtension {
             analysis_tex: Default::default(),
             height_scale: 50.0,
             preview_mode: 0,
+            uv_min: Vec2::ZERO,
+            uv_max: Vec2::ONE,
         }
     }
 }
@@ -136,11 +227,12 @@ struct ErodeParams {
     start_water: f32,
     brush_length: u32,
     num_particles: u32,
+    tile_world_offset: Vec2, // World-space offset for noise sampling (per-tile)
+    _padding: Vec2,          // Align to 16 bytes
 }
 
 #[derive(Resource, Clone, ExtractResource)]
 struct ErosionCpuBuffers {
-    random_indices: Vec<u32>,
     brush_indices: Vec<i32>,
     brush_weights: Vec<f32>,
 }
@@ -161,53 +253,72 @@ struct CurrentPreviewMode {
     mode: PreviewMode,
 }
 
+fn create_tile_texture(
+    size: UVec2,
+    format: TextureFormat,
+    images: &mut ResMut<Assets<Image>>,
+) -> Handle<Image> {
+    let mut texture = Image::new_target_texture(size.x, size.y, format);
+    texture.asset_usage = RenderAssetUsages::RENDER_WORLD;
+    texture.texture_descriptor.usage = TextureUsages::COPY_DST
+        | TextureUsages::COPY_SRC
+        | TextureUsages::STORAGE_BINDING
+        | TextureUsages::TEXTURE_BINDING;
+    images.add(texture)
+}
+
 fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
-    // Height texture (rgba16float) written by compute blit
-    let mut height = Image::new_target_texture(SIZE.x, SIZE.y, TextureFormat::Rgba16Float);
-    height.asset_usage = RenderAssetUsages::RENDER_WORLD;
-    height.texture_descriptor.usage =
-        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
-    let height_handle = images.add(height);
+    // Create tile configuration
+    let tile_config = TileConfig::new(BASE_TILE_SIZE, OVERLAP_SIZE, TILE_COUNT);
+    let tile_size = tile_config.tile_size_with_overlap;
 
-    // Color texture (Rgba16Float) used as storage for color advection and sampled in terrain shader
-    let mut color = Image::new_target_texture(SIZE.x, SIZE.y, TextureFormat::Rgba16Float);
-    color.asset_usage = RenderAssetUsages::RENDER_WORLD;
-    color.texture_descriptor.usage =
-        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
-    let color_handle = images.add(color);
+    println!("Tile configuration:");
+    println!(
+        "  Base tile size: {}x{}",
+        tile_config.base_tile_size.x, tile_config.base_tile_size.y
+    );
+    println!("  Overlap size: {}", tile_config.overlap_size);
+    println!(
+        "  Tile count: {}x{}",
+        tile_config.tile_count.x, tile_config.tile_count.y
+    );
+    println!("  Tile size with overlap: {}x{}", tile_size.x, tile_size.y);
+    println!(
+        "  Total world size: {}x{}",
+        tile_config.total_world_size.x, tile_config.total_world_size.y
+    );
 
-    // Normal texture (Rgba16Float) written by compute and optionally sampled later
-    let mut normal = Image::new_target_texture(SIZE.x, SIZE.y, TextureFormat::Rgba16Float);
-    normal.asset_usage = RenderAssetUsages::RENDER_WORLD;
-    normal.texture_descriptor.usage =
-        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
-    let normal_handle = images.add(normal);
+    // Create textures for each tile
+    let mut tiles = Vec::new();
+    for tile_idx in 0..tile_config.total_tiles() {
+        let tile_coord = tile_config.tile_index_to_coord(tile_idx);
+        println!(
+            "Creating textures for tile {} at ({}, {})",
+            tile_idx, tile_coord.x, tile_coord.y
+        );
 
-    // Analysis texture (Rgba16Float) - combined flow/sediment/erosion data
-    // R channel: flow magnitude, G channel: sediment, B channel: erosion, A channel: flow direction encoded
-    let mut analysis = Image::new_target_texture(SIZE.x, SIZE.y, TextureFormat::Rgba16Float);
-    analysis.asset_usage = RenderAssetUsages::RENDER_WORLD;
-    analysis.texture_descriptor.usage =
-        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
-    let analysis_handle = images.add(analysis);
+        tiles.push(TileImages {
+            height: create_tile_texture(tile_size, TextureFormat::Rgba16Float, &mut images),
+            color: create_tile_texture(tile_size, TextureFormat::Rgba16Float, &mut images),
+            normal: create_tile_texture(tile_size, TextureFormat::Rgba16Float, &mut images),
+            analysis: create_tile_texture(tile_size, TextureFormat::Rgba16Float, &mut images),
+        });
+    }
 
-    commands.insert_resource(ErosionImages {
-        height: height_handle,
-        color: color_handle,
-        normal: normal_handle,
-        analysis: analysis_handle,
-    });
+    commands.insert_resource(ErosionImages { tiles });
 
-    // Parameters
+    // Parameters - per tile
     let brush_radius: i32 = 16;
-    let (brush_indices, brush_weights) = build_brush(SIZE.x as i32, brush_radius);
-    let num_particles: u32 = 1024 * 8;
-    let random_indices = generate_random_indices(num_particles, (SIZE.x * SIZE.y) as u32);
+    let (brush_indices, brush_weights) = build_brush(tile_size.x as i32, brush_radius);
+    let num_particles_per_tile: u32 = 1024 * 8;
+    let overlap_size = tile_config.overlap_size; // Store before moving
+
+    commands.insert_resource(tile_config);
 
     commands.insert_resource(ErodeParams {
-        map_size: SIZE,
+        map_size: tile_size, // Each tile size including overlap
         max_lifetime: 32,
-        border_size: 0,
+        border_size: overlap_size, // Prevent droplets from writing to halo region
         inertia: 0.05,
         sediment_capacity_factor: 4.0,
         min_sediment_capacity: 0.01,
@@ -218,10 +329,11 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         start_speed: 1.0,
         start_water: 1.0,
         brush_length: brush_indices.len() as u32,
-        num_particles,
+        num_particles: num_particles_per_tile,
+        tile_world_offset: Vec2::ZERO, // Will be set per-tile in prepare_erosion_bind_groups
+        _padding: Vec2::ZERO,
     });
     commands.insert_resource(ErosionCpuBuffers {
-        random_indices,
         brush_indices,
         brush_weights,
     });
@@ -250,11 +362,13 @@ fn spawn_terrain(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
     erosion_images: Res<ErosionImages>,
+    tile_config: Res<TileConfig>,
 ) {
-    // Spawn a subdivided plane with UVs
-    let size = 512.0;
-    let resolution = 511; // subdivisions
-    let half_size = size * 0.5;
+    let tile_world_size = tile_config.base_tile_size.x as f32;
+    let resolution = 511; // subdivisions per tile (reduced for performance with multiple tiles)
+    let half_size = tile_world_size * 0.5;
+
+    // Create mesh once and reuse for all tiles
     let plane = Mesh::from(
         Plane3d::default()
             .mesh()
@@ -263,28 +377,48 @@ fn spawn_terrain(
     );
     let mesh_handle = meshes.add(plane);
 
-    let mat_handle = materials.add(ExtendedMaterial {
-        base: StandardMaterial {
-            base_color: Color::srgb(1.0, 1.0, 1.0),
-            perceptual_roughness: 0.8,
-            metallic: 0.0,
-            opaque_render_method: OpaqueRendererMethod::Auto,
-            ..Default::default()
-        },
-        extension: TerrainExtension {
-            height_tex: erosion_images.height.clone(),
-            color_tex: erosion_images.color.clone(),
-            analysis_tex: erosion_images.analysis.clone(),
-            height_scale: 50.0,
-            preview_mode: 0, // Default to PBR
-        },
-    });
+    // Calculate UV crop region to exclude halo/overlap borders
+    let tile_size_with_overlap = tile_config.tile_size_with_overlap.x as f32;
+    let overlap = tile_config.overlap_size as f32;
+    let uv_min = Vec2::splat(overlap / tile_size_with_overlap);
+    let uv_max = Vec2::splat((tile_size_with_overlap - overlap) / tile_size_with_overlap);
 
-    commands.spawn((
-        Mesh3d(mesh_handle),
-        MeshMaterial3d(mat_handle),
-        Transform::from_xyz(0.0, 0.0, 0.0),
-    ));
+    println!("UV crop region: min={:?}, max={:?}", uv_min, uv_max);
+
+    // Spawn one terrain mesh per tile
+    for tile_idx in 0..tile_config.total_tiles() {
+        let tile_coord = tile_config.tile_index_to_coord(tile_idx);
+        let tile_images = &erosion_images.tiles[tile_idx];
+
+        // Position tiles so they touch at base_tile_size intervals (no gaps)
+        let world_x = tile_coord.x as f32 * tile_world_size * 0.5 - half_size * 0.5;
+        let world_z = tile_coord.y as f32 * tile_world_size * 0.5 - half_size * 0.5;
+
+        let mat_handle = materials.add(ExtendedMaterial {
+            base: StandardMaterial {
+                base_color: Color::srgb(1.0, 1.0, 1.0),
+                perceptual_roughness: 0.8,
+                metallic: 0.0,
+                opaque_render_method: OpaqueRendererMethod::Auto,
+                ..Default::default()
+            },
+            extension: TerrainExtension {
+                height_tex: tile_images.height.clone(),
+                color_tex: tile_images.color.clone(),
+                analysis_tex: tile_images.analysis.clone(),
+                height_scale: 50.0,
+                preview_mode: 0, // Default to PBR
+                uv_min,          // Crop to exclude overlap borders
+                uv_max,
+            },
+        });
+
+        commands.spawn((
+            Mesh3d(mesh_handle.clone()),
+            MeshMaterial3d(mat_handle),
+            Transform::from_xyz(world_x, 0.0, world_z),
+        ));
+    }
 
     // 3D camera
     commands.spawn((
@@ -316,34 +450,6 @@ fn spawn_terrain(
         },
         Transform::from_xyz(1.0, 0.1, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
-
-    // sprite for the color image
-    commands.spawn((
-        Sprite::from_image(erosion_images.color.clone()),
-        Transform::from_xyz(-300.0, 0.0, 0.0),
-    ));
-
-    commands.spawn((
-        Sprite::from_image(erosion_images.height.clone()),
-        Transform::from_xyz(300.0, 0.0, 0.0),
-    ));
-
-    // 2d camera
-    // commands.spawn((Camera2d, Transform::from_xyz(0.0, 0.0, 0.0)));
-}
-
-fn generate_random_indices(count: u32, max_index: u32) -> Vec<u32> {
-    let mut v = Vec::with_capacity(count as usize);
-    let mut state: u64 = 0x1234_5678_ABCD_EFFF;
-    for _ in 0..count {
-        // xorshift64*
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
-        let r = (state.wrapping_mul(2685821657736338717) >> 32) as u32;
-        v.push(if max_index == 0 { 0 } else { r % max_index });
-    }
-    v
 }
 
 fn generate_random_indices_seeded(count: u32, max_index: u32, mut state: u64) -> Vec<u32> {
@@ -391,6 +497,7 @@ impl Plugin for ErosionComputePlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins((
             ExtractResourcePlugin::<ErosionImages>::default(),
+            ExtractResourcePlugin::<TileConfig>::default(),
             ExtractResourcePlugin::<ErodeParams>::default(),
             ExtractResourcePlugin::<ErosionCpuBuffers>::default(),
             ExtractResourcePlugin::<ResetSim>::default(),
@@ -419,11 +526,16 @@ struct ErosionPipeline {
     pipeline_init: CachedComputePipelineId,
     pipeline_init_color: CachedComputePipelineId,
     pipeline_erode: CachedComputePipelineId,
+    pipeline_halo_exchange: CachedComputePipelineId,
     pipeline_blit: CachedComputePipelineId,
 }
 
 #[derive(Resource)]
 struct ErosionBindGroups {
+    tiles: Vec<TileBindGroups>,
+}
+
+struct TileBindGroups {
     erosion: BindGroup,
     color: BindGroup,
     blit: BindGroup,
@@ -431,11 +543,18 @@ struct ErosionBindGroups {
 
 #[derive(Resource)]
 struct ErosionBuffers {
-    uniform: UniformBuffer<ErodeParams>,
-    height: StorageBuffer<Vec<f32>>,
-    random: StorageBuffer<Vec<u32>>,
+    tiles: Vec<TileBuffers>,
+    // Shared across all tiles (brush data only)
     brush_idx: StorageBuffer<Vec<i32>>,
     brush_w: StorageBuffer<Vec<f32>>,
+    // Dummy buffer for edge tiles without neighbors (to avoid binding conflicts)
+    dummy_height: StorageBuffer<Vec<f32>>,
+}
+
+struct TileBuffers {
+    uniform: UniformBuffer<ErodeParams>, // Per-tile params (contains tile_world_offset)
+    height: StorageBuffer<Vec<f32>>,
+    random: StorageBuffer<Vec<u32>>,
     flow: StorageBuffer<Vec<u32>>,     // atomic<u32> in shader
     sediment: StorageBuffer<Vec<u32>>, // atomic<u32> in shader
     erosion: StorageBuffer<Vec<u32>>,  // atomic<u32> in shader
@@ -458,14 +577,18 @@ fn init_erosion_pipeline(
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                storage_buffer::<f32>(false), // height
-                uniform_buffer::<ErodeParams>(false),
+                storage_buffer::<f32>(false),           // height (read_write)
+                uniform_buffer::<ErodeParams>(false),   // params
                 storage_buffer_read_only::<u32>(false), // random_indices
                 storage_buffer_read_only::<i32>(false), // brush_indices
                 storage_buffer_read_only::<f32>(false), // brush_weights
-                storage_buffer::<u32>(false),           // flow (atomic<u32> in shader)
-                storage_buffer::<u32>(false),           // sediment (atomic<u32> in shader)
-                storage_buffer::<u32>(false),           // erosion (atomic<u32> in shader)
+                storage_buffer::<u32>(false),           // flow (atomic<u32>)
+                storage_buffer::<u32>(false),           // sediment (atomic<u32>)
+                storage_buffer::<u32>(false),           // erosion (atomic<u32>)
+                storage_buffer_read_only::<f32>(false), // height_left neighbor
+                storage_buffer_read_only::<f32>(false), // height_right neighbor
+                storage_buffer_read_only::<f32>(false), // height_top neighbor
+                storage_buffer_read_only::<f32>(false), // height_bottom neighbor
             ),
         ),
     );
@@ -514,6 +637,12 @@ fn init_erosion_pipeline(
         entry_point: Some(Cow::from("erode")),
         ..default()
     });
+    let pipeline_halo_exchange = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        layout: vec![layout_erosion.clone()],
+        shader: shader.clone(),
+        entry_point: Some(Cow::from("halo_exchange")),
+        ..default()
+    });
     let pipeline_blit = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         layout: vec![layout_erosion.clone(), layout_blit.clone()],
         shader,
@@ -528,6 +657,7 @@ fn init_erosion_pipeline(
         pipeline_init,
         pipeline_init_color,
         pipeline_erode,
+        pipeline_halo_exchange,
         pipeline_blit,
     });
 }
@@ -537,6 +667,7 @@ fn prepare_erosion_bind_groups(
     pipeline: Res<ErosionPipeline>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     images: Res<ErosionImages>,
+    tile_config: Res<TileConfig>,
     params: Res<ErodeParams>,
     cpu_buffers: Res<ErosionCpuBuffers>,
     render_device: Res<RenderDevice>,
@@ -544,99 +675,143 @@ fn prepare_erosion_bind_groups(
     mut existing: Option<ResMut<ErosionBuffers>>,
     rng_state: Option<ResMut<ErosionRngState>>,
 ) {
-    let view_height = gpu_images.get(&images.height).unwrap();
-    let view_color = gpu_images.get(&images.color).unwrap();
-    let view_normal = gpu_images.get(&images.normal).unwrap();
-    let view_analysis = gpu_images.get(&images.analysis).unwrap();
+    let texels_per_tile = (params.map_size.x * params.map_size.y) as usize;
+    let num_tiles = tile_config.total_tiles();
 
-    // Check if we need to verify buffer structure
-    let texels = (params.map_size.x * params.map_size.y) as usize;
+    // Check if we need to recreate buffers (e.g., tile count changed)
     let needs_recreation = if let Some(ref buffers) = existing {
-        // Check if buffers have correct size for new fields
-        // If any of the analysis buffers are empty/wrong size, recreate
-        buffers.flow.buffer().is_none()
-            || buffers.sediment.buffer().is_none()
-            || buffers.erosion.buffer().is_none()
-            // Check if all buffers have correct size (should all be texels, 1 u32 per pixel)
-            || buffers.flow.get().len() != texels
-            || buffers.sediment.get().len() != texels
-            || buffers.erosion.get().len() != texels
+        buffers.tiles.len() != num_tiles
+            || buffers.tiles.iter().any(|tile| {
+                tile.flow.buffer().is_none() || tile.flow.get().len() != texels_per_tile
+            })
     } else {
         false
     };
 
     if needs_recreation {
-        // Force recreation by removing the resource
         existing = None;
     }
 
     match existing {
         Some(mut buffers) => {
-            // Ensure we have RNG state
+            // Update RNG state and regenerate random indices for each tile
             let mut seed = if let Some(ref rs) = rng_state {
                 rs.state
             } else {
                 0xCAFEBABE_1234_5678
             };
-            // Regenerate start positions every frame using evolving RNG state
-            let new_random = generate_random_indices_seeded(
-                params.num_particles,
-                params.map_size.x * params.map_size.y,
-                seed,
-            );
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+
+            let mut tile_bind_groups = Vec::new();
+
+            // Update random indices for all tiles first
+            for tile_idx in 0..num_tiles {
+                let tile_buffers = &mut buffers.tiles[tile_idx];
+
+                // Generate new random indices for this tile
+                let new_random = generate_random_indices_seeded(
+                    params.num_particles,
+                    params.map_size.x * params.map_size.y,
+                    seed,
+                );
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+
+                tile_buffers.random = StorageBuffer::from(new_random);
+                tile_buffers.random.write_buffer(&render_device, &queue);
+            }
+
+            // Now create bind groups (with immutable borrows only)
+            for tile_idx in 0..num_tiles {
+                let tile_images = &images.tiles[tile_idx];
+                let tile_buffers = &buffers.tiles[tile_idx];
+
+                // Get neighbor tile indices [left, right, top, bottom]
+                let neighbors = tile_config.get_neighbor_indices(tile_idx);
+
+                // Get neighbor height buffers (use dummy if neighbor doesn't exist)
+                let height_left = neighbors[0]
+                    .map(|idx| &buffers.tiles[idx].height)
+                    .unwrap_or(&buffers.dummy_height);
+                let height_right = neighbors[1]
+                    .map(|idx| &buffers.tiles[idx].height)
+                    .unwrap_or(&buffers.dummy_height);
+                let height_top = neighbors[2]
+                    .map(|idx| &buffers.tiles[idx].height)
+                    .unwrap_or(&buffers.dummy_height);
+                let height_bottom = neighbors[3]
+                    .map(|idx| &buffers.tiles[idx].height)
+                    .unwrap_or(&buffers.dummy_height);
+
+                // Get GPU texture views for this tile
+                let view_height = gpu_images.get(&tile_images.height).unwrap();
+                let view_color = gpu_images.get(&tile_images.color).unwrap();
+                let view_normal = gpu_images.get(&tile_images.normal).unwrap();
+                let view_analysis = gpu_images.get(&tile_images.analysis).unwrap();
+
+                // Create bind groups for this tile
+                let erosion = render_device.create_bind_group(
+                    None,
+                    &pipeline.layout_erosion,
+                    &BindGroupEntries::sequential((
+                        &tile_buffers.height,
+                        &tile_buffers.uniform,
+                        &tile_buffers.random,
+                        &buffers.brush_idx,
+                        &buffers.brush_w,
+                        &tile_buffers.flow,
+                        &tile_buffers.sediment,
+                        &tile_buffers.erosion,
+                        height_left,
+                        height_right,
+                        height_top,
+                        height_bottom,
+                    )),
+                );
+
+                let blit = render_device.create_bind_group(
+                    None,
+                    &pipeline.layout_blit,
+                    &BindGroupEntries::sequential((
+                        &view_height.texture_view,
+                        &view_normal.texture_view,
+                        &view_analysis.texture_view,
+                    )),
+                );
+
+                let color = render_device.create_bind_group(
+                    None,
+                    &pipeline.layout_color,
+                    &BindGroupEntries::sequential((&view_color.texture_view,)),
+                );
+
+                tile_bind_groups.push(TileBindGroups {
+                    erosion,
+                    color,
+                    blit,
+                });
+            }
+
+            // Update RNG state
             if let Some(mut rs) = rng_state {
                 rs.state = seed;
             } else {
                 commands.insert_resource(ErosionRngState { state: seed });
             }
-            buffers.random = StorageBuffer::from(new_random);
-            buffers.random.write_buffer(&render_device, &queue);
 
-            // Reuse existing buffers, just rebuild bind groups (safe across frames)
-            let erosion = render_device.create_bind_group(
-                None,
-                &pipeline.layout_erosion,
-                &BindGroupEntries::sequential((
-                    &buffers.height,
-                    &buffers.uniform,
-                    &buffers.random,
-                    &buffers.brush_idx,
-                    &buffers.brush_w,
-                    &buffers.flow,
-                    &buffers.sediment,
-                    &buffers.erosion,
-                )),
-            );
-            let blit = render_device.create_bind_group(
-                None,
-                &pipeline.layout_blit,
-                &BindGroupEntries::sequential((
-                    &view_height.texture_view,
-                    &view_normal.texture_view,
-                    &view_analysis.texture_view,
-                )),
-            );
-            let color = render_device.create_bind_group(
-                None,
-                &pipeline.layout_color,
-                &BindGroupEntries::sequential((&view_color.texture_view,)),
-            );
             commands.insert_resource(ErosionBindGroups {
-                erosion,
-                color,
-                blit,
+                tiles: tile_bind_groups,
             });
         }
         None => {
-            // Create buffers once
-            let mut uniform = UniformBuffer::from(params.clone());
-            uniform.write_buffer(&render_device, &queue);
+            // Create shared buffers (brush data only)
+            let mut brush_idx = StorageBuffer::from(cpu_buffers.brush_indices.clone());
+            brush_idx.write_buffer(&render_device, &queue);
 
-            let texels = (params.map_size.x * params.map_size.y) as usize;
-            let mut height = StorageBuffer::from(vec![0.0f32; texels]);
-            height.write_buffer(&render_device, &queue);
-            // Create and fill initial height once using FBM on CPU for now (optional: let GPU init and copy back)
+            let mut brush_w = StorageBuffer::from(cpu_buffers.brush_weights.clone());
+            brush_w.write_buffer(&render_device, &queue);
+
+            // Create dummy buffer for edge tiles (same size as a height buffer)
+            let mut dummy_height = StorageBuffer::from(vec![0.0f32; texels_per_tile]);
+            dummy_height.write_buffer(&render_device, &queue);
 
             // Initialize RNG state
             let mut seed = if let Some(ref rs) = rng_state {
@@ -644,75 +819,148 @@ fn prepare_erosion_bind_groups(
             } else {
                 0xCAFEBABE_1234_5678
             };
-            let first_random = generate_random_indices_seeded(
-                params.num_particles,
-                params.map_size.x * params.map_size.y,
-                seed,
-            );
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+
+            // Create per-tile buffers first (we need all buffers to exist before creating bind groups)
+            let mut tile_buffers = Vec::new();
+
+            for tile_idx in 0..num_tiles {
+                let tile_coord = tile_config.tile_index_to_coord(tile_idx);
+
+                // Calculate world offset for this tile (for noise sampling)
+                let tile_world_offset = Vec2::new(
+                    tile_coord.x as f32 * tile_config.base_tile_size.x as f32,
+                    tile_coord.y as f32 * tile_config.base_tile_size.y as f32,
+                );
+
+                // Create per-tile uniform with world offset
+                let mut tile_params = params.clone();
+                tile_params.tile_world_offset = tile_world_offset;
+                let mut uniform = UniformBuffer::from(tile_params);
+                uniform.write_buffer(&render_device, &queue);
+
+                // Create height buffer for this tile
+                let mut height = StorageBuffer::from(vec![0.0f32; texels_per_tile]);
+                height.write_buffer(&render_device, &queue);
+
+                // Generate random indices for this tile
+                let first_random = generate_random_indices_seeded(
+                    params.num_particles,
+                    params.map_size.x * params.map_size.y,
+                    seed,
+                );
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let mut random = StorageBuffer::from(first_random);
+                random.write_buffer(&render_device, &queue);
+
+                // Create analysis buffers (flow, sediment, erosion)
+                let mut flow = StorageBuffer::from(vec![0u32; texels_per_tile]);
+                flow.write_buffer(&render_device, &queue);
+
+                let mut sediment = StorageBuffer::from(vec![0u32; texels_per_tile]);
+                sediment.write_buffer(&render_device, &queue);
+
+                let mut erosion_buf = StorageBuffer::from(vec![0u32; texels_per_tile]);
+                erosion_buf.write_buffer(&render_device, &queue);
+
+                tile_buffers.push(TileBuffers {
+                    uniform,
+                    height,
+                    random,
+                    flow,
+                    sediment,
+                    erosion: erosion_buf,
+                });
+            }
+
+            // Now create bind groups with neighbor references
+            let mut tile_bind_groups = Vec::new();
+
+            for tile_idx in 0..num_tiles {
+                let tile_images = &images.tiles[tile_idx];
+                let tile_buffers_ref = &tile_buffers[tile_idx];
+
+                // Get neighbor tile indices [left, right, top, bottom]
+                let neighbors = tile_config.get_neighbor_indices(tile_idx);
+
+                // Get neighbor height buffers (use dummy if neighbor doesn't exist)
+                let height_left = neighbors[0]
+                    .map(|idx| &tile_buffers[idx].height)
+                    .unwrap_or(&dummy_height);
+                let height_right = neighbors[1]
+                    .map(|idx| &tile_buffers[idx].height)
+                    .unwrap_or(&dummy_height);
+                let height_top = neighbors[2]
+                    .map(|idx| &tile_buffers[idx].height)
+                    .unwrap_or(&dummy_height);
+                let height_bottom = neighbors[3]
+                    .map(|idx| &tile_buffers[idx].height)
+                    .unwrap_or(&dummy_height);
+
+                // Get GPU texture views for this tile
+                let view_height = gpu_images.get(&tile_images.height).unwrap();
+                let view_color = gpu_images.get(&tile_images.color).unwrap();
+                let view_normal = gpu_images.get(&tile_images.normal).unwrap();
+                let view_analysis = gpu_images.get(&tile_images.analysis).unwrap();
+
+                // Build bind groups for this tile
+                let erosion_bg = render_device.create_bind_group(
+                    None,
+                    &pipeline.layout_erosion,
+                    &BindGroupEntries::sequential((
+                        &tile_buffers_ref.height,
+                        &tile_buffers_ref.uniform,
+                        &tile_buffers_ref.random,
+                        &brush_idx,
+                        &brush_w,
+                        &tile_buffers_ref.flow,
+                        &tile_buffers_ref.sediment,
+                        &tile_buffers_ref.erosion,
+                        height_left,
+                        height_right,
+                        height_top,
+                        height_bottom,
+                    )),
+                );
+
+                let blit = render_device.create_bind_group(
+                    None,
+                    &pipeline.layout_blit,
+                    &BindGroupEntries::sequential((
+                        &view_height.texture_view,
+                        &view_normal.texture_view,
+                        &view_analysis.texture_view,
+                    )),
+                );
+
+                let color = render_device.create_bind_group(
+                    None,
+                    &pipeline.layout_color,
+                    &BindGroupEntries::sequential((&view_color.texture_view,)),
+                );
+
+                tile_bind_groups.push(TileBindGroups {
+                    erosion: erosion_bg,
+                    color,
+                    blit,
+                });
+            }
+
+            // Update RNG state
             if let Some(mut rs) = rng_state {
                 rs.state = seed;
             } else {
                 commands.insert_resource(ErosionRngState { state: seed });
             }
-            let mut random = StorageBuffer::from(first_random);
-            random.write_buffer(&render_device, &queue);
 
-            let mut brush_idx = StorageBuffer::from(cpu_buffers.brush_indices.clone());
-            brush_idx.write_buffer(&render_device, &queue);
-
-            let mut brush_w = StorageBuffer::from(cpu_buffers.brush_weights.clone());
-            brush_w.write_buffer(&render_device, &queue);
-
-            // Initialize buffers for atomic operations
-            // All buffers store single scalar per pixel (1 u32 per pixel)
-            let mut flow = StorageBuffer::from(vec![0u32; texels]);
-            flow.write_buffer(&render_device, &queue);
-
-            let mut sediment = StorageBuffer::from(vec![0u32; texels]);
-            sediment.write_buffer(&render_device, &queue);
-
-            let mut erosion = StorageBuffer::from(vec![0u32; texels]);
-            erosion.write_buffer(&render_device, &queue);
-
-            // Build bind groups using these buffers
-            let erosion_bg = render_device.create_bind_group(
-                None,
-                &pipeline.layout_erosion,
-                &BindGroupEntries::sequential((
-                    &height, &uniform, &random, &brush_idx, &brush_w, &flow, &sediment, &erosion,
-                )),
-            );
-            let blit = render_device.create_bind_group(
-                None,
-                &pipeline.layout_blit,
-                &BindGroupEntries::sequential((
-                    &view_height.texture_view,
-                    &view_normal.texture_view,
-                    &view_analysis.texture_view,
-                )),
-            );
-            let color = render_device.create_bind_group(
-                None,
-                &pipeline.layout_color,
-                &BindGroupEntries::sequential((&view_color.texture_view,)),
-            );
-
-            // Insert buffers and groups as resources
+            // Insert buffers and bind groups as resources
             commands.insert_resource(ErosionBuffers {
-                uniform,
-                height,
-                random,
+                tiles: tile_buffers,
                 brush_idx,
                 brush_w,
-                flow,
-                sediment,
-                erosion,
+                dummy_height,
             });
             commands.insert_resource(ErosionBindGroups {
-                erosion: erosion_bg,
-                color,
-                blit,
+                tiles: tile_bind_groups,
             });
         }
     }
@@ -880,96 +1128,110 @@ impl Node for ErosionNode {
         let groups = world.resource::<ErosionBindGroups>();
         let params = world.resource::<ErodeParams>();
         let buffers = world.resource::<ErosionBuffers>();
+        let tile_config = world.resource::<TileConfig>();
+
+        let gx = (params.map_size.x + 7) / 8;
+        let gy = (params.map_size.y + 7) / 8;
 
         match self.state {
             ErosionState::Loading => {}
             ErosionState::Init => {
-                // Pass 1: init FBM (writes buffer)
-                {
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    let p_init = cache.get_compute_pipeline(pipes.pipeline_init).unwrap();
-                    pass.set_pipeline(p_init);
-                    pass.set_bind_group(0, &groups.erosion, &[]);
-                    let gx = (params.map_size.x + 7) / 8;
-                    let gy = (params.map_size.y + 7) / 8;
-                    pass.dispatch_workgroups(gx, gy, 1);
-                }
-                // Pass 1b: init color bands (uses height as input, writes color storage texture)
-                if let Some(p_color_ok) =
-                    match cache.get_compute_pipeline_state(pipes.pipeline_init_color) {
-                        CachedPipelineState::Ok(_) => {
-                            cache.get_compute_pipeline(pipes.pipeline_init_color)
-                        }
-                        _ => None,
-                    }
-                {
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    pass.set_pipeline(p_color_ok);
-                    pass.set_bind_group(0, &groups.erosion, &[]);
-                    pass.set_bind_group(1, &groups.color, &[]);
-                    let gx = (params.map_size.x + 7) / 8;
-                    let gy = (params.map_size.y + 7) / 8;
-                    pass.dispatch_workgroups(gx, gy, 1);
-                }
-                // Pass 2: blit (samples)
-                {
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    let p_blit = cache.get_compute_pipeline(pipes.pipeline_blit).unwrap();
-                    pass.set_pipeline(p_blit);
-                    pass.set_bind_group(0, &groups.erosion, &[]);
-                    pass.set_bind_group(1, &groups.blit, &[]);
-                    let gx = (params.map_size.x + 7) / 8;
-                    let gy = (params.map_size.y + 7) / 8;
-                    pass.dispatch_workgroups(gx, gy, 1);
-                }
-            }
-            ErosionState::Erode => {
-                // If reset happened recently, restore from initial before eroding
-                // (Handled via state transition to Loading/Init above)
-                // Pass 1: erode (writes storage) — gated by pause/step
-                if self.allow_erode_this_frame {
-                    if let Some(p_erode) = cache.get_compute_pipeline(pipes.pipeline_erode) {
+                // Initialize all tiles
+                for tile_idx in 0..tile_config.total_tiles() {
+                    let tile_groups = &groups.tiles[tile_idx];
+
+                    // Pass 1: init FBM (writes buffer)
+                    {
                         let mut pass = render_context
                             .command_encoder()
                             .begin_compute_pass(&ComputePassDescriptor::default());
-                        pass.set_pipeline(p_erode);
-                        pass.set_bind_group(0, &groups.erosion, &[]);
-                        pass.set_bind_group(1, &groups.color, &[]);
-                        let workgroups = (params.num_particles + 1023) / 1024;
-                        pass.dispatch_workgroups(workgroups, 1, 1);
-                    } else {
-                        error!("Erode pipeline not ready!");
+                        let p_init = cache.get_compute_pipeline(pipes.pipeline_init).unwrap();
+                        pass.set_pipeline(p_init);
+                        pass.set_bind_group(0, &tile_groups.erosion, &[]);
+                        pass.dispatch_workgroups(gx, gy, 1);
+                    }
+
+                    // Pass 1b: init color bands
+                    if let Some(p_color_ok) =
+                        match cache.get_compute_pipeline_state(pipes.pipeline_init_color) {
+                            CachedPipelineState::Ok(_) => {
+                                cache.get_compute_pipeline(pipes.pipeline_init_color)
+                            }
+                            _ => None,
+                        }
+                    {
+                        let mut pass = render_context
+                            .command_encoder()
+                            .begin_compute_pass(&ComputePassDescriptor::default());
+                        pass.set_pipeline(p_color_ok);
+                        pass.set_bind_group(0, &tile_groups.erosion, &[]);
+                        pass.set_bind_group(1, &tile_groups.color, &[]);
+                        pass.dispatch_workgroups(gx, gy, 1);
+                    }
+
+                    // Pass 2: blit
+                    {
+                        let mut pass = render_context
+                            .command_encoder()
+                            .begin_compute_pass(&ComputePassDescriptor::default());
+                        let p_blit = cache.get_compute_pipeline(pipes.pipeline_blit).unwrap();
+                        pass.set_pipeline(p_blit);
+                        pass.set_bind_group(0, &tile_groups.erosion, &[]);
+                        pass.set_bind_group(1, &tile_groups.blit, &[]);
+                        pass.dispatch_workgroups(gx, gy, 1);
                     }
                 }
-                // Pass 2: blit (samples)
-                {
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    let p_blit = cache.get_compute_pipeline(pipes.pipeline_blit).unwrap();
-                    pass.set_pipeline(p_blit);
-                    pass.set_bind_group(0, &groups.erosion, &[]);
-                    pass.set_bind_group(1, &groups.blit, &[]);
-                    let gx = (params.map_size.x + 7) / 8;
-                    let gy = (params.map_size.y + 7) / 8;
-                    pass.dispatch_workgroups(gx, gy, 1);
+            }
+            ErosionState::Erode => {
+                // Erode all tiles
+                for tile_idx in 0..tile_config.total_tiles() {
+                    let tile_groups = &groups.tiles[tile_idx];
+
+                    // Pass 1: erode
+                    if self.allow_erode_this_frame {
+                        if let Some(p_erode) = cache.get_compute_pipeline(pipes.pipeline_erode) {
+                            let mut pass = render_context
+                                .command_encoder()
+                                .begin_compute_pass(&ComputePassDescriptor::default());
+                            pass.set_pipeline(p_erode);
+                            pass.set_bind_group(0, &tile_groups.erosion, &[]);
+                            pass.set_bind_group(1, &tile_groups.color, &[]);
+                            let workgroups = (params.num_particles + 1023) / 1024;
+                            pass.dispatch_workgroups(workgroups, 1, 1);
+                        } else {
+                            error!("Erode pipeline not ready!");
+                        }
+
+                        // Pass 1.5: halo exchange (sync neighbor data into halo regions)
+                        if let Some(p_halo) =
+                            cache.get_compute_pipeline(pipes.pipeline_halo_exchange)
+                        {
+                            let mut pass = render_context
+                                .command_encoder()
+                                .begin_compute_pass(&ComputePassDescriptor::default());
+                            pass.set_pipeline(p_halo);
+                            pass.set_bind_group(0, &tile_groups.erosion, &[]);
+                            pass.dispatch_workgroups(gx, gy, 1);
+                        }
+                    }
+
+                    // Pass 2: blit
+                    {
+                        let mut pass = render_context
+                            .command_encoder()
+                            .begin_compute_pass(&ComputePassDescriptor::default());
+                        let p_blit = cache.get_compute_pipeline(pipes.pipeline_blit).unwrap();
+                        pass.set_pipeline(p_blit);
+                        pass.set_bind_group(0, &tile_groups.erosion, &[]);
+                        pass.set_bind_group(1, &tile_groups.blit, &[]);
+                        pass.dispatch_workgroups(gx, gy, 1);
+                    }
                 }
             }
         }
 
-        // Keep buffers alive (not strictly necessary, but avoids drop before usage on some backends)
-        let _keep = (
-            &buffers.uniform,
-            &buffers.random,
-            &buffers.brush_idx,
-            &buffers.brush_w,
-        );
+        // Keep buffers alive
+        let _keep = (&buffers.brush_idx, &buffers.brush_w);
 
         Ok(())
     }
