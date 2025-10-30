@@ -19,6 +19,9 @@ pub struct OrbitController {
     pub max_distance: f32,
     pub yaw: f32,
     pub pitch: f32,
+    pub target_yaw: f32,
+    pub target_pitch: f32,
+    pub damping_factor: f32,
     pub rotate_sensitivity: Vec2,
     pub zoom_sensitivity: f32,
     pub rotate_button: MouseButton,
@@ -26,13 +29,18 @@ pub struct OrbitController {
 
 impl Default for OrbitController {
     fn default() -> Self {
+        let initial_yaw = std::f32::consts::FRAC_PI_4;      // 45°
+        let initial_pitch = std::f32::consts::FRAC_PI_6;    // 30°
         Self {
             target: Vec3::new(0.0, 1.0, 0.0),
             distance: 200.0,
             min_distance: 30.0,
             max_distance: 2000.0,
-            yaw: std::f32::consts::FRAC_PI_4,      // 45°
-            pitch: std::f32::consts::FRAC_PI_6,    // 30°
+            yaw: initial_yaw,
+            pitch: initial_pitch,
+            target_yaw: initial_yaw,
+            target_pitch: initial_pitch,
+            damping_factor: 0.15, // Lerp factor per frame (0.0 = no movement, 1.0 = instant)
             rotate_sensitivity: Vec2::new(0.01, 0.01),
             zoom_sensitivity: 2.0, // units per line
             rotate_button: MouseButton::Left,
@@ -56,11 +64,11 @@ fn orbit_mouse_rotate(
         if !buttons.pressed(ctrl.rotate_button) {
             continue;
         }
-        ctrl.yaw -= delta.x * ctrl.rotate_sensitivity.x;
-        ctrl.pitch += delta.y * ctrl.rotate_sensitivity.y;
+        ctrl.target_yaw -= delta.x * ctrl.rotate_sensitivity.x;
+        ctrl.target_pitch += delta.y * ctrl.rotate_sensitivity.y;
         let max_pitch = std::f32::consts::FRAC_PI_2 - 0.01;
         let min_pitch = -max_pitch;
-        ctrl.pitch = ctrl.pitch.clamp(min_pitch, max_pitch);
+        ctrl.target_pitch = ctrl.target_pitch.clamp(min_pitch, max_pitch);
     }
 }
 
@@ -90,9 +98,13 @@ fn orbit_mouse_zoom(
 }
 
 fn apply_orbit_transform(
-    mut query: Query<(&mut Transform, &OrbitController), With<Camera3d>>,
+    mut query: Query<(&mut Transform, &mut OrbitController), With<Camera3d>>,
 ) {
-    for (mut transform, ctrl) in &mut query {
+    for (mut transform, mut ctrl) in &mut query {
+        // Lerp current yaw and pitch towards target values
+        ctrl.yaw = ctrl.yaw + (ctrl.target_yaw - ctrl.yaw) * ctrl.damping_factor;
+        ctrl.pitch = ctrl.pitch + (ctrl.target_pitch - ctrl.pitch) * ctrl.damping_factor;
+        
         // Spherical coordinates around target
         let x = ctrl.distance * ctrl.pitch.cos() * ctrl.yaw.sin();
         let y = ctrl.distance * ctrl.pitch.sin();

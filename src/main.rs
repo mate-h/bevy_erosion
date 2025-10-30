@@ -140,7 +140,6 @@ struct ErodeParams {
 
 #[derive(Resource, Clone, ExtractResource)]
 struct ErosionCpuBuffers {
-    random_indices: Vec<u32>,
     brush_indices: Vec<i32>,
     brush_weights: Vec<f32>,
 }
@@ -202,7 +201,6 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     let brush_radius: i32 = 16;
     let (brush_indices, brush_weights) = build_brush(SIZE.x as i32, brush_radius);
     let num_particles: u32 = 1024 * 8;
-    let random_indices = generate_random_indices(num_particles, (SIZE.x * SIZE.y) as u32);
 
     commands.insert_resource(ErodeParams {
         map_size: SIZE,
@@ -221,7 +219,6 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         num_particles,
     });
     commands.insert_resource(ErosionCpuBuffers {
-        random_indices,
         brush_indices,
         brush_weights,
     });
@@ -302,7 +299,7 @@ fn spawn_terrain(
             ..Default::default()
         },
         AtmosphereEnvironmentMapLight::default(),
-        Exposure { ev100: 13.0 },
+        Exposure { ev100: 12.0 },
         Tonemapping::AcesFitted,
         Bloom::NATURAL,
     ));
@@ -330,20 +327,6 @@ fn spawn_terrain(
 
     // 2d camera
     // commands.spawn((Camera2d, Transform::from_xyz(0.0, 0.0, 0.0)));
-}
-
-fn generate_random_indices(count: u32, max_index: u32) -> Vec<u32> {
-    let mut v = Vec::with_capacity(count as usize);
-    let mut state: u64 = 0x1234_5678_ABCD_EFFF;
-    for _ in 0..count {
-        // xorshift64*
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
-        let r = (state.wrapping_mul(2685821657736338717) >> 32) as u32;
-        v.push(if max_index == 0 { 0 } else { r % max_index });
-    }
-    v
 }
 
 fn generate_random_indices_seeded(count: u32, max_index: u32, mut state: u64) -> Vec<u32> {
