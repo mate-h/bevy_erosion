@@ -27,6 +27,8 @@ use bevy::{
 use std::borrow::Cow;
 mod camera;
 use camera::{OrbitCameraPlugin, OrbitController};
+mod sun;
+use sun::{SunPlugin, Sun, SunController};
 
 const EROSION_SHADER: &str = "erosion.wgsl";
 const TERRAIN_SHADER: &str = "terrain_extended.wgsl";
@@ -41,6 +43,7 @@ fn main() {
             ErosionComputePlugin,
             MaterialPlugin::<TerrainMaterial>::default(),
             OrbitCameraPlugin,
+            SunPlugin,
         ))
         .add_systems(Startup, (setup, print_controls))
         .add_systems(PostStartup, spawn_terrain)
@@ -305,13 +308,17 @@ fn spawn_terrain(
     ));
 
     // Directional light for PBR shading
+    let initial_sun_pos = Vec3::new(1.0, 0.1, 0.0);
+    let initial_sun_dir = -initial_sun_pos.normalize(); // Direction from origin to sun
     commands.spawn((
         DirectionalLight {
             shadows_enabled: true,
             illuminance: lux::RAW_SUNLIGHT,
             ..default()
         },
-        Transform::from_xyz(1.0, 0.1, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_translation(initial_sun_pos).looking_at(Vec3::ZERO, Vec3::Y),
+        Sun,
+        SunController::new(initial_sun_dir),
     ));
 
     // sprite for the color image
