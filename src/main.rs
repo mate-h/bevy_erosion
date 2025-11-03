@@ -4,8 +4,7 @@ use bevy::{
     core_pipeline::tonemapping::Tonemapping,
     light::{AtmosphereEnvironmentMapLight, light_consts::lux},
     pbr::{
-        Atmosphere, AtmosphereSettings, ExtendedMaterial, MaterialExtension, MaterialPlugin,
-        OpaqueRendererMethod,
+        Atmosphere, AtmosphereSettings, EarthlikeAtmosphere, ExtendedMaterial, MaterialExtension, MaterialPlugin, OpaqueRendererMethod, ScatteringMedium
     },
     post_process::bloom::Bloom,
     prelude::*,
@@ -226,7 +225,7 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     commands.insert_resource(SimControl::default());
     commands.insert_resource(CurrentPreviewMode::default());
 
-    commands.insert_resource(AmbientLight::NONE);
+    // commands.insert_resource(AmbientLight::default());
 }
 
 fn print_controls() {
@@ -246,6 +245,7 @@ fn spawn_terrain(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
+    earth_atmosphere: Res<EarthlikeAtmosphere>,
     erosion_images: Res<ErosionImages>,
 ) {
     // Spawn a subdivided plane with UVs
@@ -292,7 +292,7 @@ fn spawn_terrain(
             distance: 225.0,
             ..Default::default()
         },
-        Atmosphere::EARTH,
+        earth_atmosphere.get(),
         AtmosphereSettings {
             scene_units_to_m: 50.0,
             // rendering_method: AtmosphereMode::Raymarched,
@@ -396,9 +396,9 @@ impl Plugin for ErosionComputePlugin {
 
 #[derive(Resource)]
 struct ErosionPipeline {
-    layout_erosion: BindGroupLayout,
-    layout_color: BindGroupLayout,
-    layout_blit: BindGroupLayout,
+    layout_erosion: BindGroupLayoutDescriptor,
+    layout_color: BindGroupLayoutDescriptor,
+    layout_blit: BindGroupLayoutDescriptor,
     pipeline_init: CachedComputePipelineId,
     pipeline_init_color: CachedComputePipelineId,
     pipeline_erode: CachedComputePipelineId,
@@ -431,12 +431,11 @@ struct ErosionRngState {
 
 fn init_erosion_pipeline(
     mut commands: Commands,
-    render_device: Res<RenderDevice>,
     asset_server: Res<AssetServer>,
     pipeline_cache: Res<PipelineCache>,
 ) {
     // Layout for erosion (group 0)
-    let layout_erosion = render_device.create_bind_group_layout(
+    let layout_erosion = BindGroupLayoutDescriptor::new(
         "ErosionGroup0",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
@@ -454,7 +453,7 @@ fn init_erosion_pipeline(
     );
 
     // Layout for blit (group 1)
-    let layout_blit = render_device.create_bind_group_layout(
+    let layout_blit = BindGroupLayoutDescriptor::new(
         "ErosionBlitGroup1",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
@@ -467,7 +466,7 @@ fn init_erosion_pipeline(
     );
 
     // Layout for color (group 1 for erosion/color init)
-    let layout_color = render_device.create_bind_group_layout(
+    let layout_color = BindGroupLayoutDescriptor::new(
         "ErosionColorGroup1",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
@@ -518,6 +517,7 @@ fn init_erosion_pipeline(
 fn prepare_erosion_bind_groups(
     mut commands: Commands,
     pipeline: Res<ErosionPipeline>,
+    pipeline_cache: Res<PipelineCache>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     images: Res<ErosionImages>,
     params: Res<ErodeParams>,
@@ -579,7 +579,7 @@ fn prepare_erosion_bind_groups(
             // Reuse existing buffers, just rebuild bind groups (safe across frames)
             let erosion = render_device.create_bind_group(
                 None,
-                &pipeline.layout_erosion,
+                &pipeline_cache.get_bind_group_layout(&pipeline.layout_erosion),
                 &BindGroupEntries::sequential((
                     &buffers.height,
                     &buffers.uniform,
@@ -593,7 +593,7 @@ fn prepare_erosion_bind_groups(
             );
             let blit = render_device.create_bind_group(
                 None,
-                &pipeline.layout_blit,
+                &pipeline_cache.get_bind_group_layout(&pipeline.layout_blit),
                 &BindGroupEntries::sequential((
                     &view_height.texture_view,
                     &view_normal.texture_view,
@@ -602,7 +602,7 @@ fn prepare_erosion_bind_groups(
             );
             let color = render_device.create_bind_group(
                 None,
-                &pipeline.layout_color,
+                &pipeline_cache.get_bind_group_layout(&pipeline.layout_color),
                 &BindGroupEntries::sequential((&view_color.texture_view,)),
             );
             commands.insert_resource(ErosionBindGroups {
@@ -661,14 +661,14 @@ fn prepare_erosion_bind_groups(
             // Build bind groups using these buffers
             let erosion_bg = render_device.create_bind_group(
                 None,
-                &pipeline.layout_erosion,
+                &pipeline_cache.get_bind_group_layout(&pipeline.layout_erosion),
                 &BindGroupEntries::sequential((
                     &height, &uniform, &random, &brush_idx, &brush_w, &flow, &sediment, &erosion,
                 )),
             );
             let blit = render_device.create_bind_group(
                 None,
-                &pipeline.layout_blit,
+                &pipeline_cache.get_bind_group_layout(&pipeline.layout_blit),
                 &BindGroupEntries::sequential((
                     &view_height.texture_view,
                     &view_normal.texture_view,
@@ -677,7 +677,7 @@ fn prepare_erosion_bind_groups(
             );
             let color = render_device.create_bind_group(
                 None,
-                &pipeline.layout_color,
+                &pipeline_cache.get_bind_group_layout(&pipeline.layout_color),
                 &BindGroupEntries::sequential((&view_color.texture_view,)),
             );
 
@@ -721,6 +721,7 @@ fn handle_preview_mode_input(
     mut preview_mode: ResMut<CurrentPreviewMode>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
     mut cameras: Query<(&mut Atmosphere, &mut Tonemapping, &mut Bloom), With<Camera3d>>,
+    earth_atmosphere: Res<EarthlikeAtmosphere>,
 ) {
     let new_mode = if keys.just_pressed(KeyCode::Digit1) {
         Some(PreviewMode::Pbr)
@@ -759,15 +760,18 @@ fn handle_preview_mode_input(
             for (mut atmosphere, mut tonemapping, mut bloom) in cameras.iter_mut() {
                 if mode == PreviewMode::Pbr {
                     // Enable atmosphere and bloom for PBR
-                    *atmosphere = Atmosphere::EARTH;
+                    *atmosphere = earth_atmosphere.get();
                     *tonemapping = Tonemapping::AcesFitted;
                     *bloom = Bloom::NATURAL;
                 } else {
                     // Disable atmosphere and bloom for debug modes
+                    // Preserve the medium handle to avoid invalid asset errors
+                    let medium_handle = atmosphere.medium.clone();
                     *atmosphere = Atmosphere {
-                        rayleigh_scattering: Vec3::ZERO,
-                        mie_scattering: 0.0,
-                        ..default()
+                        bottom_radius: 0.0,
+                        top_radius: 0.0,
+                        ground_albedo: Vec3::ZERO,
+                        medium: medium_handle,
                     };
                     *tonemapping = Tonemapping::None;
                     bloom.intensity = 0.0;
