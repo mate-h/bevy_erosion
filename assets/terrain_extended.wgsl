@@ -8,19 +8,20 @@
 }
 
 // Extension bind group uses MATERIAL_BIND_GROUP with slots starting at 100
+// Height has sampler for smooth interpolation in vertex shader
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var height_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var height_sampler: sampler;
+// Color and analysis textures use texelFetch (no samplers) to reduce sampler count
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var color_tex: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(103) var color_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(103) var analysis_tex: texture_2d<f32>;
+// AO texture with sampler for smooth interpolation
+@group(#{MATERIAL_BIND_GROUP}) @binding(104) var ao_tex: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(105) var ao_sampler: sampler;
 
 struct TerrainParams {
     height_scale: f32,
 }
-@group(#{MATERIAL_BIND_GROUP}) @binding(104) var<uniform> terrain_params: TerrainParams;
-
-// Analysis texture: R=flow_mag, G=sediment, B=erosion, A=flow_angle
-@group(#{MATERIAL_BIND_GROUP}) @binding(105) var analysis_tex: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(106) var analysis_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(106) var<uniform> terrain_params: TerrainParams;
 
 struct PreviewParams {
     mode: u32,  // 0=PBR, 1=Flow, 2=Sediment, 3=Erosion, 4=Height, 5=ViewSpaceNormals
@@ -37,7 +38,7 @@ struct VertexIn {
 
 @vertex
 fn vertex(v: VertexIn) -> VertexOutput {
-    // Sample height at UV to displace along local +Y
+    // Sample height at UV to displace along local +Y (using sampler for smooth interpolation)
     let h = textureSampleLevel(height_tex, height_sampler, v.uv, 0.0).x;
     let displaced_local = vec3<f32>(v.position.x, v.position.y + h * terrain_params.height_scale, v.position.z);
 
@@ -134,35 +135,38 @@ fn apply_lambert_shading(base_color: vec4<f32>, world_normal: vec3<f32>) -> vec4
 
 // Get base color for the current preview mode
 fn get_preview_color(mode: u32, uv: vec2<f32>, world_normal: vec3<f32>) -> vec4<f32> {
+    let dims = textureDimensions(color_tex, 0);
+    let px = vec2<i32>(vec2<f32>(dims) * uv);
+    
     switch (mode) {
         case MODE_FLOW: {
-            let analysis = textureSample(analysis_tex, analysis_sampler, uv);
+            let analysis = textureSample(analysis_tex, ao_sampler, uv);
             let flow_mag = analysis.r * 0.01;
             let color = heat_map(flow_mag);
             return vec4<f32>(color, 1.0);
         }
         case MODE_SEDIMENT: {
-            let analysis = textureSample(analysis_tex, analysis_sampler, uv);
+            let analysis = textureSample(analysis_tex, ao_sampler, uv);
             let sediment = analysis.g * 20.0;
             let color = heat_map(sediment);
             return vec4<f32>(color, 1.0);
         }
         case MODE_EROSION: {
-            let analysis = textureSample(analysis_tex, analysis_sampler, uv);
+            let analysis = textureSample(analysis_tex, ao_sampler, uv);
             let erosion = analysis.b * 100.0;
             let color = heat_map(erosion);
             return vec4<f32>(color, 1.0);
         }
         case MODE_HEIGHT: {
             // Height: repeating black/white bands for high contrast visualization
-            let height = textureSample(height_tex, height_sampler, uv).x;
+            let height = textureSampleLevel(height_tex, height_sampler, uv, 0.0).x;
             let bands = fract(height * 100.0); // 100 repeating bands
             let color = step(0.5, bands); // Black (0) or white (1)
             return vec4(vec3(height + (color * .2)), 1.0);
         }
         default: {
-            // PBR mode: use computed color texture
-            return textureSample(color_tex, color_sampler, uv);
+            // PBR mode: use computed color texture with linear sampling
+            return textureSample(color_tex, ao_sampler, uv);
         }
     }
 }
@@ -170,6 +174,9 @@ fn get_preview_color(mode: u32, uv: vec2<f32>, world_normal: vec3<f32>) -> vec4<
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
     var out: FragmentOutput;
+    
+    // Sample precomputed ambient occlusion with linear interpolation for smooth result
+    let ao_value = textureSample(ao_tex, ao_sampler, in.uv).x;
     
     // Create PBR input for lighting
     var pbr_input = pbr_input_from_standard_material(in, is_front);
@@ -181,6 +188,8 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     if (preview_params.mode == MODE_PBR) {
         // Full PBR lighting for default mode
         pbr_input.material.base_color = alpha_discard(pbr_input.material, base_color);
+        // Apply AO to diffuse_occlusion
+        pbr_input.diffuse_occlusion = vec3<f32>(ao_value);
         out.color = apply_pbr_lighting(pbr_input);
         out.color = main_pass_post_lighting_processing(pbr_input, out.color);
     } 
@@ -191,8 +200,9 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         out.color = pow(color, vec4(vec3(4.0), 1.0));
     }
     else {
-        // Simple Lambert shading for preview modes
+        // Simple Lambert shading for preview modes - apply AO as simple multiplier
         out.color = apply_lambert_shading(base_color, in.world_normal);
+        out.color = vec4<f32>(out.color.rgb * ao_value, out.color.a);
     }
     
     return out;

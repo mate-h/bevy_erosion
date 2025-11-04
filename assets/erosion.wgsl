@@ -151,7 +151,17 @@ fn init_color_bands(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = u32(gid.y * params.map_size.x + gid.x);
     let h = height[idx];
     let c = band_color_from_height(h);
-    textureStore(color_image, vec2<i32>(gid.xy), vec4<f32>(c, 1.0));
+    
+    // Generate FBM noise for black overlay (using different scale/offset from height field)
+    let uv = vec2<f32>(gid.xy);
+    let noise = fbm(uv * 0.015 + vec2<f32>(100.0, 100.0)); // Different scale and offset
+    let noise_factor = clamp(noise, 0.0, 1.0);
+    let black = vec3<f32>(0.0, 0.0, 0.0);
+    
+    // Blend black FBM noise on top of color bands
+    let blended = mix(c, black, noise_factor); // 30% max darkening
+    
+    textureStore(color_image, vec2<i32>(gid.xy), vec4<f32>(blended, 1.0));
 }
 
 fn load_height(p: vec2<i32>) -> f32 {
@@ -306,6 +316,7 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(1) @binding(0) var display_out: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(1) var normal_out: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(2) var analysis_out: texture_storage_2d<rgba16float, write>;  // R=flow_mag, G=sediment, B=erosion, A=flow_angle
+@group(1) @binding(3) var ao_out: texture_storage_2d<r16float, read_write>;
 
 @compute @workgroup_size(8,8,1)
 fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -353,4 +364,175 @@ fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(analysis_out, vec2<i32>(px, py), analysis);
 }
 
+// Hammersley low-discrepancy sequence for uniform sampling
+// Based on Bevy's hammersley_2d implementation
+fn radical_inverse_VdC(bits_in: u32) -> f32 {
+    var bits = bits_in;
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return f32(bits) * 2.3283064365386963e-10; // / 0x100000000
+}
+
+fn hammersley_2d(i: u32, n: u32) -> vec2<f32> {
+    return vec2<f32>(f32(i) / f32(n), radical_inverse_VdC(i));
+}
+
+// PCG hash for noise generation
+fn pcg_hash(input: u32) -> u32 {
+    let state = input * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+// Interleaved gradient noise for dithering
+fn interleaved_gradient_noise(pixel_coordinates: vec2<f32>, frame: u32) -> f32 {
+    let xy = pixel_coordinates + 5.588238 * f32(frame % 64u);
+    return fract(52.9829189 * fract(0.06711056 * xy.x + 0.00583715 * xy.y));
+}
+
+const PI = 3.14159265359;
+const HALF_PI = 1.57079632679;
+const PI_2 = 6.28318530718;
+
+// Compute ambient occlusion from heightmap
+// Sample count, radius, strength are hardcoded for compute shader
+@compute @workgroup_size(8,8,1)
+fn compute_ao(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
+    
+    let size_x = i32(params.map_size.x);
+    let size_y = i32(params.map_size.y);
+    let px = i32(gid.x);
+    let py = i32(gid.y);
+    let idx = u32(py * size_x + px);
+    
+    let current_height = height[idx];
+    
+    // AO parameters (matching the default values from Rust)
+    let sample_count = 64u; // Increased for smoother result
+    let sample_radius_px = 0.08 * f32(params.map_size.x); // Convert UV radius to pixels
+    let strength = 1.5;
+    let bias = 0.0;
+    let height_scale = 50.0; // Match terrain height scale
+    let terrain_size = 512.0; // Terrain world size
+    
+    var occlusion = 0.0;
+    
+    for (var i = 0u; i < sample_count; i = i + 1u) {
+        // Use Hammersley sequence for well-distributed samples (no noise for consistency)
+        let h = hammersley_2d(i, sample_count);
+        
+        // Angle from Hammersley sequence only
+        let angle = h.x * PI_2;
+        
+        // Radius using sqrt for uniform disk distribution
+        let radius_t = h.y;
+        let radius_px = sqrt(radius_t) * sample_radius_px;
+        
+        // Sample offset in pixel space
+        let offset = vec2<f32>(cos(angle), sin(angle)) * radius_px;
+        let sample_x = clamp(px + i32(round(offset.x)), 0, size_x - 1);
+        let sample_y = clamp(py + i32(round(offset.y)), 0, size_y - 1);
+        let sample_idx = u32(sample_y * size_x + sample_x);
+        
+        // Sample height
+        let sample_height = height[sample_idx];
+        
+        // Height difference (scaled to world space)
+        let height_diff = (sample_height - current_height) * height_scale;
+        
+        // Distance in pixel space
+        let px_distance = length(offset);
+        
+        // Convert to world distance
+        let world_distance = (px_distance / f32(params.map_size.x)) * terrain_size;
+        
+        // Skip if distance is too small
+        if (world_distance < 0.1) {
+            continue;
+        }
+        
+        // Calculate occlusion: samples higher than current point block sky light
+        if (height_diff > 0.001) {
+            // Calculate the horizon angle
+            let elevation_angle = atan(height_diff / world_distance);
+            
+            // Distance falloff with smoothstep
+            let t = px_distance / sample_radius_px;
+            let falloff = 1.0 - (t * t * (3.0 - 2.0 * t));
+            
+            // Accumulate occlusion
+            let contribution = (elevation_angle / HALF_PI) * falloff;
+            occlusion = occlusion + contribution;
+        }
+    }
+    
+    // Average and scale occlusion
+    occlusion = (occlusion / f32(sample_count)) * strength * 8.0;
+    
+    // Convert to AO value (1.0 = bright, 0.0 = dark)
+    let ao_value = 1.0 - clamp(occlusion, 0.0, 1.0);
+    
+    // Apply power curve for contrast
+    let ao_final = pow(ao_value, 0.8);
+    
+    // Apply bias
+    let ao = max(ao_final, bias);
+    
+    // Write AO value to texture (single channel R16Float)
+    textureStore(ao_out, vec2<i32>(px, py), vec4<f32>(ao, 0.0, 0.0, 0.0));
+}
+
+// Gaussian blur pass for smoothing AO
+// Temporary storage texture for separable blur
+@group(1) @binding(4) var ao_temp: texture_storage_2d<r16float, read_write>;
+
+@compute @workgroup_size(8,8,1)
+fn blur_ao_horizontal(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
+    
+    let px = i32(gid.x);
+    let py = i32(gid.y);
+    let size_x = i32(params.map_size.x);
+    
+    // 5-tap Gaussian kernel weights (approximation: 1, 4, 6, 4, 1) / 16
+    let weights = array<f32, 5>(0.0625, 0.25, 0.375, 0.25, 0.0625);
+    
+    var sum = 0.0;
+    for (var i = 0; i < 5; i = i + 1) {
+        let offset = i - 2;
+        let sample_x = clamp(px + offset, 0, size_x - 1);
+        let ao_val = textureLoad(ao_out, vec2<i32>(sample_x, py)).x;
+        sum = sum + ao_val * weights[i];
+    }
+    
+    // Write to temp texture
+    textureStore(ao_temp, vec2<i32>(px, py), vec4<f32>(sum, 0.0, 0.0, 0.0));
+}
+
+@compute @workgroup_size(8,8,1)
+fn blur_ao_vertical(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
+    
+    let px = i32(gid.x);
+    let py = i32(gid.y);
+    let size_y = i32(params.map_size.y);
+    
+    // 5-tap Gaussian kernel weights
+    let weights = array<f32, 5>(0.0625, 0.25, 0.375, 0.25, 0.0625);
+    
+    var sum = 0.0;
+    for (var i = 0; i < 5; i = i + 1) {
+        let offset = i - 2;
+        let sample_y = clamp(py + offset, 0, size_y - 1);
+        let ao_val = textureLoad(ao_temp, vec2<i32>(px, sample_y)).x;
+        sum = sum + ao_val * weights[i];
+    }
+    
+    // Write back to AO output
+    textureStore(ao_out, vec2<i32>(px, py), vec4<f32>(sum, 0.0, 0.0, 0.0));
+}
 

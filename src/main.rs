@@ -1,14 +1,7 @@
 use bevy::{
-    asset::RenderAssetUsages,
-    camera::Exposure,
-    core_pipeline::tonemapping::Tonemapping,
-    light::{AtmosphereEnvironmentMapLight, light_consts::lux},
-    pbr::{
-        Atmosphere, AtmosphereSettings, EarthlikeAtmosphere, ExtendedMaterial, MaterialExtension, MaterialPlugin, OpaqueRendererMethod, ScatteringMedium
-    },
-    post_process::bloom::Bloom,
-    prelude::*,
-    render::{
+    asset::RenderAssetUsages, core_pipeline::tonemapping::Tonemapping, light::{AtmosphereEnvironmentMapLight, light_consts::lux}, math::{cubic_splines::LinearSpline, vec2}, pbr::{
+        Atmosphere, AtmosphereSettings, EarthlikeAtmosphere, ExtendedMaterial, MaterialExtension, MaterialPlugin, OpaqueRendererMethod
+    }, post_process::{auto_exposure::{AutoExposure, AutoExposureCompensationCurve, AutoExposurePlugin}, bloom::Bloom}, prelude::*, render::{
         Render, RenderApp, RenderStartup, RenderSystems,
         extract_resource::{ExtractResource, ExtractResourcePlugin},
         render_asset::RenderAssets,
@@ -21,8 +14,7 @@ use bevy::{
         },
         renderer::{RenderContext, RenderDevice, RenderQueue},
         texture::GpuImage,
-    },
-    shader::{PipelineCacheError, ShaderRef},
+    }, shader::{PipelineCacheError, ShaderRef}
 };
 use std::borrow::Cow;
 mod camera;
@@ -34,6 +26,8 @@ const EROSION_SHADER: &str = "erosion.wgsl";
 const TERRAIN_SHADER: &str = "terrain_extended.wgsl";
 
 const SIZE: UVec2 = UVec2::new(512, 512);
+// Controls how much to under-expose (in F-stops). Negative values = under-expose, positive = over-expose
+const UNDER_EXPOSURE_AMOUNT: f32 = -2.0;
 
 fn main() {
     App::new()
@@ -44,6 +38,7 @@ fn main() {
             MaterialPlugin::<TerrainMaterial>::default(),
             OrbitCameraPlugin,
             SunPlugin,
+            AutoExposurePlugin,
         ))
         .add_systems(Startup, (setup, print_controls))
         .add_systems(PostStartup, spawn_terrain)
@@ -64,6 +59,8 @@ struct ErosionImages {
     color: Handle<Image>,
     normal: Handle<Image>,
     analysis: Handle<Image>, // Combined: R=flow_mag, G=sediment, B=erosion, A=flow_dir_encoded
+    ao: Handle<Image>, // Ambient occlusion texture
+    ao_temp: Handle<Image>, // Temporary texture for AO blur
 }
 
 type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
@@ -79,22 +76,43 @@ enum PreviewMode {
     Normals,
 }
 
+#[derive(Debug, Clone, Copy, ShaderType, Reflect)]
+struct AOParams {
+    sample_count: u32,
+    sample_radius: f32,
+    strength: f32,
+    bias: f32,
+}
+
+impl Default for AOParams {
+    fn default() -> Self {
+        Self {
+            sample_count: 48,  // Increase for smoother result
+            sample_radius: 0.08,
+            strength: 1.5,
+            bias: 0.0,
+        }
+    }
+}
+
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
 struct TerrainExtension {
-    // Height map sampled in vertex shader
+    // Height map with sampler (used in vertex shader)
     #[texture(100)]
     #[sampler(101)]
     height_tex: Handle<Image>,
-    // Color map sampled in fragment shader
+    // Color map (no sampler, use texelFetch)
     #[texture(102)]
-    #[sampler(103)]
     color_tex: Handle<Image>,
-    // Analysis texture: R=flow_mag, G=sediment, B=erosion
-    #[texture(105)]
-    #[sampler(106)]
+    // Analysis texture (no sampler, use texelFetch)
+    #[texture(103)]
     analysis_tex: Handle<Image>,
+    // AO texture with sampler for smooth interpolation
+    #[texture(104)]
+    #[sampler(105)]
+    ao_tex: Handle<Image>,
     // Displacement height scale
-    #[uniform(104)]
+    #[uniform(106)]
     height_scale: f32,
     // Preview mode: 0=PBR, 1=Flow, 2=Sediment, 3=Erosion, 4=Height, 5=Normals
     #[uniform(107)]
@@ -107,6 +125,7 @@ impl Default for TerrainExtension {
             height_tex: Default::default(),
             color_tex: Default::default(),
             analysis_tex: Default::default(),
+            ao_tex: Default::default(),
             height_scale: 50.0,
             preview_mode: 0,
         }
@@ -192,11 +211,27 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
     let analysis_handle = images.add(analysis);
 
+    // AO texture (R16Float) - ambient occlusion
+    let mut ao = Image::new_target_texture(SIZE.x, SIZE.y, TextureFormat::R16Float);
+    ao.asset_usage = RenderAssetUsages::RENDER_WORLD;
+    ao.texture_descriptor.usage =
+        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
+    let ao_handle = images.add(ao);
+
+    // AO temp texture for blur pass
+    let mut ao_temp = Image::new_target_texture(SIZE.x, SIZE.y, TextureFormat::R16Float);
+    ao_temp.asset_usage = RenderAssetUsages::RENDER_WORLD;
+    ao_temp.texture_descriptor.usage =
+        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
+    let ao_temp_handle = images.add(ao_temp);
+
     commands.insert_resource(ErosionImages {
         height: height_handle,
         color: color_handle,
         normal: normal_handle,
         analysis: analysis_handle,
+        ao: ao_handle,
+        ao_temp: ao_temp_handle,
     });
 
     // Parameters
@@ -228,7 +263,7 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     commands.insert_resource(SimControl::default());
     commands.insert_resource(CurrentPreviewMode::default());
 
-    // commands.insert_resource(AmbientLight::default());
+    commands.insert_resource(GlobalAmbientLight::NONE);
 }
 
 fn print_controls() {
@@ -248,6 +283,7 @@ fn spawn_terrain(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
+    mut compensation_curves: ResMut<Assets<AutoExposureCompensationCurve>>,
     earth_atmosphere: Res<EarthlikeAtmosphere>,
     erosion_images: Res<ErosionImages>,
 ) {
@@ -266,7 +302,7 @@ fn spawn_terrain(
     let mat_handle = materials.add(ExtendedMaterial {
         base: StandardMaterial {
             base_color: Color::srgb(1.0, 1.0, 1.0),
-            perceptual_roughness: 0.8,
+            perceptual_roughness: 1.0,
             metallic: 0.0,
             opaque_render_method: OpaqueRendererMethod::Auto,
             ..Default::default()
@@ -275,6 +311,7 @@ fn spawn_terrain(
             height_tex: erosion_images.height.clone(),
             color_tex: erosion_images.color.clone(),
             analysis_tex: erosion_images.analysis.clone(),
+            ao_tex: erosion_images.ao.clone(),
             height_scale: 50.0,
             preview_mode: 0, // Default to PBR
         },
@@ -286,6 +323,23 @@ fn spawn_terrain(
         Transform::from_xyz(0.0, 0.0, 0.0),
     ));
 
+    let mut atmosphere = earth_atmosphere.get();
+    atmosphere.ground_albedo = Vec3::new(0.0, 0.0, 0.0);
+
+    // Create a compensation curve that slightly under-exposes
+    // Negative compensation values = darker/under-exposed
+    // The curve shape applies more under-exposure in darker scenes and less in brighter scenes
+    let under_expose_curve = compensation_curves.add(
+        AutoExposureCompensationCurve::from_curve(LinearSpline::new([
+            vec2(-4.0, UNDER_EXPOSURE_AMOUNT * 1.67), // Dark scenes: more under-exposure
+            vec2(-2.0, UNDER_EXPOSURE_AMOUNT * 1.33), // Medium-dark: moderate under-exposure
+            vec2(0.0, UNDER_EXPOSURE_AMOUNT),         // Middle gray: base under-exposure
+            vec2(2.0, UNDER_EXPOSURE_AMOUNT * 0.67), // Medium-bright: less under-exposure
+            vec2(4.0, UNDER_EXPOSURE_AMOUNT * 0.33), // Bright scenes: minimal under-exposure
+        ]))
+        .expect("Failed to create compensation curve"),
+    );
+
     // 3D camera
     commands.spawn((
         Camera3d::default(),
@@ -295,16 +349,19 @@ fn spawn_terrain(
             distance: 225.0,
             ..Default::default()
         },
-        earth_atmosphere.get(),
+        atmosphere,
         AtmosphereSettings {
-            scene_units_to_m: 50.0,
+            scene_units_to_m: 10.0,
             // rendering_method: AtmosphereMode::Raymarched,
             ..Default::default()
         },
         AtmosphereEnvironmentMapLight::default(),
-        Exposure { ev100: 12.0 },
         Tonemapping::AcesFitted,
         Bloom::NATURAL,
+        AutoExposure {
+            compensation_curve: under_expose_curve,
+            ..Default::default()
+        },
     ));
 
     // Directional light for PBR shading
@@ -406,10 +463,14 @@ struct ErosionPipeline {
     layout_erosion: BindGroupLayoutDescriptor,
     layout_color: BindGroupLayoutDescriptor,
     layout_blit: BindGroupLayoutDescriptor,
+    layout_blit_blur: BindGroupLayoutDescriptor,
     pipeline_init: CachedComputePipelineId,
     pipeline_init_color: CachedComputePipelineId,
     pipeline_erode: CachedComputePipelineId,
     pipeline_blit: CachedComputePipelineId,
+    pipeline_ao: CachedComputePipelineId,
+    pipeline_blur_h: CachedComputePipelineId,
+    pipeline_blur_v: CachedComputePipelineId,
 }
 
 #[derive(Resource)]
@@ -417,6 +478,7 @@ struct ErosionBindGroups {
     erosion: BindGroup,
     color: BindGroup,
     blit: BindGroup,
+    blit_blur: BindGroup,
 }
 
 #[derive(Resource)]
@@ -468,6 +530,22 @@ fn init_erosion_pipeline(
                 texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly), // height display
                 texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly), // normal
                 texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly), // analysis (flow+sediment+erosion combined)
+                texture_storage_2d(TextureFormat::R16Float, StorageTextureAccess::ReadWrite), // AO (ReadWrite for blur)
+            ),
+        ),
+    );
+
+    // Layout for blit with blur (group 1) - includes temp texture
+    let layout_blit_blur = BindGroupLayoutDescriptor::new(
+        "ErosionBlitBlurGroup1",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly), // height display
+                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly), // normal
+                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly), // analysis (flow+sediment+erosion combined)
+                texture_storage_2d(TextureFormat::R16Float, StorageTextureAccess::ReadWrite), // AO
+                texture_storage_2d(TextureFormat::R16Float, StorageTextureAccess::ReadWrite), // AO temp
             ),
         ),
     );
@@ -505,8 +583,26 @@ fn init_erosion_pipeline(
     });
     let pipeline_blit = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         layout: vec![layout_erosion.clone(), layout_blit.clone()],
-        shader,
+        shader: shader.clone(),
         entry_point: Some(Cow::from("blit_to_texture")),
+        ..default()
+    });
+    let pipeline_ao = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        layout: vec![layout_erosion.clone(), layout_blit.clone()],
+        shader: shader.clone(),
+        entry_point: Some(Cow::from("compute_ao")),
+        ..default()
+    });
+    let pipeline_blur_h = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        layout: vec![layout_erosion.clone(), layout_blit_blur.clone()],
+        shader: shader.clone(),
+        entry_point: Some(Cow::from("blur_ao_horizontal")),
+        ..default()
+    });
+    let pipeline_blur_v = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        layout: vec![layout_erosion.clone(), layout_blit_blur.clone()],
+        shader,
+        entry_point: Some(Cow::from("blur_ao_vertical")),
         ..default()
     });
 
@@ -514,10 +610,14 @@ fn init_erosion_pipeline(
         layout_erosion,
         layout_color,
         layout_blit,
+        layout_blit_blur,
         pipeline_init,
         pipeline_init_color,
         pipeline_erode,
         pipeline_blit,
+        pipeline_ao,
+        pipeline_blur_h,
+        pipeline_blur_v,
     });
 }
 
@@ -538,6 +638,8 @@ fn prepare_erosion_bind_groups(
     let view_color = gpu_images.get(&images.color).unwrap();
     let view_normal = gpu_images.get(&images.normal).unwrap();
     let view_analysis = gpu_images.get(&images.analysis).unwrap();
+    let view_ao = gpu_images.get(&images.ao).unwrap();
+    let view_ao_temp = gpu_images.get(&images.ao_temp).unwrap();
 
     // Check if we need to verify buffer structure
     let texels = (params.map_size.x * params.map_size.y) as usize;
@@ -605,6 +707,7 @@ fn prepare_erosion_bind_groups(
                     &view_height.texture_view,
                     &view_normal.texture_view,
                     &view_analysis.texture_view,
+                    &view_ao.texture_view,
                 )),
             );
             let color = render_device.create_bind_group(
@@ -612,10 +715,22 @@ fn prepare_erosion_bind_groups(
                 &pipeline_cache.get_bind_group_layout(&pipeline.layout_color),
                 &BindGroupEntries::sequential((&view_color.texture_view,)),
             );
+            let blit_blur = render_device.create_bind_group(
+                None,
+                &pipeline_cache.get_bind_group_layout(&pipeline.layout_blit_blur),
+                &BindGroupEntries::sequential((
+                    &view_height.texture_view,
+                    &view_normal.texture_view,
+                    &view_analysis.texture_view,
+                    &view_ao.texture_view,
+                    &view_ao_temp.texture_view,
+                )),
+            );
             commands.insert_resource(ErosionBindGroups {
                 erosion,
                 color,
                 blit,
+                blit_blur,
             });
         }
         None => {
@@ -680,12 +795,24 @@ fn prepare_erosion_bind_groups(
                     &view_height.texture_view,
                     &view_normal.texture_view,
                     &view_analysis.texture_view,
+                    &view_ao.texture_view,
                 )),
             );
             let color = render_device.create_bind_group(
                 None,
                 &pipeline_cache.get_bind_group_layout(&pipeline.layout_color),
                 &BindGroupEntries::sequential((&view_color.texture_view,)),
+            );
+            let blit_blur = render_device.create_bind_group(
+                None,
+                &pipeline_cache.get_bind_group_layout(&pipeline.layout_blit_blur),
+                &BindGroupEntries::sequential((
+                    &view_height.texture_view,
+                    &view_normal.texture_view,
+                    &view_analysis.texture_view,
+                    &view_ao.texture_view,
+                    &view_ao_temp.texture_view,
+                )),
             );
 
             // Insert buffers and groups as resources
@@ -703,6 +830,7 @@ fn prepare_erosion_bind_groups(
                 erosion: erosion_bg,
                 color,
                 blit,
+                blit_blur,
             });
         }
     }
@@ -922,6 +1050,42 @@ impl Node for ErosionNode {
                     let gy = (params.map_size.y + 7) / 8;
                     pass.dispatch_workgroups(gx, gy, 1);
                 }
+                // Pass 3: compute AO
+                if let Some(p_ao) = cache.get_compute_pipeline(pipes.pipeline_ao) {
+                    let mut pass = render_context
+                        .command_encoder()
+                        .begin_compute_pass(&ComputePassDescriptor::default());
+                    pass.set_pipeline(p_ao);
+                    pass.set_bind_group(0, &groups.erosion, &[]);
+                    pass.set_bind_group(1, &groups.blit, &[]);
+                    let gx = (params.map_size.x + 7) / 8;
+                    let gy = (params.map_size.y + 7) / 8;
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
+                // Pass 4: blur AO horizontally
+                if let Some(p_blur_h) = cache.get_compute_pipeline(pipes.pipeline_blur_h) {
+                    let mut pass = render_context
+                        .command_encoder()
+                        .begin_compute_pass(&ComputePassDescriptor::default());
+                    pass.set_pipeline(p_blur_h);
+                    pass.set_bind_group(0, &groups.erosion, &[]);
+                    pass.set_bind_group(1, &groups.blit_blur, &[]);
+                    let gx = (params.map_size.x + 7) / 8;
+                    let gy = (params.map_size.y + 7) / 8;
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
+                // Pass 5: blur AO vertically
+                if let Some(p_blur_v) = cache.get_compute_pipeline(pipes.pipeline_blur_v) {
+                    let mut pass = render_context
+                        .command_encoder()
+                        .begin_compute_pass(&ComputePassDescriptor::default());
+                    pass.set_pipeline(p_blur_v);
+                    pass.set_bind_group(0, &groups.erosion, &[]);
+                    pass.set_bind_group(1, &groups.blit_blur, &[]);
+                    let gx = (params.map_size.x + 7) / 8;
+                    let gy = (params.map_size.y + 7) / 8;
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
             }
             ErosionState::Erode => {
                 // If reset happened recently, restore from initial before eroding
@@ -950,6 +1114,42 @@ impl Node for ErosionNode {
                     pass.set_pipeline(p_blit);
                     pass.set_bind_group(0, &groups.erosion, &[]);
                     pass.set_bind_group(1, &groups.blit, &[]);
+                    let gx = (params.map_size.x + 7) / 8;
+                    let gy = (params.map_size.y + 7) / 8;
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
+                // Pass 3: compute AO
+                if let Some(p_ao) = cache.get_compute_pipeline(pipes.pipeline_ao) {
+                    let mut pass = render_context
+                        .command_encoder()
+                        .begin_compute_pass(&ComputePassDescriptor::default());
+                    pass.set_pipeline(p_ao);
+                    pass.set_bind_group(0, &groups.erosion, &[]);
+                    pass.set_bind_group(1, &groups.blit, &[]);
+                    let gx = (params.map_size.x + 7) / 8;
+                    let gy = (params.map_size.y + 7) / 8;
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
+                // Pass 4: blur AO horizontally
+                if let Some(p_blur_h) = cache.get_compute_pipeline(pipes.pipeline_blur_h) {
+                    let mut pass = render_context
+                        .command_encoder()
+                        .begin_compute_pass(&ComputePassDescriptor::default());
+                    pass.set_pipeline(p_blur_h);
+                    pass.set_bind_group(0, &groups.erosion, &[]);
+                    pass.set_bind_group(1, &groups.blit_blur, &[]);
+                    let gx = (params.map_size.x + 7) / 8;
+                    let gy = (params.map_size.y + 7) / 8;
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
+                // Pass 5: blur AO vertically
+                if let Some(p_blur_v) = cache.get_compute_pipeline(pipes.pipeline_blur_v) {
+                    let mut pass = render_context
+                        .command_encoder()
+                        .begin_compute_pass(&ComputePassDescriptor::default());
+                    pass.set_pipeline(p_blur_v);
+                    pass.set_bind_group(0, &groups.erosion, &[]);
+                    pass.set_bind_group(1, &groups.blit_blur, &[]);
                     let gx = (params.map_size.x + 7) / 8;
                     let gy = (params.map_size.y + 7) / 8;
                     pass.dispatch_workgroups(gx, gy, 1);
