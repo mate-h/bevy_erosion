@@ -3,7 +3,11 @@
 // Pass 2: erode - run droplets using structured buffers (map as storage texture).
 // Pass 3: blit_to_texture - optional, copy height to rgba for display.
 
-@group(0) @binding(0) var<storage, read_write> height: array<f32>;
+// Height stored as fixed-point u32 (multiply by HEIGHT_SCALE) to allow atomic operations
+// This prevents race conditions when multiple droplets modify the same pixel
+const HEIGHT_SCALE: f32 = 1000000.0;
+
+@group(0) @binding(0) var<storage, read_write> height: array<atomic<u32>>;
 
 // For init_fbm we only need output; height_in is ignored.
 
@@ -93,7 +97,7 @@ fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uv = vec2<f32>(gid.xy);
     let hval = fbm(uv);
     let idx = gid.y * params.map_size.x + gid.x;
-    height[idx] = hval * 1.0;
+    atomicStore(&height[idx], u32(hval * HEIGHT_SCALE));
     
     // Clear flow, sediment, and erosion buffers (all store 1 value per pixel)
     atomicStore(&flow_buffer[idx], 0u);
@@ -149,7 +153,7 @@ fn init_color_bands(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
     let size = i32(params.map_size.x);
     let idx = u32(gid.y * params.map_size.x + gid.x);
-    let h = height[idx];
+    let h = f32(atomicLoad(&height[idx])) / HEIGHT_SCALE;
     let c = band_color_from_height(h);
     
     // Generate FBM noise for black overlay (using different scale/offset from height field)
@@ -167,7 +171,7 @@ fn init_color_bands(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn load_height(p: vec2<i32>) -> f32 {
     let size = i32(params.map_size.x);
     let idx = u32(p.y * size + p.x);
-    return height[idx];
+    return f32(atomicLoad(&height[idx])) / HEIGHT_SCALE;
 }
 
 fn sample_height_and_gradient(pos: vec2<f32>) -> vec3<f32> {
@@ -252,10 +256,11 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
             let iNE = u32(base + 1);
             let iSW = u32(base + size_i);
             let iSE = u32(base + size_i + 1);
-            height[iNW] = height[iNW] + deposit * wNW;
-            height[iNE] = height[iNE] + deposit * wNE;
-            height[iSW] = height[iSW] + deposit * wSW;
-            height[iSE] = height[iSE] + deposit * wSE;
+            // Use atomicAdd to prevent race conditions when multiple droplets modify same pixel
+            atomicAdd(&height[iNW], u32(deposit * wNW * HEIGHT_SCALE));
+            atomicAdd(&height[iNE], u32(deposit * wNE * HEIGHT_SCALE));
+            atomicAdd(&height[iSW], u32(deposit * wSW * HEIGHT_SCALE));
+            atomicAdd(&height[iSE], u32(deposit * wSE * HEIGHT_SCALE));
             
             // Accumulate sediment deposition (convert to fixed-point: multiply by 10000)
             atomicAdd(&sediment_buffer[iNW], u32(deposit * wNW * 10000.0));
@@ -286,10 +291,12 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let erodeIndex = dropletIndex + brush_indices[i];
                 if (erodeIndex >= 0 && erodeIndex < map_len) {
                     let idx = u32(erodeIndex);
-                    let current = height[idx];
+                    let current_fixed = atomicLoad(&height[idx]);
+                    let current = f32(current_fixed) / HEIGHT_SCALE;
                     let weighted = amountToErode * brush_weights[i];
                     let delta = select(weighted, current, current < weighted);
-                    height[idx] = current - delta;
+                    // Use atomicSub to prevent race conditions
+                    atomicSub(&height[idx], u32(delta * HEIGHT_SCALE));
                     sediment += delta;
                     
                     // Accumulate erosion - use larger multiplier to avoid truncation with fine brush
@@ -315,7 +322,7 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @group(1) @binding(0) var display_out: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(1) var normal_out: texture_storage_2d<rgba16float, write>;
-@group(1) @binding(2) var analysis_out: texture_storage_2d<rgba16float, write>;  // R=flow_mag, G=sediment, B=erosion, A=flow_angle
+@group(1) @binding(2) var analysis_out: texture_storage_2d<rgba16float, write>;  // R=flow_mag, G=sediment, B=erosion, A=curvature
 @group(1) @binding(3) var ao_out: texture_storage_2d<r16float, read_write>;
 
 @compute @workgroup_size(8,8,1)
@@ -326,7 +333,7 @@ fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px = i32(gid.x);
     let py = i32(gid.y);
     let idx = u32(py * size_x + px);
-    let h = height[idx];
+    let h = f32(atomicLoad(&height[idx])) / HEIGHT_SCALE;
 
     // grayscale height to display
     let c = h;
@@ -338,10 +345,10 @@ fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ym1 = max(py - 1, 0);
     let yp1 = min(py + 1, size_y - 1);
 
-    let hL = height[u32(py * size_x + xm1)];
-    let hR = height[u32(py * size_x + xp1)];
-    let hD = height[u32(ym1 * size_x + px)];
-    let hU = height[u32(yp1 * size_x + px)];
+    let hL = f32(atomicLoad(&height[u32(py * size_x + xm1)])) / HEIGHT_SCALE;
+    let hR = f32(atomicLoad(&height[u32(py * size_x + xp1)])) / HEIGHT_SCALE;
+    let hD = f32(atomicLoad(&height[u32(ym1 * size_x + px)])) / HEIGHT_SCALE;
+    let hU = f32(atomicLoad(&height[u32(yp1 * size_x + px)])) / HEIGHT_SCALE;
 
     let dx = hR - hL;
     let dy = hU - hD;
@@ -354,12 +361,18 @@ fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
     let sediment = f32(atomicLoad(&sediment_buffer[idx])) / 10000.0;
     let erosion = f32(atomicLoad(&erosion_buffer[idx])) / 100000.0;
     
-    // Pack into analysis texture: R=flow_mag, G=sediment, B=erosion
+    // Compute curvature using Laplacian of height field (5-point stencil)
+    // Positive curvature = convex (peaks/ridges), negative = concave (valleys)
+    let curvature_raw = (hL + hR + hD + hU - 4.0 * h);
+    // Scale and center curvature for visualization (map to [0,1] range approximately)
+    let curvature = curvature_raw * 50.0 + 0.5;
+    
+    // Pack into analysis texture: R=flow_mag, G=sediment, B=erosion, A=curvature
     let analysis = vec4<f32>(
         flow_mag,
         sediment,
         erosion,
-        0.0
+        curvature
     );
     textureStore(analysis_out, vec2<i32>(px, py), analysis);
 }
@@ -409,7 +422,7 @@ fn compute_ao(@builtin(global_invocation_id) gid: vec3<u32>) {
     let py = i32(gid.y);
     let idx = u32(py * size_x + px);
     
-    let current_height = height[idx];
+    let current_height = f32(atomicLoad(&height[idx])) / HEIGHT_SCALE;
     
     // AO parameters (matching the default values from Rust)
     let sample_count = 64u; // Increased for smoother result
@@ -439,7 +452,7 @@ fn compute_ao(@builtin(global_invocation_id) gid: vec3<u32>) {
         let sample_idx = u32(sample_y * size_x + sample_x);
         
         // Sample height
-        let sample_height = height[sample_idx];
+        let sample_height = f32(atomicLoad(&height[sample_idx])) / HEIGHT_SCALE;
         
         // Height difference (scaled to world space)
         let height_diff = (sample_height - current_height) * height_scale;

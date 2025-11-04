@@ -74,6 +74,7 @@ enum PreviewMode {
     Erosion,
     Height,
     Normals,
+    Curvature,
 }
 
 #[derive(Debug, Clone, Copy, ShaderType, Reflect)]
@@ -114,7 +115,7 @@ struct TerrainExtension {
     // Displacement height scale
     #[uniform(106)]
     height_scale: f32,
-    // Preview mode: 0=PBR, 1=Flow, 2=Sediment, 3=Erosion, 4=Height, 5=Normals
+    // Preview mode: 0=PBR, 1=Flow, 2=Sediment, 3=Erosion, 4=Height, 5=Normals, 6=Curvature
     #[uniform(107)]
     preview_mode: u32,
 }
@@ -277,6 +278,7 @@ fn print_controls() {
     println!("  4 - Erosion mask preview");
     println!("  5 - Height map preview");
     println!("  6 - View-space normals preview");
+    println!("  7 - Curvature map preview");
 }
 
 fn spawn_terrain(
@@ -484,7 +486,7 @@ struct ErosionBindGroups {
 #[derive(Resource)]
 struct ErosionBuffers {
     uniform: UniformBuffer<ErodeParams>,
-    height: StorageBuffer<Vec<f32>>,
+    height: StorageBuffer<Vec<u32>>,   // atomic<u32> in shader (fixed-point)
     random: StorageBuffer<Vec<u32>>,
     brush_idx: StorageBuffer<Vec<i32>>,
     brush_w: StorageBuffer<Vec<f32>>,
@@ -509,7 +511,7 @@ fn init_erosion_pipeline(
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                storage_buffer::<f32>(false), // height
+                storage_buffer::<u32>(false),           // height (atomic<u32> in shader, fixed-point)
                 uniform_buffer::<ErodeParams>(false),
                 storage_buffer_read_only::<u32>(false), // random_indices
                 storage_buffer_read_only::<i32>(false), // brush_indices
@@ -739,9 +741,9 @@ fn prepare_erosion_bind_groups(
             uniform.write_buffer(&render_device, &queue);
 
             let texels = (params.map_size.x * params.map_size.y) as usize;
-            let mut height = StorageBuffer::from(vec![0.0f32; texels]);
+            // Height buffer now uses u32 for atomic operations (fixed-point representation in shader)
+            let mut height = StorageBuffer::from(vec![0u32; texels]);
             height.write_buffer(&render_device, &queue);
-            // Create and fill initial height once using FBM on CPU for now (optional: let GPU init and copy back)
 
             // Initialize RNG state
             let mut seed = if let Some(ref rs) = rng_state {
@@ -870,6 +872,8 @@ fn handle_preview_mode_input(
         Some(PreviewMode::Height)
     } else if keys.just_pressed(KeyCode::Digit6) {
         Some(PreviewMode::Normals)
+    } else if keys.just_pressed(KeyCode::Digit7) {
+        Some(PreviewMode::Curvature)
     } else {
         None
     };
@@ -888,6 +892,7 @@ fn handle_preview_mode_input(
                     PreviewMode::Erosion => 3,
                     PreviewMode::Height => 4,
                     PreviewMode::Normals => 5,
+                    PreviewMode::Curvature => 6,
                 };
             }
 
