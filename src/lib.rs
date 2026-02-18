@@ -1,7 +1,10 @@
 use bevy::{
-    asset::RenderAssetUsages, core_pipeline::tonemapping::Tonemapping, light::{AtmosphereEnvironmentMapLight, light_consts::lux}, math::{cubic_splines::LinearSpline, vec2}, pbr::{
-        Atmosphere, AtmosphereSettings, EarthlikeAtmosphere, ExtendedMaterial, MaterialExtension, MaterialPlugin, OpaqueRendererMethod
-    }, post_process::{auto_exposure::{AutoExposure, AutoExposureCompensationCurve, AutoExposurePlugin}, bloom::Bloom}, prelude::*, render::{
+    asset::RenderAssetUsages,
+    pbr::{
+        ExtendedMaterial, MaterialExtension, StandardMaterial,
+    },
+    prelude::*,
+    render::{
         Render, RenderApp, RenderStartup, RenderSystems,
         extract_resource::{ExtractResource, ExtractResourcePlugin},
         render_asset::RenderAssets,
@@ -10,63 +13,58 @@ use bevy::{
             binding_types::{
                 storage_buffer, storage_buffer_read_only, texture_storage_2d, uniform_buffer,
             },
-            *,
+            TextureFormat, TextureUsages, *,
         },
         renderer::{RenderContext, RenderDevice, RenderQueue},
         texture::GpuImage,
-    }, shader::{PipelineCacheError, ShaderRef}
+    },
+    shader::ShaderRef,
 };
 use std::borrow::Cow;
-mod camera;
-use camera::{OrbitCameraPlugin, OrbitController};
-mod sun;
-use sun::{SunPlugin, Sun, SunController};
+
+pub mod camera;
+pub mod sun;
 
 const EROSION_SHADER: &str = "erosion.wgsl";
 const TERRAIN_SHADER: &str = "terrain_extended.wgsl";
 
-const SIZE: UVec2 = UVec2::new(512, 512);
-// Controls how much to under-expose (in F-stops). Negative values = under-expose, positive = over-expose
-const UNDER_EXPOSURE_AMOUNT: f32 = -2.0;
-
-fn main() {
-    App::new()
-        .insert_resource(ClearColor(Color::BLACK))
-        .add_plugins((
-            DefaultPlugins,
-            ErosionComputePlugin,
-            MaterialPlugin::<TerrainMaterial>::default(),
-            OrbitCameraPlugin,
-            SunPlugin,
-            AutoExposurePlugin,
-        ))
-        .add_systems(Startup, (setup, print_controls))
-        .add_systems(PostStartup, spawn_terrain)
-        .add_systems(
-            Update,
-            (
-                handle_reset_input,
-                handle_sim_input,
-                handle_preview_mode_input,
-            ),
-        )
-        .run();
-}
-
+/// Resource containing handles to all erosion-related images
 #[derive(Resource, Clone, ExtractResource)]
-struct ErosionImages {
-    height: Handle<Image>,
-    color: Handle<Image>,
-    normal: Handle<Image>,
-    analysis: Handle<Image>, // Combined: R=flow_mag, G=sediment, B=erosion, A=flow_dir_encoded
-    ao: Handle<Image>, // Ambient occlusion texture
-    ao_temp: Handle<Image>, // Temporary texture for AO blur
+pub struct ErosionImages {
+    pub height: Handle<Image>,
+    pub color: Handle<Image>,
+    pub normal: Handle<Image>,
+    pub analysis: Handle<Image>, // Combined: R=flow_mag, G=sediment, B=erosion, A=flow_dir_encoded
+    pub ao: Handle<Image>,        // Ambient occlusion texture
+    pub ao_temp: Handle<Image>,   // Temporary texture for AO blur
 }
 
-type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
+/// Creates all erosion render-target images for the given map size and adds them to `images`.
+/// Called automatically by `ErosionComputePlugin` from `ErosionConfig`; exposed for custom setups.
+pub fn create_erosion_images(images: &mut Assets<Image>, size: UVec2) -> ErosionImages {
+    let add = |images: &mut Assets<Image>, format: TextureFormat| {
+        let mut image = Image::new_target_texture(size.x, size.y, format);
+        image.asset_usage = RenderAssetUsages::RENDER_WORLD;
+        image.texture_descriptor.usage =
+            TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
+        images.add(image)
+    };
+    ErosionImages {
+        height: add(images, TextureFormat::Rgba16Float),
+        color: add(images, TextureFormat::Rgba16Float),
+        normal: add(images, TextureFormat::Rgba16Float),
+        analysis: add(images, TextureFormat::Rgba16Float),
+        ao: add(images, TextureFormat::R16Float),
+        ao_temp: add(images, TextureFormat::R16Float),
+    }
+}
 
+/// Extended material type for terrain rendering
+pub type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
+
+/// Preview mode for terrain visualization
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Reflect)]
-enum PreviewMode {
+pub enum PreviewMode {
     #[default]
     Pbr,
     Flow,
@@ -77,18 +75,19 @@ enum PreviewMode {
     Curvature,
 }
 
+/// Parameters for ambient occlusion computation
 #[derive(Debug, Clone, Copy, ShaderType, Reflect)]
-struct AOParams {
-    sample_count: u32,
-    sample_radius: f32,
-    strength: f32,
-    bias: f32,
+pub struct AOParams {
+    pub sample_count: u32,
+    pub sample_radius: f32,
+    pub strength: f32,
+    pub bias: f32,
 }
 
 impl Default for AOParams {
     fn default() -> Self {
         Self {
-            sample_count: 48,  // Increase for smoother result
+            sample_count: 48, // Increase for smoother result
             sample_radius: 0.08,
             strength: 1.5,
             bias: 0.0,
@@ -96,28 +95,29 @@ impl Default for AOParams {
     }
 }
 
+/// Material extension for terrain rendering with height maps, color maps, and analysis textures
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
-struct TerrainExtension {
+pub struct TerrainExtension {
     // Height map with sampler (used in vertex shader)
     #[texture(100)]
     #[sampler(101)]
-    height_tex: Handle<Image>,
+    pub height_tex: Handle<Image>,
     // Color map (no sampler, use texelFetch)
     #[texture(102)]
-    color_tex: Handle<Image>,
+    pub color_tex: Handle<Image>,
     // Analysis texture (no sampler, use texelFetch)
     #[texture(103)]
-    analysis_tex: Handle<Image>,
+    pub analysis_tex: Handle<Image>,
     // AO texture with sampler for smooth interpolation
     #[texture(104)]
     #[sampler(105)]
-    ao_tex: Handle<Image>,
+    pub ao_tex: Handle<Image>,
     // Displacement height scale
     #[uniform(106)]
-    height_scale: f32,
+    pub height_scale: f32,
     // Preview mode: 0=PBR, 1=Flow, 2=Sediment, 3=Erosion, 4=Height, 5=Normals, 6=Curvature
     #[uniform(107)]
-    preview_mode: u32,
+    pub preview_mode: u32,
 }
 
 impl Default for TerrainExtension {
@@ -142,309 +142,171 @@ impl MaterialExtension for TerrainExtension {
     }
 }
 
+/// Parameters for the erosion simulation
 #[derive(Resource, Clone, ExtractResource, ShaderType)]
-struct ErodeParams {
-    map_size: UVec2,
-    max_lifetime: u32,
-    border_size: u32,
-    inertia: f32,
-    sediment_capacity_factor: f32,
-    min_sediment_capacity: f32,
-    deposit_speed: f32,
-    erode_speed: f32,
-    evaporate_speed: f32,
-    gravity: f32,
-    start_speed: f32,
-    start_water: f32,
-    brush_length: u32,
-    num_particles: u32,
+pub struct ErodeParams {
+    pub map_size: UVec2,
+    pub max_lifetime: u32,
+    pub border_size: u32,
+    pub inertia: f32,
+    pub sediment_capacity_factor: f32,
+    pub min_sediment_capacity: f32,
+    pub deposit_speed: f32,
+    pub erode_speed: f32,
+    pub evaporate_speed: f32,
+    pub gravity: f32,
+    pub start_speed: f32,
+    pub start_water: f32,
+    pub brush_length: u32,
+    pub num_particles: u32,
 }
 
+impl Default for ErodeParams {
+    fn default() -> Self {
+        Self {
+            map_size: UVec2::new(512, 512),
+            max_lifetime: 32,
+            border_size: 0,
+            inertia: 0.05,
+            sediment_capacity_factor: 4.0,
+            min_sediment_capacity: 0.01,
+            deposit_speed: 0.3,
+            erode_speed: 0.3,
+            evaporate_speed: 0.01,
+            gravity: 4.0,
+            start_speed: 1.0,
+            start_water: 1.0,
+            brush_length: 0, // set from brush in setup_erosion_resources
+            num_particles: 1024 * 8,
+        }
+    }
+}
+
+/// CPU-side buffers for brush data
 #[derive(Resource, Clone, ExtractResource)]
-struct ErosionCpuBuffers {
-    brush_indices: Vec<i32>,
-    brush_weights: Vec<f32>,
+pub struct ErosionCpuBuffers {
+    pub brush_indices: Vec<i32>,
+    pub brush_weights: Vec<f32>,
 }
 
+/// Resource to trigger simulation reset
 #[derive(Resource, Clone, ExtractResource, Default)]
-struct ResetSim {
-    generation: u32,
+pub struct ResetSim {
+    pub generation: u32,
 }
 
+/// Resource to control simulation state
 #[derive(Resource, Clone, ExtractResource, Default)]
-struct SimControl {
-    paused: bool,
-    step_counter: u64,
+pub struct SimControl {
+    pub paused: bool,
+    pub step_counter: u64,
 }
 
-#[derive(Resource, Default)]
-struct CurrentPreviewMode {
-    mode: PreviewMode,
+/// User-facing configuration for the erosion simulation. Insert this (or use the default) before
+/// the app runs; the plugin creates `ErosionImages`, `ErodeParams`, and related resources from it.
+/// At runtime you can mutate `ErodeParams` directly to tweak the simulation.
+#[derive(Resource, Clone)]
+pub struct ErosionConfig {
+    /// Map width and height (e.g. 512×512).
+    pub map_size: UVec2,
+    /// Brush radius in texels for erosion deposition.
+    pub brush_radius: i32,
+    /// Number of droplet particles per frame.
+    pub num_particles: u32,
+    /// Max droplet steps before termination.
+    pub max_lifetime: u32,
+    /// Pixels to leave unmoved at map edges.
+    pub border_size: u32,
+    /// How much velocity is preserved between steps (0–1).
+    pub inertia: f32,
+    pub sediment_capacity_factor: f32,
+    pub min_sediment_capacity: f32,
+    pub deposit_speed: f32,
+    pub erode_speed: f32,
+    pub evaporate_speed: f32,
+    pub gravity: f32,
+    pub start_speed: f32,
+    pub start_water: f32,
 }
 
-fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
-    // Height texture (rgba16float) written by compute blit
-    let mut height = Image::new_target_texture(SIZE.x, SIZE.y, TextureFormat::Rgba16Float);
-    height.asset_usage = RenderAssetUsages::RENDER_WORLD;
-    height.texture_descriptor.usage =
-        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
-    let height_handle = images.add(height);
+impl Default for ErosionConfig {
+    fn default() -> Self {
+        Self {
+            map_size: UVec2::new(512, 512),
+            brush_radius: 16,
+            num_particles: 1024 * 8,
+            max_lifetime: 32,
+            border_size: 0,
+            inertia: 0.05,
+            sediment_capacity_factor: 4.0,
+            min_sediment_capacity: 0.01,
+            deposit_speed: 0.3,
+            erode_speed: 0.3,
+            evaporate_speed: 0.01,
+            gravity: 4.0,
+            start_speed: 1.0,
+            start_water: 1.0,
+        }
+    }
+}
 
-    // Color texture (Rgba16Float) used as storage for color advection and sampled in terrain shader
-    let mut color = Image::new_target_texture(SIZE.x, SIZE.y, TextureFormat::Rgba16Float);
-    color.asset_usage = RenderAssetUsages::RENDER_WORLD;
-    color.texture_descriptor.usage =
-        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
-    let color_handle = images.add(color);
+impl ErosionConfig {
+    /// Produces `ErodeParams` for the GPU, with `brush_length` derived from the actual brush.
+    pub fn to_erode_params(&self, brush_length: u32) -> ErodeParams {
+        ErodeParams {
+            map_size: self.map_size,
+            max_lifetime: self.max_lifetime,
+            border_size: self.border_size,
+            inertia: self.inertia,
+            sediment_capacity_factor: self.sediment_capacity_factor,
+            min_sediment_capacity: self.min_sediment_capacity,
+            deposit_speed: self.deposit_speed,
+            erode_speed: self.erode_speed,
+            evaporate_speed: self.evaporate_speed,
+            gravity: self.gravity,
+            start_speed: self.start_speed,
+            start_water: self.start_water,
+            brush_length,
+            num_particles: self.num_particles,
+        }
+    }
+}
 
-    // Normal texture (Rgba16Float) written by compute and optionally sampled later
-    let mut normal = Image::new_target_texture(SIZE.x, SIZE.y, TextureFormat::Rgba16Float);
-    normal.asset_usage = RenderAssetUsages::RENDER_WORLD;
-    normal.texture_descriptor.usage =
-        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
-    let normal_handle = images.add(normal);
+/// Plugin for erosion compute simulation
+pub struct ErosionComputePlugin;
 
-    // Analysis texture (Rgba16Float) - combined flow/sediment/erosion data
-    // R channel: flow magnitude, G channel: sediment, B channel: erosion, A channel: flow direction encoded
-    let mut analysis = Image::new_target_texture(SIZE.x, SIZE.y, TextureFormat::Rgba16Float);
-    analysis.asset_usage = RenderAssetUsages::RENDER_WORLD;
-    analysis.texture_descriptor.usage =
-        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
-    let analysis_handle = images.add(analysis);
+#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
+struct ErosionLabel;
 
-    // AO texture (R16Float) - ambient occlusion
-    let mut ao = Image::new_target_texture(SIZE.x, SIZE.y, TextureFormat::R16Float);
-    ao.asset_usage = RenderAssetUsages::RENDER_WORLD;
-    ao.texture_descriptor.usage =
-        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
-    let ao_handle = images.add(ao);
+fn setup_erosion_resources(
+    config: Res<ErosionConfig>,
+    mut commands: Commands,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let size = config.map_size;
+    commands.insert_resource(create_erosion_images(&mut images, size));
 
-    // AO temp texture for blur pass
-    let mut ao_temp = Image::new_target_texture(SIZE.x, SIZE.y, TextureFormat::R16Float);
-    ao_temp.asset_usage = RenderAssetUsages::RENDER_WORLD;
-    ao_temp.texture_descriptor.usage =
-        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
-    let ao_temp_handle = images.add(ao_temp);
-
-    commands.insert_resource(ErosionImages {
-        height: height_handle,
-        color: color_handle,
-        normal: normal_handle,
-        analysis: analysis_handle,
-        ao: ao_handle,
-        ao_temp: ao_temp_handle,
-    });
-
-    // Parameters
-    let brush_radius: i32 = 16;
-    let (brush_indices, brush_weights) = build_brush(SIZE.x as i32, brush_radius);
-    let num_particles: u32 = 1024 * 8;
-
-    commands.insert_resource(ErodeParams {
-        map_size: SIZE,
-        max_lifetime: 32,
-        border_size: 0,
-        inertia: 0.05,
-        sediment_capacity_factor: 4.0,
-        min_sediment_capacity: 0.01,
-        deposit_speed: 0.3,
-        erode_speed: 0.3,
-        evaporate_speed: 0.01,
-        gravity: 4.0,
-        start_speed: 1.0,
-        start_water: 1.0,
-        brush_length: brush_indices.len() as u32,
-        num_particles,
-    });
+    let (brush_indices, brush_weights) = build_brush(size.x as i32, config.brush_radius);
+    commands.insert_resource(config.to_erode_params(brush_indices.len() as u32));
     commands.insert_resource(ErosionCpuBuffers {
         brush_indices,
         brush_weights,
     });
     commands.insert_resource(ResetSim::default());
     commands.insert_resource(SimControl::default());
-    commands.insert_resource(CurrentPreviewMode::default());
-
-    commands.insert_resource(GlobalAmbientLight::NONE);
 }
-
-fn print_controls() {
-    println!("Controls:");
-    println!("  R - reset simulation");
-    println!("  Space - pause/resume");
-    println!("  E - step one iteration (when paused)");
-    println!("  1 - PBR shading mode (default)");
-    println!("  2 - Flow map preview");
-    println!("  3 - Sediment mask preview");
-    println!("  4 - Erosion mask preview");
-    println!("  5 - Height map preview");
-    println!("  6 - View-space normals preview");
-    println!("  7 - Curvature map preview");
-}
-
-fn spawn_terrain(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<TerrainMaterial>>,
-    mut compensation_curves: ResMut<Assets<AutoExposureCompensationCurve>>,
-    earth_atmosphere: Res<EarthlikeAtmosphere>,
-    erosion_images: Res<ErosionImages>,
-) {
-    // Spawn a subdivided plane with UVs
-    let size = 512.0;
-    let resolution = 511; // subdivisions
-    let half_size = size * 0.5;
-    let plane = Mesh::from(
-        Plane3d::default()
-            .mesh()
-            .subdivisions(resolution)
-            .size(half_size, half_size),
-    );
-    let mesh_handle = meshes.add(plane);
-
-    let mat_handle = materials.add(ExtendedMaterial {
-        base: StandardMaterial {
-            base_color: Color::srgb(1.0, 1.0, 1.0),
-            perceptual_roughness: 1.0,
-            metallic: 0.0,
-            opaque_render_method: OpaqueRendererMethod::Auto,
-            ..Default::default()
-        },
-        extension: TerrainExtension {
-            height_tex: erosion_images.height.clone(),
-            color_tex: erosion_images.color.clone(),
-            analysis_tex: erosion_images.analysis.clone(),
-            ao_tex: erosion_images.ao.clone(),
-            height_scale: 50.0,
-            preview_mode: 0, // Default to PBR
-        },
-    });
-
-    commands.spawn((
-        Mesh3d(mesh_handle),
-        MeshMaterial3d(mat_handle),
-        Transform::from_xyz(0.0, 0.0, 0.0),
-    ));
-
-    let mut atmosphere = earth_atmosphere.get();
-    atmosphere.ground_albedo = Vec3::new(0.0, 0.0, 0.0);
-
-    // Create a compensation curve that slightly under-exposes
-    // Negative compensation values = darker/under-exposed
-    // The curve shape applies more under-exposure in darker scenes and less in brighter scenes
-    let under_expose_curve = compensation_curves.add(
-        AutoExposureCompensationCurve::from_curve(LinearSpline::new([
-            vec2(-4.0, UNDER_EXPOSURE_AMOUNT * 1.67), // Dark scenes: more under-exposure
-            vec2(-2.0, UNDER_EXPOSURE_AMOUNT * 1.33), // Medium-dark: moderate under-exposure
-            vec2(0.0, UNDER_EXPOSURE_AMOUNT),         // Middle gray: base under-exposure
-            vec2(2.0, UNDER_EXPOSURE_AMOUNT * 0.67), // Medium-bright: less under-exposure
-            vec2(4.0, UNDER_EXPOSURE_AMOUNT * 0.33), // Bright scenes: minimal under-exposure
-        ]))
-        .expect("Failed to create compensation curve"),
-    );
-
-    // 3D camera
-    commands.spawn((
-        Camera3d::default(),
-        Transform::from_xyz(150.0, 50.0, 150.0).looking_at(Vec3::ZERO, Vec3::Y),
-        OrbitController {
-            target: Vec3::ZERO,
-            distance: 225.0,
-            ..Default::default()
-        },
-        atmosphere,
-        AtmosphereSettings {
-            scene_units_to_m: 10.0,
-            // rendering_method: AtmosphereMode::Raymarched,
-            ..Default::default()
-        },
-        AtmosphereEnvironmentMapLight::default(),
-        Tonemapping::AcesFitted,
-        Bloom::NATURAL,
-        AutoExposure {
-            compensation_curve: under_expose_curve,
-            ..Default::default()
-        },
-    ));
-
-    // Directional light for PBR shading
-    let initial_sun_pos = Vec3::new(1.0, 0.1, 0.0);
-    let initial_sun_dir = -initial_sun_pos.normalize(); // Direction from origin to sun
-    commands.spawn((
-        DirectionalLight {
-            shadows_enabled: true,
-            illuminance: lux::RAW_SUNLIGHT,
-            ..default()
-        },
-        Transform::from_translation(initial_sun_pos).looking_at(Vec3::ZERO, Vec3::Y),
-        Sun,
-        SunController::new(initial_sun_dir),
-    ));
-
-    // sprite for the color image
-    commands.spawn((
-        Sprite::from_image(erosion_images.color.clone()),
-        Transform::from_xyz(-300.0, 0.0, 0.0),
-    ));
-
-    commands.spawn((
-        Sprite::from_image(erosion_images.height.clone()),
-        Transform::from_xyz(300.0, 0.0, 0.0),
-    ));
-
-    // 2d camera
-    // commands.spawn((Camera2d, Transform::from_xyz(0.0, 0.0, 0.0)));
-}
-
-fn generate_random_indices_seeded(count: u32, max_index: u32, mut state: u64) -> Vec<u32> {
-    let mut v = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        // xorshift64*
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
-        let r = (state.wrapping_mul(2685821657736338717) >> 32) as u32;
-        v.push(if max_index == 0 { 0 } else { r % max_index });
-    }
-    v
-}
-
-fn build_brush(map_size: i32, radius: i32) -> (Vec<i32>, Vec<f32>) {
-    let mut idx = Vec::new();
-    let mut w = Vec::new();
-    let r2 = (radius * radius) as f32;
-    let r = radius as f32;
-    for y in -radius..=radius {
-        for x in -radius..=radius {
-            let d2 = (x * x + y * y) as f32;
-            if d2 <= r2 {
-                // Match Sebastian Lague's weighting: 1 - sqrt(distance) / radius
-                let weight = 1.0 - (d2.sqrt() / r);
-                idx.push(y * map_size + x);
-                w.push(weight.max(0.0));
-            }
-        }
-    }
-    let sum: f32 = w.iter().sum::<f32>().max(1e-6);
-    for ww in &mut w {
-        *ww /= sum;
-    }
-    (idx, w)
-}
-
-struct ErosionComputePlugin;
-
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-struct ErosionLabel;
 
 impl Plugin for ErosionComputePlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins((
-            ExtractResourcePlugin::<ErosionImages>::default(),
-            ExtractResourcePlugin::<ErodeParams>::default(),
-            ExtractResourcePlugin::<ErosionCpuBuffers>::default(),
-            ExtractResourcePlugin::<ResetSim>::default(),
-            ExtractResourcePlugin::<SimControl>::default(),
-        ));
+        app.init_resource::<ErosionConfig>()
+            .add_plugins((
+                ExtractResourcePlugin::<ErosionImages>::default(),
+                ExtractResourcePlugin::<ErodeParams>::default(),
+                ExtractResourcePlugin::<ErosionCpuBuffers>::default(),
+                ExtractResourcePlugin::<ResetSim>::default(),
+                ExtractResourcePlugin::<SimControl>::default(),
+            ))
+            .add_systems(Startup, setup_erosion_resources);
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app
@@ -500,6 +362,44 @@ struct ErosionRngState {
     state: u64,
 }
 
+/// Generate random indices using a seeded RNG
+pub fn generate_random_indices_seeded(count: u32, max_index: u32, mut state: u64) -> Vec<u32> {
+    let mut v = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        // xorshift64*
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let r = (state.wrapping_mul(2685821657736338717) >> 32) as u32;
+        v.push(if max_index == 0 { 0 } else { r % max_index });
+    }
+    v
+}
+
+/// Build a brush with indices and weights for erosion operations
+pub fn build_brush(map_size: i32, radius: i32) -> (Vec<i32>, Vec<f32>) {
+    let mut idx = Vec::new();
+    let mut w = Vec::new();
+    let r2 = (radius * radius) as f32;
+    let r = radius as f32;
+    for y in -radius..=radius {
+        for x in -radius..=radius {
+            let d2 = (x * x + y * y) as f32;
+            if d2 <= r2 {
+                // Match Sebastian Lague's weighting: 1 - sqrt(distance) / radius
+                let weight = 1.0 - (d2.sqrt() / r);
+                idx.push(y * map_size + x);
+                w.push(weight.max(0.0));
+            }
+        }
+    }
+    let sum: f32 = w.iter().sum::<f32>().max(1e-6);
+    for ww in &mut w {
+        *ww /= sum;
+    }
+    (idx, w)
+}
+
 fn init_erosion_pipeline(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
@@ -514,7 +414,7 @@ fn init_erosion_pipeline(
                 storage_buffer::<u32>(false),           // height (atomic<u32> in shader, fixed-point)
                 uniform_buffer::<ErodeParams>(false),
                 storage_buffer_read_only::<u32>(false), // random_indices
-                storage_buffer_read_only::<i32>(false), // brush_indices
+                storage_buffer_read_only::<i32>(false),  // brush_indices
                 storage_buffer_read_only::<f32>(false), // brush_weights
                 storage_buffer::<u32>(false),           // flow (atomic<u32> in shader)
                 storage_buffer::<u32>(false),           // sediment (atomic<u32> in shader)
@@ -838,89 +738,6 @@ fn prepare_erosion_bind_groups(
     }
 }
 
-fn handle_reset_input(keys: Res<ButtonInput<KeyCode>>, mut reset: ResMut<ResetSim>) {
-    if keys.just_pressed(KeyCode::KeyR) {
-        reset.generation = reset.generation.wrapping_add(1);
-    }
-}
-
-fn handle_sim_input(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<SimControl>) {
-    if keys.just_pressed(KeyCode::Space) {
-        sim.paused = !sim.paused;
-    }
-    if sim.paused && keys.just_pressed(KeyCode::KeyE) {
-        sim.step_counter = sim.step_counter.wrapping_add(1);
-    }
-}
-
-fn handle_preview_mode_input(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut preview_mode: ResMut<CurrentPreviewMode>,
-    mut materials: ResMut<Assets<TerrainMaterial>>,
-    mut cameras: Query<(&mut Atmosphere, &mut Tonemapping, &mut Bloom), With<Camera3d>>,
-    earth_atmosphere: Res<EarthlikeAtmosphere>,
-) {
-    let new_mode = if keys.just_pressed(KeyCode::Digit1) {
-        Some(PreviewMode::Pbr)
-    } else if keys.just_pressed(KeyCode::Digit2) {
-        Some(PreviewMode::Flow)
-    } else if keys.just_pressed(KeyCode::Digit3) {
-        Some(PreviewMode::Sediment)
-    } else if keys.just_pressed(KeyCode::Digit4) {
-        Some(PreviewMode::Erosion)
-    } else if keys.just_pressed(KeyCode::Digit5) {
-        Some(PreviewMode::Height)
-    } else if keys.just_pressed(KeyCode::Digit6) {
-        Some(PreviewMode::Normals)
-    } else if keys.just_pressed(KeyCode::Digit7) {
-        Some(PreviewMode::Curvature)
-    } else {
-        None
-    };
-
-    if let Some(mode) = new_mode {
-        if preview_mode.mode != mode {
-            preview_mode.mode = mode;
-            println!("Preview mode: {:?}", mode);
-
-            // Update all terrain materials
-            for (_, mat) in materials.iter_mut() {
-                mat.extension.preview_mode = match mode {
-                    PreviewMode::Pbr => 0,
-                    PreviewMode::Flow => 1,
-                    PreviewMode::Sediment => 2,
-                    PreviewMode::Erosion => 3,
-                    PreviewMode::Height => 4,
-                    PreviewMode::Normals => 5,
-                    PreviewMode::Curvature => 6,
-                };
-            }
-
-            // Toggle atmosphere, tonemapping, and bloom based on mode
-            for (mut atmosphere, mut tonemapping, mut bloom) in cameras.iter_mut() {
-                if mode == PreviewMode::Pbr {
-                    // Enable atmosphere and bloom for PBR
-                    *atmosphere = earth_atmosphere.get();
-                    *tonemapping = Tonemapping::AcesFitted;
-                    *bloom = Bloom::NATURAL;
-                } else {
-                    // Disable atmosphere and bloom for debug modes
-                    // Preserve the medium handle to avoid invalid asset errors
-                    let medium_handle = atmosphere.medium.clone();
-                    *atmosphere = Atmosphere {
-                        bottom_radius: 0.0,
-                        top_radius: 0.0,
-                        ground_albedo: Vec3::ZERO,
-                        medium: medium_handle,
-                    };
-                    *tonemapping = Tonemapping::None;
-                    bloom.intensity = 0.0;
-                }
-            }
-        }
-    }
-}
-
 enum ErosionState {
     Loading,
     Init,
@@ -971,7 +788,7 @@ impl Node for ErosionNode {
                 CachedPipelineState::Ok(_) => {
                     self.state = ErosionState::Init;
                 }
-                CachedPipelineState::Err(PipelineCacheError::ShaderNotLoaded(_)) => {}
+                CachedPipelineState::Err(bevy::shader::PipelineCacheError::ShaderNotLoaded(_)) => {}
                 CachedPipelineState::Err(err) => {
                     panic!("Initializing assets/{EROSION_SHADER}:\n{err}")
                 }
@@ -1173,3 +990,4 @@ impl Node for ErosionNode {
         Ok(())
     }
 }
+

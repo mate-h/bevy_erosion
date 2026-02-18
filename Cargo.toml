@@ -2,7 +2,20 @@
 name = "bevy_erosion"
 version = "0.1.0"
 edition = "2024"
+authors = ["Mate Homolya <mate.homolya@proton.me>"]
+description = "Real-time GPU-accelerated hydraulic erosion simulation for Bevy"
+license = "MIT"
+repository = "https://github.com/mate-h/bevy_erosion"
+keywords = ["bevy", "erosion", "terrain", "simulation", "gpu", "compute"]
+categories = ["game-development", "graphics", "simulation"]
+
+[lib]
+name = "bevy_erosion"
+path = "src/lib.rs"
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
 
 [dependencies]
-bevy = { git = "https://github.com/mate-h/bevy", branch = "m/atmosphere-occlusion" }
-bevy_panorbit_camera = { git = "https://github.com/kristoff3r/bevy_panorbit_camera", branch = "master" }
+bevy = { git = "https://github.com/bevyengine/bevy", branch = "main" }
