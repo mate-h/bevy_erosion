@@ -3,11 +3,16 @@ use bevy::{
     input::mouse::{MouseMotion, MouseWheel, MouseScrollUnit},
 };
 
+/// When true, orbit camera input (rotate/zoom) is ignored. Set by UI when pointer is over the panel.
+#[derive(Resource, Default)]
+pub struct OrbitInputBlocked(pub bool);
+
 pub struct OrbitCameraPlugin;
 
 impl Plugin for OrbitCameraPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (orbit_mouse_rotate, orbit_mouse_zoom, apply_orbit_transform));
+        app.init_resource::<OrbitInputBlocked>()
+            .add_systems(Update, (orbit_mouse_rotate, orbit_mouse_zoom, apply_orbit_transform));
     }
 }
 
@@ -51,8 +56,12 @@ impl Default for OrbitController {
 fn orbit_mouse_rotate(
     mut query: Query<&mut OrbitController, With<Camera3d>>,
     buttons: Res<ButtonInput<MouseButton>>,
+    blocked: Res<OrbitInputBlocked>,
     mut motion_events: MessageReader<MouseMotion>,
 ) {
+    if blocked.0 {
+        return;
+    }
     let mut delta = Vec2::ZERO;
     for ev in motion_events.read() {
         delta += ev.delta;
@@ -74,9 +83,10 @@ fn orbit_mouse_rotate(
 
 fn orbit_mouse_zoom(
     mut query: Query<&mut OrbitController, With<Camera3d>>,
+    blocked: Res<OrbitInputBlocked>,
     mut wheel_events: MessageReader<MouseWheel>,
 ) {
-    if wheel_events.is_empty() {
+    if blocked.0 || wheel_events.is_empty() {
         return;
     }
     let mut total_y: f32 = 0.0;

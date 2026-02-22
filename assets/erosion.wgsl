@@ -1,31 +1,53 @@
-// Erosion compute for a heightmap using droplet particles.
-// Pass 1: init_fbm - initialize heightmap with FBM noise into storage texture.
-// Pass 2: erode - run droplets using structured buffers (map as storage texture).
-// Pass 3: blit_to_texture - optional, copy height to rgba for display.
+// Erosion compute for a heightmap.
+// Algorithm: Smooth Fluvial Erosion
+// Pass 1: init_fbm - initialize heightmap with FBM noise.
+// Pass 2: erode - particle-based fluvial erosion.
+// Pass 3: write_back - uplift, sediment compaction.
+// Pass 4: blit_to_texture - copy height/analysis to display.
 
-// Height stored as fixed-point u32 (multiply by HEIGHT_SCALE) to allow atomic operations
-// This prevents race conditions when multiple droplets modify the same pixel
 const HEIGHT_SCALE: f32 = 1000000.0;
+const DEPOSITION_SCALE: f32 = 100000.0;  // for i32 fixed-point
 
 @group(0) @binding(0) var<storage, read_write> height: array<atomic<u32>>;
 
-// For init_fbm we only need output; height_in is ignored.
-
+// Parameters
 struct ErodeParams {
     map_size: vec2<u32>,
-    max_lifetime: u32,
-    border_size: u32,
-    inertia: f32,
-    sediment_capacity_factor: f32,
-    min_sediment_capacity: f32,
-    deposit_speed: f32,
-    erode_speed: f32,
-    evaporate_speed: f32,
-    gravity: f32,
-    start_speed: f32,
-    start_water: f32,
-    brush_length: u32,
     num_particles: u32,
+    iteration: u32,
+    num_iterations: u32,
+    detail_scale: f32,
+    compute_ridge_erosion: u32,
+    erosion_strength: f32,
+    rock_softness: f32,
+    sediment_compaction: f32,
+    compaction_threshold: f32,
+    channeling: f32,
+    channeling_character: f32,
+    sediment_removal: f32,
+    removal_character: f32,
+    wear_angle: f32,
+    talus_angle: f32,
+    max_deposit_angle: f32,
+    flow_length: f32,
+    ridge_erosion_steps: u32,
+    ridge_softening_amount: f32,
+    trail_density: f32,
+    ridge_erosion_amount: f32,
+    friction: f32,
+    rock_friction: f32,
+    flow_volume: f32,
+    velocity_randomness: f32,
+    velocity_randomness_refinement: f32,
+    suspended_load: f32,
+    river_scarring: f32,
+    river_scarring_character: f32,
+    river_friction_reduction: f32,
+    river_volume: f32,
+    uplift: f32,
+    // Padding/legacy (keep for uniform size)
+    _pad0: u32,
+    _pad1: u32,
 }
 
 @group(0) @binding(1) var<uniform> params: ErodeParams;
@@ -34,34 +56,21 @@ struct ErodeParams {
 @group(0) @binding(3) var<storage, read> brush_indices: array<i32>;
 @group(0) @binding(4) var<storage, read> brush_weights: array<f32>;
 
-// Accumulation buffers using atomic<u32> to store fixed-point float values (multiply by 10000)
-// All buffers store 1 u32 per pixel (single scalar value)
+// Accumulation buffers
 @group(0) @binding(5) var<storage, read_write> flow_buffer: array<atomic<u32>>;
-@group(0) @binding(6) var<storage, read_write> sediment_buffer: array<atomic<u32>>;
+@group(0) @binding(6) var<storage, read_write> deposition: array<atomic<i32>>;  // loose sediment per cell (fixed-point)
 @group(0) @binding(7) var<storage, read_write> erosion_buffer: array<atomic<u32>>;
 
 // Color image as read-write storage texture
 @group(1) @binding(0) var color_image: texture_storage_2d<rgba16float, read_write>;
 
-fn rand_hash(v: u32) -> u32 {
-    var x = v;
-    x ^= 2747636419u;
-    x *= 2654435769u;
-    x ^= x >> 16u;
-    x *= 2654435769u;
-    x ^= x >> 16u;
-    x *= 2654435769u;
-    return x;
-}
-
-fn rand01(v: u32) -> f32 {
-    return f32(rand_hash(v)) / 4294967295.0;
+// Hash for value noise (Inigo Quilez, https://iquilezles.org/articles/fbm/)
+fn hash21(p: vec2<f32>) -> f32 {
+    return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
 }
 
 fn noise_hash(p: vec2<i32>) -> f32 {
-    // Simple value noise hash in [0,1)
-    let h = u32(p.x) * 374761393u + u32(p.y) * 668265263u;
-    return rand01(h);
+    return hash21(vec2<f32>(f32(p.x), f32(p.y)));
 }
 
 fn value_noise(p: vec2<f32>) -> f32 {
@@ -82,7 +91,7 @@ fn value_noise(p: vec2<f32>) -> f32 {
 fn fbm(p: vec2<f32>) -> f32 {
     var total = 0.0;
     var amp = 0.5;
-    var freq = 0.008;
+    var freq = 0.004;
     for (var i = 0; i < 6; i = i + 1) {
         total += value_noise(p * freq) * amp;
         amp *= 0.5;
@@ -95,13 +104,13 @@ fn fbm(p: vec2<f32>) -> f32 {
 fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
     let uv = vec2<f32>(gid.xy);
-    let hval = fbm(uv);
+    let hval = fbm(uv) * 2.0;
     let idx = gid.y * params.map_size.x + gid.x;
     atomicStore(&height[idx], u32(hval * HEIGHT_SCALE));
     
-    // Clear flow, sediment, and erosion buffers (all store 1 value per pixel)
+    // Clear flow, deposition, and erosion buffers
     atomicStore(&flow_buffer[idx], 0u);
-    atomicStore(&sediment_buffer[idx], 0u);
+    atomicStore(&deposition[idx], 0i);
     atomicStore(&erosion_buffer[idx], 0u);
 }
 
@@ -121,31 +130,33 @@ fn band_color_from_height(h: f32) -> vec3<f32> {
     let t2 = 0.35 + o; // sand -> grass
     let t3 = 0.60 + o; // grass -> rock
     let t4 = 0.80 + o; // rock -> snow
+
+    return rock;
     
     // Blend between adjacent colors
-    if (h < t1 - feather) {
-        return water;
-    } else if (h < t1 + feather) {
-        let t = (h - (t1 - feather)) / (2.0 * feather);
-        return mix(water, sand, smoothstep(0.0, 1.0, t));
-    } else if (h < t2 - feather) {
-        return sand;
-    } else if (h < t2 + feather) {
-        let t = (h - (t2 - feather)) / (2.0 * feather);
-        return mix(sand, grass, smoothstep(0.0, 1.0, t));
-    } else if (h < t3 - feather) {
-        return grass;
-    } else if (h < t3 + feather) {
-        let t = (h - (t3 - feather)) / (2.0 * feather);
-        return mix(grass, rock, smoothstep(0.0, 1.0, t));
-    } else if (h < t4 - feather) {
-        return rock;
-    } else if (h < t4 + feather) {
-        let t = (h - (t4 - feather)) / (2.0 * feather);
-        return mix(rock, snow, smoothstep(0.0, 1.0, t));
-    } else {
-        return snow;
-    }
+    // if (h < t1 - feather) {
+    //     return water;
+    // } else if (h < t1 + feather) {
+    //     let t = (h - (t1 - feather)) / (2.0 * feather);
+    //     return mix(water, sand, smoothstep(0.0, 1.0, t));
+    // } else if (h < t2 - feather) {
+    //     return sand;
+    // } else if (h < t2 + feather) {
+    //     let t = (h - (t2 - feather)) / (2.0 * feather);
+    //     return mix(sand, grass, smoothstep(0.0, 1.0, t));
+    // } else if (h < t3 - feather) {
+    //     return grass;
+    // } else if (h < t3 + feather) {
+    //     let t = (h - (t3 - feather)) / (2.0 * feather);
+    //     return mix(grass, rock, smoothstep(0.0, 1.0, t));
+    // } else if (h < t4 - feather) {
+    //     return rock;
+    // } else if (h < t4 + feather) {
+    //     let t = (h - (t4 - feather)) / (2.0 * feather);
+    //     return mix(rock, snow, smoothstep(0.0, 1.0, t));
+    // } else {
+    //     return snow;
+    // }
 }
 
 @compute @workgroup_size(8,8,1)
@@ -174,6 +185,38 @@ fn load_height(p: vec2<i32>) -> f32 {
     return f32(atomicLoad(&height[idx])) / HEIGHT_SCALE;
 }
 
+fn load_deposition(p: vec2<i32>) -> f32 {
+    let size = i32(params.map_size.x);
+    let idx = u32(p.y * size + p.x);
+    return f32(atomicLoad(&deposition[idx])) / DEPOSITION_SCALE;
+}
+
+// 2D hash for random scatter (Inigo Quilez, https://iquilezles.org/articles/fbm/)
+fn random22(p: vec2<f32>) -> vec2<f32> {
+    let q = vec2<f32>(dot(p, vec2<f32>(127.1, 311.7)), dot(p, vec2<f32>(269.5, 183.3)));
+    return fract(sin(q) * 43758.5453);
+}
+
+fn random31(p: vec3<f32>) -> f32 {
+    let q = dot(p, vec3<f32>(127.1, 311.7, 74.7));
+    return fract(sin(q) * 43758.5453);
+}
+
+fn bilinear_sample_height(pos: vec2<f32>) -> f32 {
+    let res = vec2<f32>(params.map_size.xy);
+    var p = pos - 0.5;
+    p = vec2<f32>(clamp(p.x, 0.0, res.x - 1.00001), clamp(p.y, 0.0, res.y - 1.00001));
+    let w = vec2<f32>(p.x - floor(p.x), p.y - floor(p.y));
+    let size = i32(params.map_size.x);
+    let ix = i32(floor(p.x));
+    let iy = i32(floor(p.y));
+    let h00 = load_height(vec2<i32>(ix, iy));
+    let h10 = load_height(vec2<i32>(min(ix + 1, size - 1), iy));
+    let h01 = load_height(vec2<i32>(ix, min(iy + 1, size - 1)));
+    let h11 = load_height(vec2<i32>(min(ix + 1, size - 1), min(iy + 1, size - 1)));
+    return h00 * (1.0 - w.x) * (1.0 - w.y) + h10 * w.x * (1.0 - w.y) + h01 * (1.0 - w.x) * w.y + h11 * w.x * w.y;
+}
+
 fn sample_height_and_gradient(pos: vec2<f32>) -> vec3<f32> {
     let size = vec2<i32>(i32(params.map_size.x), i32(params.map_size.y));
     let cx = clamp(i32(floor(pos.x)), 0, size.x - 2);
@@ -191,132 +234,171 @@ fn sample_height_and_gradient(pos: vec2<f32>) -> vec3<f32> {
     return vec3<f32>(gradX, gradY, h);
 }
 
-@compute @workgroup_size(1024,1,1)
+// Smooth Fluvial Erosion
+@compute @workgroup_size(256, 1, 1)
 fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.num_particles) { return; }
+    let particle_id = gid.x;
+    let res_x = i32(params.map_size.x);
+    let res_y = i32(params.map_size.y);
+    let total_pixels = u32(res_x * res_y);
+    let num_particles_per_pass = params.num_particles / 2u;
+    let dx = 1.0;
+    let detail_scale = max(params.detail_scale, 0.001);
+    let dx_scaled = dx / detail_scale;
 
-    let size = i32(params.map_size.x);
-    let index = i32(random_indices[gid.x]);
-    var posX = f32(index % size);
-    var posY = f32(index / size);  // Use integer division before float conversion
-    var dirX = 0.0;
-    var dirY = 0.0;
-    var speed = params.start_speed;
-    var water = params.start_water;
-    var sediment = 0.0;
-    var total_erosion = 0.0;
-    var total_deposition = 0.0;
+    // Run both ridge and flow passes in one dispatch: first half = ridge (iteration 0), second half = flow (iteration 1)
+    let iteration = select(0u, 1u, particle_id >= num_particles_per_pass);
+    let detail_bias = select(0.0, 1.0, f32(iteration) > f32(params.num_iterations) / 2.0);
+    let num_trails = f32(total_pixels) * min(pow(dx_scaled, detail_bias), 1.0) * params.trail_density;
+    let do_ridge = params.compute_ridge_erosion != 0u && detail_bias < 0.5;
+    var adjusted_trails = num_trails;
+    if (do_ridge) {
+        adjusted_trails *= params.ridge_erosion_amount;
+    }
+    let local_particle_id = select(particle_id, particle_id - num_particles_per_pass, particle_id >= num_particles_per_pass);
+    if (f32(local_particle_id) >= adjusted_trails) { return; }
 
-    // droplet carries color sampled from the initial position
-    var droplet_color = textureLoad(
-        color_image,
-        vec2<i32>(i32(floor(posX)), i32(floor(posY)))
-    ).xyz;
+    var wear_angle = params.wear_angle * 3.14159265 / 180.0;
+    wear_angle = tan(wear_angle);
+    var talus_angle = params.talus_angle * 3.14159265 / 180.0;
+    talus_angle = tan(talus_angle) / 1.25;
+    var max_deposit_angle = params.max_deposit_angle * 3.14159265 / 180.0;
+    max_deposit_angle = tan(max_deposit_angle);
 
-    for (var life: u32 = 0u; life < params.max_lifetime; life = life + 1u) {
-        let nodeX = i32(floor(posX));
-        let nodeY = i32(floor(posY));
-        let dropletIndex = nodeY * size + nodeX;
-        let cellOffsetX = posX - f32(nodeX);
-        let cellOffsetY = posY - f32(nodeY);
+    var p = random22(vec2<f32>(f32(local_particle_id), f32(local_particle_id) - f32(iteration) * 5.643));
+    p *= vec2<f32>(f32(res_x), f32(res_y));
+    var v = vec2<f32>(0.0, 0.0);
 
-        let hg = sample_height_and_gradient(vec2<f32>(posX, posY));
-        dirX = dirX * params.inertia - hg.x * (1.0 - params.inertia);
-        dirY = dirY * params.inertia - hg.y * (1.0 - params.inertia);
-        let len = max(0.01, length(vec2<f32>(dirX, dirY)));
-        dirX /= len; dirY /= len;
-        let prevX = posX; let prevY = posY;
-        posX += dirX; posY += dirY;
-
-        // Stop if not moving or if leaving the safe interior region.
-        // Match reference: rely on a one-cell margin around edges for bilinear sampling.
-        if ((dirX == 0.0 && dirY == 0.0) ||
-            posX < f32(params.border_size) || posX >= f32(size - 1 - i32(params.border_size)) ||
-            posY < f32(params.border_size) || posY >= f32(size - 1 - i32(params.border_size))) {
-            break;
+    for (var i = 0; i < i32(params.ridge_softening_amount) + 1; i = i + 1) {
+        let dirs = array<vec2<i32>, 4>(vec2<i32>(1,0), vec2<i32>(0,1), vec2<i32>(-1,0), vec2<i32>(0,-1));
+        var grad = vec2<f32>(0.0, 0.0);
+        for (var j = 0; j < 4; j = j + 1) {
+            let pj = vec2<i32>(clamp(i32(p.x) + dirs[j].x, 0, res_x - 1), clamp(i32(p.y) + dirs[j].y, 0, res_y - 1));
+            grad += vec2<f32>(f32(dirs[j].x), f32(dirs[j].y)) * load_height(pj);
         }
+        let glen = length(grad);
+        if (glen > 0.0001) {
+            p += normalize(grad) * clamp(params.ridge_softening_amount - f32(i), 0.0, 1.0);
+        }
+    }
 
-        let newH = sample_height_and_gradient(vec2<f32>(posX, posY)).z;
-        let deltaH = newH - hg.z;
+    let sample_idx = vec2<i32>(clamp(i32(p.x), 0, res_x - 1), clamp(i32(p.y), 0, res_y - 1));
+    let dirs_grad = array<vec2<i32>, 4>(vec2<i32>(1,0), vec2<i32>(0,1), vec2<i32>(-1,0), vec2<i32>(0,-1));
+    var slope = 0.0;
+    for (var j = 0; j < 4; j = j + 1) {
+        let pj = vec2<i32>(clamp(sample_idx.x + dirs_grad[j].x, 0, res_x - 1), clamp(sample_idx.y + dirs_grad[j].y, 0, res_y - 1));
+        slope = max(slope, abs(load_height(pj) - load_height(sample_idx)) / dx_scaled);
+    }
+    if (slope <= wear_angle || slope <= talus_angle) { return; }
 
-        let cap = max(-deltaH * speed * water * params.sediment_capacity_factor, params.min_sediment_capacity);
-        if (sediment > cap || deltaH > 0.0) {
-            var deposit = select((sediment - cap) * params.deposit_speed, min(deltaH, sediment), deltaH > 0.0);
-            sediment -= deposit;
-            total_deposition += deposit;
-            
-            // bilinear deposit to 4 corners
-            let wNW = (1.0 - cellOffsetX) * (1.0 - cellOffsetY);
-            let wNE = cellOffsetX * (1.0 - cellOffsetY);
-            let wSW = (1.0 - cellOffsetX) * cellOffsetY;
-            let wSE = cellOffsetX * cellOffsetY;
-            let size_i = i32(params.map_size.x);
-            let base = nodeY * size_i + nodeX;
-            let iNW = u32(base);
-            let iNE = u32(base + 1);
-            let iSW = u32(base + size_i);
-            let iSE = u32(base + size_i + 1);
-            // Use atomicAdd to prevent race conditions when multiple droplets modify same pixel
-            atomicAdd(&height[iNW], u32(deposit * wNW * HEIGHT_SCALE));
-            atomicAdd(&height[iNE], u32(deposit * wNE * HEIGHT_SCALE));
-            atomicAdd(&height[iSW], u32(deposit * wSW * HEIGHT_SCALE));
-            atomicAdd(&height[iSE], u32(deposit * wSE * HEIGHT_SCALE));
-            
-            // Accumulate sediment deposition (convert to fixed-point: multiply by 10000)
-            atomicAdd(&sediment_buffer[iNW], u32(deposit * wNW * 10000.0));
-            atomicAdd(&sediment_buffer[iNE], u32(deposit * wNE * 10000.0));
-            atomicAdd(&sediment_buffer[iSW], u32(deposit * wSW * 10000.0));
-            atomicAdd(&sediment_buffer[iSE], u32(deposit * wSE * 10000.0));
+    var erosion_strength = params.erosion_strength;
+    var flow_steps = select(i32(params.ridge_erosion_steps), i32(params.flow_length / dx_scaled), detail_bias > 0.5);
+    flow_steps = i32(f32(flow_steps) * (0.5 + random31(vec3<f32>(p.x, p.y, f32(iteration)))));
 
-            // Blend carried color into deposited texels
-            let pNW = vec2<i32>(nodeX, nodeY);
-            let pNE = vec2<i32>(nodeX + 1, nodeY);
-            let pSW = vec2<i32>(nodeX, nodeY + 1);
-            let pSE = vec2<i32>(nodeX + 1, nodeY + 1);
-            let cNW = textureLoad(color_image, pNW).xyz;
-            let cNE = textureLoad(color_image, pNE).xyz;
-            let cSW = textureLoad(color_image, pSW).xyz;
-            let cSE = textureLoad(color_image, pSE).xyz;
-            let blend = clamp(deposit * 100.0, 0.0, 1.0);
-            textureStore(color_image, pNW, vec4<f32>(mix(cNW, droplet_color, blend * wNW), 1.0));
-            textureStore(color_image, pNE, vec4<f32>(mix(cNE, droplet_color, blend * wNE), 1.0));
-            textureStore(color_image, pSW, vec4<f32>(mix(cSW, droplet_color, blend * wSW), 1.0));
-            textureStore(color_image, pSE, vec4<f32>(mix(cSE, droplet_color, blend * wSE), 1.0));
+    let dx_inv = 1.0 / dx_scaled;
+    let friction_coef = pow(1.0 - params.friction, dx_scaled);
+    let rock_friction_coef = pow(1.0 - params.rock_friction, dx_scaled);
+    let channeling_coef = pow(1.0 - 0.1 * params.channeling, pow(dx_scaled, params.channeling_character));
+    let removal_coef = pow(1.0 - params.sediment_removal, pow(dx_scaled, params.removal_character));
+    let river_scarring = params.river_scarring * pow(dx_scaled, params.river_scarring_character);
+
+    var carry = 0.0;
+    var h_current = bilinear_sample_height(p);
+
+    for (var step = 0; step < flow_steps; step = step + 1) {
+        let cell = vec2<i32>(clamp(i32(p.x), 0, res_x - 1), clamp(i32(p.y), 0, res_y - 1));
+        let idx = u32(cell.y * res_x + cell.x);
+
+        var hmin = load_height(cell);
+        var hmax = hmin;
+        var grad = vec2<f32>(0.0, 0.0);
+        for (var j = -1; j <= 1; j = j + 2) {
+            let pxj = vec2<i32>(clamp(cell.x + j, 0, res_x - 1), cell.y);
+            let dep_pxj = load_deposition(pxj);
+            grad.x += f32(j) * (load_height(pxj) + params.flow_volume * dep_pxj);
+            hmin = min(hmin, load_height(pxj));
+            hmax = max(hmax, load_height(pxj));
+        }
+        for (var j = -1; j <= 1; j = j + 2) {
+            let pyj = vec2<i32>(cell.x, clamp(cell.y + j, 0, res_y - 1));
+            grad.y += f32(j) * (load_height(pyj) + params.flow_volume * load_deposition(pyj));
+            hmin = min(hmin, load_height(pyj));
+            hmax = max(hmax, load_height(pyj));
+        }
+        grad *= 0.5 * dx_inv;
+
+        let dep_val = load_deposition(cell);
+        if (dep_val == 0.0) {
+            v *= pow(1.0 - params.rock_friction, dx_scaled);
         } else {
-            let amountToErode = min((cap - sediment) * params.erode_speed, -deltaH);
-            total_erosion += amountToErode;
-            let size_i = i32(params.map_size.x);
-            let map_len = size_i * size_i;
-            for (var i: u32 = 0u; i < params.brush_length; i = i + 1u) {
-                let erodeIndex = dropletIndex + brush_indices[i];
-                if (erodeIndex >= 0 && erodeIndex < map_len) {
-                    let idx = u32(erodeIndex);
-                    let current_fixed = atomicLoad(&height[idx]);
-                    let current = f32(current_fixed) / HEIGHT_SCALE;
-                    let weighted = amountToErode * brush_weights[i];
-                    let delta = select(weighted, current, current < weighted);
-                    // Use atomicSub to prevent race conditions
-                    atomicSub(&height[idx], u32(delta * HEIGHT_SCALE));
-                    sediment += delta;
-                    
-                    // Accumulate erosion - use larger multiplier to avoid truncation with fine brush
-                    // With brush radius 16, delta can be ~1/800th of amountToErode, so we need a bigger scale
-                    atomicAdd(&erosion_buffer[idx], u32(delta * 100000.0));
-                }
+            v *= pow(1.0 - params.friction, dx_scaled);
+        }
+        v += -grad * dx_scaled;
+
+        if (params.velocity_randomness != 0.0) {
+            let d_rand = random31(vec3<f32>(p.x, p.y, f32(step))) * 6.2831853;
+            p += normalize(v + vec2<f32>(cos(d_rand), sin(d_rand)) * params.velocity_randomness * pow(1.0 - params.velocity_randomness_refinement, f32(iteration)));
+        } else {
+            let vlen = length(v);
+            if (vlen > 0.0001) {
+                p += normalize(v);
             }
-            // Pull color from eroded neighborhood toward carried color
-            let p = vec2<i32>(nodeX, nodeY);
-            let c_here = textureLoad(color_image, p).xyz;
-            let pull = clamp(amountToErode * 6.0, 0.0, 1.0);
-            droplet_color = mix(droplet_color, c_here, 0.10);
-            textureStore(color_image, p, vec4<f32>(mix(c_here, droplet_color, pull), 1.0));
         }
 
-        speed = sqrt(max(0.0, speed * speed + deltaH * params.gravity));
-        water *= (1.0 - params.evaporate_speed);
-        
-        let flow_magnitude = speed * water;
-        atomicAdd(&flow_buffer[dropletIndex], u32(flow_magnitude * 10000.0));
+        let h_prev = h_current;
+        h_current = bilinear_sample_height(p);
+
+        let dh_raw = erosion_strength * min(max(h_current - h_prev, -max_deposit_angle * dx_scaled) + talus_angle * dx_scaled, 0.0);
+        var dh = max(dh_raw, -dep_val) + min(dh_raw + dep_val, 0.0) * params.rock_softness;
+        dh += min((1.0 - params.suspended_load) * carry, max_deposit_angle * dx_scaled);
+        carry -= dh;
+        carry = max(carry, 0.0);
+
+        carry *= channeling_coef;
+        if (dh > 0.0) {
+            dh *= removal_coef;
+        }
+        dh = max(dh, hmin - load_height(cell));
+        dh = min(dh, hmax - load_height(cell));
+
+        let dep_delta = max(dh, -dep_val);
+        if (dh >= 0.0) {
+            atomicAdd(&height[idx], u32(dh * HEIGHT_SCALE));
+        } else {
+            atomicSub(&height[idx], u32(-dh * HEIGHT_SCALE));
+        }
+        atomicAdd(&deposition[idx], i32(dep_delta * DEPOSITION_SCALE));
+        if (dh < 0.0) {
+            atomicAdd(&erosion_buffer[idx], u32(-dh * 100000.0));
+        }
+        let flow_val = max(0.0, dh) * dx_inv;
+        atomicAdd(&flow_buffer[idx], u32(flow_val * 10000.0));
+
+        let px = i32(p.x);
+        let py = i32(p.y);
+        if (px < 1 || px >= res_x - 1 || py < 1 || py >= res_y - 1) { break; }
+    }
+}
+
+// writeBack: uplift, sediment compaction (runs after erosion passes)
+// Uses @group(0) only (same as erosion pass group 0)
+@compute @workgroup_size(8, 8, 1)
+fn write_back(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
+    let size = i32(params.map_size.x);
+    let idx = u32(gid.y * params.map_size.x + gid.x);
+    let dx = 1.0 / max(params.detail_scale, 0.001);
+    let uplift_scaled = params.uplift * params.trail_density * dx;
+
+    let h_old = f32(atomicLoad(&height[idx])) / HEIGHT_SCALE;
+    let h_new = h_old + uplift_scaled;
+    atomicStore(&height[idx], u32(h_new * HEIGHT_SCALE));
+
+    let dep = f32(atomicLoad(&deposition[idx])) / DEPOSITION_SCALE;
+    if (dep > params.compaction_threshold * params.detail_scale) {
+        let dep_sub = dep - params.compaction_threshold;
+        let dep_compacted = dep_sub * pow(1.0 - params.sediment_compaction, 0.25 * dx) + params.compaction_threshold;
+        atomicStore(&deposition[idx], i32(dep_compacted * DEPOSITION_SCALE));
     }
 }
 
@@ -356,9 +438,9 @@ fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
     let enc = n * 0.5 + vec3<f32>(0.5, 0.5, 0.5);
     textureStore(normal_out, vec2<i32>(px, py), vec4<f32>(enc, 1.0));
     
-    // Pack flow, sediment, and erosion into single analysis texture
+    // Pack flow, deposition (sediment), and erosion into single analysis texture
     let flow_mag = f32(atomicLoad(&flow_buffer[idx])) / 10000.0;
-    let sediment = f32(atomicLoad(&sediment_buffer[idx])) / 10000.0;
+    let sediment = max(0.0, f32(atomicLoad(&deposition[idx])) / DEPOSITION_SCALE);
     let erosion = f32(atomicLoad(&erosion_buffer[idx])) / 100000.0;
     
     // Compute curvature using Laplacian of height field (5-point stencil)

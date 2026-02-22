@@ -4,6 +4,9 @@ Real-time GPU-accelerated hydraulic erosion simulation built with Bevy.
 
 <img width="688" height="404" alt="Group" src="https://github.com/user-attachments/assets/25b434a1-98d8-4ca7-b5bc-78e681b1b608" />
 
+Based on the Smooth Fluvial Erosion algorithm from Kruger Terrain Tools Houdini Asset.
+
+https://samk9632.gumroad.com/l/KTTforHoudini
 
 ## Features
 

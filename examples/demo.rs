@@ -16,6 +16,8 @@ use bevy_erosion::{
     sun::{SunPlugin, Sun, SunController},
     ErosionConfig, *,
 };
+#[cfg(feature = "ui")]
+use bevy_erosion::ui::ErosionParamsPlugin;
 
 /// Map size (width and height). Customize this to change erosion resolution.
 const MAP_SIZE: UVec2 = UVec2::new(512, 512);
@@ -36,6 +38,8 @@ fn main() {
             OrbitCameraPlugin,
             SunPlugin,
             AutoExposurePlugin,
+            #[cfg(feature = "ui")]
+            ErosionParamsPlugin,
         ))
         .add_systems(Startup, (setup, print_controls))
         .add_systems(PostStartup, spawn_terrain)
@@ -147,7 +151,7 @@ fn spawn_terrain(
         },
         atmosphere,
         AtmosphereSettings {
-            scene_units_to_m: 10.0,
+            scene_units_to_m: 1.0,
             // rendering_method: AtmosphereMode::Raymarched,
             ..Default::default()
         },

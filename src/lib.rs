@@ -25,6 +25,9 @@ use std::borrow::Cow;
 pub mod camera;
 pub mod sun;
 
+#[cfg(feature = "ui")]
+pub mod ui;
+
 const EROSION_SHADER: &str = "erosion.wgsl";
 const TERRAIN_SHADER: &str = "terrain_extended.wgsl";
 
@@ -142,42 +145,85 @@ impl MaterialExtension for TerrainExtension {
     }
 }
 
-/// Parameters for the erosion simulation
+/// Erosion parameters
 #[derive(Resource, Clone, ExtractResource, ShaderType)]
+#[repr(C)]
 pub struct ErodeParams {
     pub map_size: UVec2,
-    pub max_lifetime: u32,
-    pub border_size: u32,
-    pub inertia: f32,
-    pub sediment_capacity_factor: f32,
-    pub min_sediment_capacity: f32,
-    pub deposit_speed: f32,
-    pub erode_speed: f32,
-    pub evaporate_speed: f32,
-    pub gravity: f32,
-    pub start_speed: f32,
-    pub start_water: f32,
-    pub brush_length: u32,
     pub num_particles: u32,
+    pub iteration: u32,
+    pub num_iterations: u32,
+    pub detail_scale: f32,
+    pub compute_ridge_erosion: u32,
+    pub erosion_strength: f32,
+    pub rock_softness: f32,
+    pub sediment_compaction: f32,
+    pub compaction_threshold: f32,
+    pub channeling: f32,
+    pub channeling_character: f32,
+    pub sediment_removal: f32,
+    pub removal_character: f32,
+    pub wear_angle: f32,
+    pub talus_angle: f32,
+    pub max_deposit_angle: f32,
+    pub flow_length: f32,
+    pub ridge_erosion_steps: u32,
+    pub ridge_softening_amount: f32,
+    pub trail_density: f32,
+    pub ridge_erosion_amount: f32,
+    pub friction: f32,
+    pub rock_friction: f32,
+    pub flow_volume: f32,
+    pub velocity_randomness: f32,
+    pub velocity_randomness_refinement: f32,
+    pub suspended_load: f32,
+    pub river_scarring: f32,
+    pub river_scarring_character: f32,
+    pub river_friction_reduction: f32,
+    pub river_volume: f32,
+    pub uplift: f32,
+    pub _pad0: u32,
+    pub _pad1: u32,
 }
 
 impl Default for ErodeParams {
     fn default() -> Self {
         Self {
             map_size: UVec2::new(512, 512),
-            max_lifetime: 32,
-            border_size: 0,
-            inertia: 0.05,
-            sediment_capacity_factor: 4.0,
-            min_sediment_capacity: 0.01,
-            deposit_speed: 0.3,
-            erode_speed: 0.3,
-            evaporate_speed: 0.01,
-            gravity: 4.0,
-            start_speed: 1.0,
-            start_water: 1.0,
-            brush_length: 0, // set from brush in setup_erosion_resources
-            num_particles: 1024 * 8,
+            num_particles: 256 * 256,
+            iteration: 0,
+            num_iterations: 2,
+            detail_scale: 1.0,
+            compute_ridge_erosion: 1,
+            erosion_strength: 0.5,
+            rock_softness: 0.5,
+            sediment_compaction: 0.0,
+            compaction_threshold: 0.0,
+            channeling: 0.0,
+            channeling_character: 1.0,
+            sediment_removal: 0.0,
+            removal_character: 1.0,
+            wear_angle: 0.0,
+            talus_angle: 0.0,
+            max_deposit_angle: 45.0,
+            flow_length: 256.0,
+            ridge_erosion_steps: 25,
+            ridge_softening_amount: 0.0,
+            trail_density: 0.1,
+            ridge_erosion_amount: 1.0,
+            friction: 1.0,
+            rock_friction: 1.0,
+            flow_volume: 0.0,
+            velocity_randomness: 0.0,
+            velocity_randomness_refinement: 0.0,
+            suspended_load: 0.0,
+            river_scarring: 0.0,
+            river_scarring_character: 1.0,
+            river_friction_reduction: 1.0,
+            river_volume: 0.0,
+            uplift: 0.0,
+            _pad0: 0,
+            _pad1: 0,
         }
     }
 }
@@ -202,72 +248,40 @@ pub struct SimControl {
     pub step_counter: u64,
 }
 
-/// User-facing configuration for the erosion simulation. Insert this (or use the default) before
-/// the app runs; the plugin creates `ErosionImages`, `ErodeParams`, and related resources from it.
-/// At runtime you can mutate `ErodeParams` directly to tweak the simulation.
+
+/// User-facing configuration for the erosion simulation.
 #[derive(Resource, Clone)]
 pub struct ErosionConfig {
     /// Map width and height (e.g. 512×512).
     pub map_size: UVec2,
-    /// Brush radius in texels for erosion deposition.
-    pub brush_radius: i32,
-    /// Number of droplet particles per frame.
-    pub num_particles: u32,
-    /// Max droplet steps before termination.
-    pub max_lifetime: u32,
-    /// Pixels to leave unmoved at map edges.
-    pub border_size: u32,
-    /// How much velocity is preserved between steps (0–1).
-    pub inertia: f32,
-    pub sediment_capacity_factor: f32,
-    pub min_sediment_capacity: f32,
-    pub deposit_speed: f32,
-    pub erode_speed: f32,
-    pub evaporate_speed: f32,
-    pub gravity: f32,
-    pub start_speed: f32,
-    pub start_water: f32,
+    /// Erosion amount / trail density (0–1). Higher = more particles, slower.
+    pub trail_density: f32,
+    /// Feature scale for terrain detail.
+    pub feature_size: f32,
 }
 
 impl Default for ErosionConfig {
     fn default() -> Self {
         Self {
             map_size: UVec2::new(512, 512),
-            brush_radius: 16,
-            num_particles: 1024 * 8,
-            max_lifetime: 32,
-            border_size: 0,
-            inertia: 0.05,
-            sediment_capacity_factor: 4.0,
-            min_sediment_capacity: 0.01,
-            deposit_speed: 0.3,
-            erode_speed: 0.3,
-            evaporate_speed: 0.01,
-            gravity: 4.0,
-            start_speed: 1.0,
-            start_water: 1.0,
+            trail_density: 0.1,
+            feature_size: 8.0,
         }
     }
 }
 
 impl ErosionConfig {
-    /// Produces `ErodeParams` for the GPU, with `brush_length` derived from the actual brush.
-    pub fn to_erode_params(&self, brush_length: u32) -> ErodeParams {
+    /// Produces `ErodeParams` for the GPU.
+    pub fn to_erode_params(&self, iteration: u32) -> ErodeParams {
+        let num_particles = (self.map_size.x * self.map_size.y) as u32;
         ErodeParams {
             map_size: self.map_size,
-            max_lifetime: self.max_lifetime,
-            border_size: self.border_size,
-            inertia: self.inertia,
-            sediment_capacity_factor: self.sediment_capacity_factor,
-            min_sediment_capacity: self.min_sediment_capacity,
-            deposit_speed: self.deposit_speed,
-            erode_speed: self.erode_speed,
-            evaporate_speed: self.evaporate_speed,
-            gravity: self.gravity,
-            start_speed: self.start_speed,
-            start_water: self.start_water,
-            brush_length,
-            num_particles: self.num_particles,
+            num_particles,
+            iteration,
+            num_iterations: 2,
+            detail_scale: self.feature_size / 8.0,
+            trail_density: self.trail_density,
+            ..Default::default()
         }
     }
 }
@@ -285,16 +299,15 @@ fn setup_erosion_resources(
 ) {
     let size = config.map_size;
     commands.insert_resource(create_erosion_images(&mut images, size));
-
-    let (brush_indices, brush_weights) = build_brush(size.x as i32, config.brush_radius);
-    commands.insert_resource(config.to_erode_params(brush_indices.len() as u32));
+    commands.insert_resource(config.to_erode_params(0));
     commands.insert_resource(ErosionCpuBuffers {
-        brush_indices,
-        brush_weights,
+        brush_indices: vec![],
+        brush_weights: vec![],
     });
     commands.insert_resource(ResetSim::default());
     commands.insert_resource(SimControl::default());
 }
+
 
 impl Plugin for ErosionComputePlugin {
     fn build(&self, app: &mut App) {
@@ -331,6 +344,7 @@ struct ErosionPipeline {
     pipeline_init: CachedComputePipelineId,
     pipeline_init_color: CachedComputePipelineId,
     pipeline_erode: CachedComputePipelineId,
+    pipeline_write_back: CachedComputePipelineId,
     pipeline_blit: CachedComputePipelineId,
     pipeline_ao: CachedComputePipelineId,
     pipeline_blur_h: CachedComputePipelineId,
@@ -348,13 +362,13 @@ struct ErosionBindGroups {
 #[derive(Resource)]
 struct ErosionBuffers {
     uniform: UniformBuffer<ErodeParams>,
-    height: StorageBuffer<Vec<u32>>,   // atomic<u32> in shader (fixed-point)
+    height: StorageBuffer<Vec<u32>>,
     random: StorageBuffer<Vec<u32>>,
     brush_idx: StorageBuffer<Vec<i32>>,
     brush_w: StorageBuffer<Vec<f32>>,
-    flow: StorageBuffer<Vec<u32>>,     // atomic<u32> in shader
-    sediment: StorageBuffer<Vec<u32>>, // atomic<u32> in shader
-    erosion: StorageBuffer<Vec<u32>>,  // atomic<u32> in shader
+    flow: StorageBuffer<Vec<u32>>,
+    deposition: StorageBuffer<Vec<i32>>, // loose sediment per cell (atomic<i32> in shader)
+    erosion: StorageBuffer<Vec<u32>>,
 }
 
 #[derive(Resource, Clone)]
@@ -417,7 +431,7 @@ fn init_erosion_pipeline(
                 storage_buffer_read_only::<i32>(false),  // brush_indices
                 storage_buffer_read_only::<f32>(false), // brush_weights
                 storage_buffer::<u32>(false),           // flow (atomic<u32> in shader)
-                storage_buffer::<u32>(false),           // sediment (atomic<u32> in shader)
+                storage_buffer::<i32>(false),           // deposition (atomic<i32> in shader)
                 storage_buffer::<u32>(false),           // erosion (atomic<u32> in shader)
             ),
         ),
@@ -483,6 +497,12 @@ fn init_erosion_pipeline(
         entry_point: Some(Cow::from("erode")),
         ..default()
     });
+    let pipeline_write_back = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        layout: vec![layout_erosion.clone()],
+        shader: shader.clone(),
+        entry_point: Some(Cow::from("write_back")),
+        ..default()
+    });
     let pipeline_blit = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         layout: vec![layout_erosion.clone(), layout_blit.clone()],
         shader: shader.clone(),
@@ -516,6 +536,7 @@ fn init_erosion_pipeline(
         pipeline_init,
         pipeline_init_color,
         pipeline_erode,
+        pipeline_write_back,
         pipeline_blit,
         pipeline_ao,
         pipeline_blur_h,
@@ -546,14 +567,11 @@ fn prepare_erosion_bind_groups(
     // Check if we need to verify buffer structure
     let texels = (params.map_size.x * params.map_size.y) as usize;
     let needs_recreation = if let Some(ref buffers) = existing {
-        // Check if buffers have correct size for new fields
-        // If any of the analysis buffers are empty/wrong size, recreate
         buffers.flow.buffer().is_none()
-            || buffers.sediment.buffer().is_none()
+            || buffers.deposition.buffer().is_none()
             || buffers.erosion.buffer().is_none()
-            // Check if all buffers have correct size (should all be texels, 1 u32 per pixel)
             || buffers.flow.get().len() != texels
-            || buffers.sediment.get().len() != texels
+            || buffers.deposition.get().len() != texels
             || buffers.erosion.get().len() != texels
     } else {
         false
@@ -566,6 +584,10 @@ fn prepare_erosion_bind_groups(
 
     match existing {
         Some(mut buffers) => {
+            // Update uniform with current params each frame
+            buffers.uniform = UniformBuffer::from(params.clone());
+            buffers.uniform.write_buffer(&render_device, &queue);
+
             // Ensure we have RNG state
             let mut seed = if let Some(ref rs) = rng_state {
                 rs.state
@@ -598,7 +620,7 @@ fn prepare_erosion_bind_groups(
                     &buffers.brush_idx,
                     &buffers.brush_w,
                     &buffers.flow,
-                    &buffers.sediment,
+                    &buffers.deposition,
                     &buffers.erosion,
                 )),
             );
@@ -676,8 +698,8 @@ fn prepare_erosion_bind_groups(
             let mut flow = StorageBuffer::from(vec![0u32; texels]);
             flow.write_buffer(&render_device, &queue);
 
-            let mut sediment = StorageBuffer::from(vec![0u32; texels]);
-            sediment.write_buffer(&render_device, &queue);
+            let mut deposition = StorageBuffer::from(vec![0i32; texels]);
+            deposition.write_buffer(&render_device, &queue);
 
             let mut erosion = StorageBuffer::from(vec![0u32; texels]);
             erosion.write_buffer(&render_device, &queue);
@@ -687,7 +709,7 @@ fn prepare_erosion_bind_groups(
                 None,
                 &pipeline_cache.get_bind_group_layout(&pipeline.layout_erosion),
                 &BindGroupEntries::sequential((
-                    &height, &uniform, &random, &brush_idx, &brush_w, &flow, &sediment, &erosion,
+                    &height, &uniform, &random, &brush_idx, &brush_w, &flow, &deposition, &erosion,
                 )),
             );
             let blit = render_device.create_bind_group(
@@ -725,7 +747,7 @@ fn prepare_erosion_bind_groups(
                 brush_idx,
                 brush_w,
                 flow,
-                sediment,
+                deposition,
                 erosion,
             });
             commands.insert_resource(ErosionBindGroups {
@@ -926,6 +948,17 @@ impl Node for ErosionNode {
                     } else {
                         error!("Erode pipeline not ready!");
                     }
+                }
+                // Pass 1b: write_back (uplift, sediment compaction)
+                if let Some(p_wb) = cache.get_compute_pipeline(pipes.pipeline_write_back) {
+                    let mut pass = render_context
+                        .command_encoder()
+                        .begin_compute_pass(&ComputePassDescriptor::default());
+                    pass.set_pipeline(p_wb);
+                    pass.set_bind_group(0, &groups.erosion, &[]);
+                    let gx = (params.map_size.x + 7) / 8;
+                    let gy = (params.map_size.y + 7) / 8;
+                    pass.dispatch_workgroups(gx, gy, 1);
                 }
                 // Pass 2: blit (samples)
                 {

@@ -17,5 +17,9 @@ path = "src/lib.rs"
 name = "demo"
 path = "examples/demo.rs"
 
+[features]
+default = ["ui"]
+ui = ["bevy/experimental_bevy_feathers"]
+
 [dependencies]
 bevy = { git = "https://github.com/bevyengine/bevy", branch = "main" }
