@@ -1,4 +1,4 @@
-//! Bevy Feathers UI for erosion parameters (Houdini-style controls).
+//! Bevy Feathers UI for erosion parameters.
 
 use bevy::{
     feathers::{
@@ -26,9 +26,9 @@ use crate::{ErodeParams, ResetSim, SimControl};
 #[derive(Component)]
 pub struct ErosionParamsPanel;
 
-/// Marks which ErodeParams field a slider controls.
+/// Marks erosion param sliders for styling (height, font).
 #[derive(Component)]
-struct ErosionSliderField(ErosionSliderFieldKind);
+struct ErosionSliderField;
 
 #[derive(Clone, Copy, PartialEq)]
 enum ErosionSliderFieldKind {
@@ -95,9 +95,7 @@ impl Plugin for ErosionParamsPlugin {
             .add_systems(
                 PostStartup,
                 (shrink_slider_heights, shrink_slider_value_font, shrink_button_checkbox_font),
-            )
-            // Force ErodeParams extraction every frame so UI changes reach the GPU
-            .add_systems(PostUpdate, force_erode_params_extraction);
+            );
     }
 }
 
@@ -132,7 +130,6 @@ fn spawn_erosion_params_panel(mut commands: Commands) {
         observe(|_: On<Pointer<Out>>, mut blocked: ResMut<OrbitInputBlocked>| {
             blocked.0 = false;
         }),
-        observe(erosion_slider_value_change),
         children![
             // Header + sim controls
             (
@@ -324,20 +321,6 @@ fn shrink_button_checkbox_font(
     }
 }
 
-fn force_erode_params_extraction(mut params: ResMut<ErodeParams>) {
-    params.set_changed();
-}
-
-fn erosion_slider_value_change(
-    change: On<ValueChange<f32>>,
-    mut params: ResMut<ErodeParams>,
-    q: Query<&ErosionSliderField>,
-) {
-    if let Ok(field) = q.get(change.source) {
-        field.0.apply(&mut params, change.value);
-    }
-}
-
 fn section_label(text: &str) -> impl Bundle {
     (
         Text::new(text),
@@ -390,10 +373,13 @@ fn slider_row(
                         (
                             SliderStep(0.01),
                             SliderPrecision(3),
-                            ErosionSliderField(field),
+                            ErosionSliderField,
                         ),
                     ),
                     observe(slider_self_update),
+                    observe(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>| {
+                        field.apply(&mut params, change.value);
+                    }),
                 )],
             ),
         ],
