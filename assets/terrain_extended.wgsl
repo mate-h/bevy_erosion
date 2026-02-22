@@ -142,7 +142,7 @@ fn get_preview_color(mode: u32, uv: vec2<f32>, world_normal: vec3<f32>) -> vec4<
     switch (mode) {
         case MODE_FLOW: {
             let analysis = textureSample(analysis_tex, ao_sampler, uv);
-            let flow_mag = analysis.r * 0.01;
+            let flow_mag = analysis.r * 2.0;
             let color = heat_map(flow_mag);
             return vec4<f32>(color, 1.0);
         }
@@ -154,7 +154,7 @@ fn get_preview_color(mode: u32, uv: vec2<f32>, world_normal: vec3<f32>) -> vec4<
         }
         case MODE_EROSION: {
             let analysis = textureSample(analysis_tex, ao_sampler, uv);
-            let erosion = analysis.b * 100.0;
+            let erosion = analysis.b * 2.0;
             let color = heat_map(erosion);
             return vec4<f32>(color, 1.0);
         }

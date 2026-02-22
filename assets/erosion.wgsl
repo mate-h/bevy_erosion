@@ -45,21 +45,18 @@ struct ErodeParams {
     river_friction_reduction: f32,
     river_volume: f32,
     uplift: f32,
-    // Padding/legacy (keep for uniform size)
-    _pad0: u32,
-    _pad1: u32,
+    noise_frequency: f32,
+    noise_scale: f32,
 }
 
 @group(0) @binding(1) var<uniform> params: ErodeParams;
 
 @group(0) @binding(2) var<storage, read> random_indices: array<u32>;
-@group(0) @binding(3) var<storage, read> brush_indices: array<i32>;
-@group(0) @binding(4) var<storage, read> brush_weights: array<f32>;
 
 // Accumulation buffers
-@group(0) @binding(5) var<storage, read_write> flow_buffer: array<atomic<u32>>;
-@group(0) @binding(6) var<storage, read_write> deposition: array<atomic<i32>>;  // loose sediment per cell (fixed-point)
-@group(0) @binding(7) var<storage, read_write> erosion_buffer: array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write> flow_buffer: array<atomic<u32>>;
+@group(0) @binding(4) var<storage, read_write> deposition: array<atomic<i32>>;  // loose sediment per cell (fixed-point)
+@group(0) @binding(5) var<storage, read_write> erosion_buffer: array<atomic<u32>>;
 
 // Color image as read-write storage texture
 @group(1) @binding(0) var color_image: texture_storage_2d<rgba16float, read_write>;
@@ -91,7 +88,7 @@ fn value_noise(p: vec2<f32>) -> f32 {
 fn fbm(p: vec2<f32>) -> f32 {
     var total = 0.0;
     var amp = 0.5;
-    var freq = 0.004;
+    var freq = params.noise_frequency;
     for (var i = 0; i < 6; i = i + 1) {
         total += value_noise(p * freq) * amp;
         amp *= 0.5;
@@ -104,7 +101,7 @@ fn fbm(p: vec2<f32>) -> f32 {
 fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
     let uv = vec2<f32>(gid.xy);
-    let hval = fbm(uv) * 2.0;
+    let hval = fbm(uv) * params.noise_scale;
     let idx = gid.y * params.map_size.x + gid.x;
     atomicStore(&height[idx], u32(hval * HEIGHT_SCALE));
     
@@ -119,8 +116,8 @@ fn band_color_from_height(h: f32) -> vec3<f32> {
     let o = 0.0;
     let feather = 0.05; // feather width for blending between layers
     
-    let water = vec3<f32>(0.08, 0.35, 0.65);
-    let sand = vec3<f32>(0.76, 0.70, 0.50);
+    let water = vec3<f32>(0.08, 0.35, 0.65) * 0.5;
+    let sand = vec3<f32>(0.76, 0.70, 0.50) * 0.5;
     let grass = vec3<f32>(0.20, 0.55, 0.25) * 0.5;
     let rock = vec3<f32>(0.40, 0.40, 0.40) * 0.5;
     let snow = vec3<f32>(0.95, 0.95, 0.95);
@@ -130,33 +127,31 @@ fn band_color_from_height(h: f32) -> vec3<f32> {
     let t2 = 0.35 + o; // sand -> grass
     let t3 = 0.60 + o; // grass -> rock
     let t4 = 0.80 + o; // rock -> snow
-
-    return rock;
     
     // Blend between adjacent colors
-    // if (h < t1 - feather) {
-    //     return water;
-    // } else if (h < t1 + feather) {
-    //     let t = (h - (t1 - feather)) / (2.0 * feather);
-    //     return mix(water, sand, smoothstep(0.0, 1.0, t));
-    // } else if (h < t2 - feather) {
-    //     return sand;
-    // } else if (h < t2 + feather) {
-    //     let t = (h - (t2 - feather)) / (2.0 * feather);
-    //     return mix(sand, grass, smoothstep(0.0, 1.0, t));
-    // } else if (h < t3 - feather) {
-    //     return grass;
-    // } else if (h < t3 + feather) {
-    //     let t = (h - (t3 - feather)) / (2.0 * feather);
-    //     return mix(grass, rock, smoothstep(0.0, 1.0, t));
-    // } else if (h < t4 - feather) {
-    //     return rock;
-    // } else if (h < t4 + feather) {
-    //     let t = (h - (t4 - feather)) / (2.0 * feather);
-    //     return mix(rock, snow, smoothstep(0.0, 1.0, t));
-    // } else {
-    //     return snow;
-    // }
+    if (h < t1 - feather) {
+        return water;
+    } else if (h < t1 + feather) {
+        let t = (h - (t1 - feather)) / (2.0 * feather);
+        return mix(water, sand, smoothstep(0.0, 1.0, t));
+    } else if (h < t2 - feather) {
+        return sand;
+    } else if (h < t2 + feather) {
+        let t = (h - (t2 - feather)) / (2.0 * feather);
+        return mix(sand, grass, smoothstep(0.0, 1.0, t));
+    } else if (h < t3 - feather) {
+        return grass;
+    } else if (h < t3 + feather) {
+        let t = (h - (t3 - feather)) / (2.0 * feather);
+        return mix(grass, rock, smoothstep(0.0, 1.0, t));
+    } else if (h < t4 - feather) {
+        return rock;
+    } else if (h < t4 + feather) {
+        let t = (h - (t4 - feather)) / (2.0 * feather);
+        return mix(rock, snow, smoothstep(0.0, 1.0, t));
+    } else {
+        return snow;
+    }
 }
 
 @compute @workgroup_size(8,8,1)

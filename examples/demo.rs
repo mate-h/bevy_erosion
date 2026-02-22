@@ -124,7 +124,7 @@ fn spawn_terrain(
     ));
 
     let mut atmosphere = earth_atmosphere.get();
-    atmosphere.ground_albedo = Vec3::new(0.0, 0.0, 0.0);
+    atmosphere.ground_albedo = Vec3::splat(0.3);
 
     // Create a compensation curve that slightly under-exposes
     // Negative compensation values = darker/under-exposed

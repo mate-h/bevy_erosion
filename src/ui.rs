@@ -50,6 +50,8 @@ enum ErosionSliderFieldKind {
     Channeling,
     SedimentRemoval,
     Uplift,
+    NoiseFrequency,
+    NoiseScale,
 }
 
 impl ErosionSliderFieldKind {
@@ -73,6 +75,8 @@ impl ErosionSliderFieldKind {
             Self::Channeling => params.channeling = value,
             Self::SedimentRemoval => params.sediment_removal = value,
             Self::Uplift => params.uplift = value,
+            Self::NoiseFrequency => params.noise_frequency = value,
+            Self::NoiseScale => params.noise_scale = value,
         }
     }
 }
@@ -200,6 +204,9 @@ fn spawn_erosion_params_panel(mut commands: Commands) {
                     ),
                 ],
             ),
+            section_label("Noise"),
+            slider_row("Noise Freq", 0.001, 0.05, params.noise_frequency, ErosionSliderFieldKind::NoiseFrequency),
+            slider_row("Noise Scale", 0.5, 5.0, params.noise_scale, ErosionSliderFieldKind::NoiseScale),
             section_label("Main"),
             slider_row("Erosion Strength", 0.0, 1.0, params.erosion_strength, ErosionSliderFieldKind::ErosionStrength),
             slider_row("Rock Softness", 0.0, 1.0, params.rock_softness, ErosionSliderFieldKind::RockSoftness),
@@ -377,8 +384,11 @@ fn slider_row(
                         ),
                     ),
                     observe(slider_self_update),
-                    observe(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>| {
+                    observe(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
                         field.apply(&mut params, change.value);
+                        if matches!(field, ErosionSliderFieldKind::NoiseFrequency | ErosionSliderFieldKind::NoiseScale) {
+                            reset.generation = reset.generation.wrapping_add(1);
+                        }
                     }),
                 )],
             ),

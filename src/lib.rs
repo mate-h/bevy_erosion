@@ -182,8 +182,8 @@ pub struct ErodeParams {
     pub river_friction_reduction: f32,
     pub river_volume: f32,
     pub uplift: f32,
-    pub _pad0: u32,
-    pub _pad1: u32,
+    pub noise_frequency: f32,
+    pub noise_scale: f32,
 }
 
 impl Default for ErodeParams {
@@ -222,17 +222,10 @@ impl Default for ErodeParams {
             river_friction_reduction: 1.0,
             river_volume: 0.0,
             uplift: 0.0,
-            _pad0: 0,
-            _pad1: 0,
+            noise_frequency: 0.008,
+            noise_scale: 1.0,
         }
     }
-}
-
-/// CPU-side buffers for brush data
-#[derive(Resource, Clone, ExtractResource)]
-pub struct ErosionCpuBuffers {
-    pub brush_indices: Vec<i32>,
-    pub brush_weights: Vec<f32>,
 }
 
 /// Resource to trigger simulation reset
@@ -300,10 +293,6 @@ fn setup_erosion_resources(
     let size = config.map_size;
     commands.insert_resource(create_erosion_images(&mut images, size));
     commands.insert_resource(config.to_erode_params(0));
-    commands.insert_resource(ErosionCpuBuffers {
-        brush_indices: vec![],
-        brush_weights: vec![],
-    });
     commands.insert_resource(ResetSim::default());
     commands.insert_resource(SimControl::default());
 }
@@ -315,7 +304,6 @@ impl Plugin for ErosionComputePlugin {
             .add_plugins((
                 ExtractResourcePlugin::<ErosionImages>::default(),
                 ExtractResourcePlugin::<ErodeParams>::default(),
-                ExtractResourcePlugin::<ErosionCpuBuffers>::default(),
                 ExtractResourcePlugin::<ResetSim>::default(),
                 ExtractResourcePlugin::<SimControl>::default(),
             ))
@@ -364,8 +352,6 @@ struct ErosionBuffers {
     uniform: UniformBuffer<ErodeParams>,
     height: StorageBuffer<Vec<u32>>,
     random: StorageBuffer<Vec<u32>>,
-    brush_idx: StorageBuffer<Vec<i32>>,
-    brush_w: StorageBuffer<Vec<f32>>,
     flow: StorageBuffer<Vec<u32>>,
     deposition: StorageBuffer<Vec<i32>>, // loose sediment per cell (atomic<i32> in shader)
     erosion: StorageBuffer<Vec<u32>>,
@@ -390,30 +376,6 @@ pub fn generate_random_indices_seeded(count: u32, max_index: u32, mut state: u64
     v
 }
 
-/// Build a brush with indices and weights for erosion operations
-pub fn build_brush(map_size: i32, radius: i32) -> (Vec<i32>, Vec<f32>) {
-    let mut idx = Vec::new();
-    let mut w = Vec::new();
-    let r2 = (radius * radius) as f32;
-    let r = radius as f32;
-    for y in -radius..=radius {
-        for x in -radius..=radius {
-            let d2 = (x * x + y * y) as f32;
-            if d2 <= r2 {
-                // Match Sebastian Lague's weighting: 1 - sqrt(distance) / radius
-                let weight = 1.0 - (d2.sqrt() / r);
-                idx.push(y * map_size + x);
-                w.push(weight.max(0.0));
-            }
-        }
-    }
-    let sum: f32 = w.iter().sum::<f32>().max(1e-6);
-    for ww in &mut w {
-        *ww /= sum;
-    }
-    (idx, w)
-}
-
 fn init_erosion_pipeline(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
@@ -428,8 +390,6 @@ fn init_erosion_pipeline(
                 storage_buffer::<u32>(false),           // height (atomic<u32> in shader, fixed-point)
                 uniform_buffer::<ErodeParams>(false),
                 storage_buffer_read_only::<u32>(false), // random_indices
-                storage_buffer_read_only::<i32>(false),  // brush_indices
-                storage_buffer_read_only::<f32>(false), // brush_weights
                 storage_buffer::<u32>(false),           // flow (atomic<u32> in shader)
                 storage_buffer::<i32>(false),           // deposition (atomic<i32> in shader)
                 storage_buffer::<u32>(false),           // erosion (atomic<u32> in shader)
@@ -551,7 +511,6 @@ fn prepare_erosion_bind_groups(
     gpu_images: Res<RenderAssets<GpuImage>>,
     images: Res<ErosionImages>,
     params: Res<ErodeParams>,
-    cpu_buffers: Res<ErosionCpuBuffers>,
     render_device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     mut existing: Option<ResMut<ErosionBuffers>>,
@@ -617,8 +576,6 @@ fn prepare_erosion_bind_groups(
                     &buffers.height,
                     &buffers.uniform,
                     &buffers.random,
-                    &buffers.brush_idx,
-                    &buffers.brush_w,
                     &buffers.flow,
                     &buffers.deposition,
                     &buffers.erosion,
@@ -687,12 +644,6 @@ fn prepare_erosion_bind_groups(
             let mut random = StorageBuffer::from(first_random);
             random.write_buffer(&render_device, &queue);
 
-            let mut brush_idx = StorageBuffer::from(cpu_buffers.brush_indices.clone());
-            brush_idx.write_buffer(&render_device, &queue);
-
-            let mut brush_w = StorageBuffer::from(cpu_buffers.brush_weights.clone());
-            brush_w.write_buffer(&render_device, &queue);
-
             // Initialize buffers for atomic operations
             // All buffers store single scalar per pixel (1 u32 per pixel)
             let mut flow = StorageBuffer::from(vec![0u32; texels]);
@@ -709,7 +660,7 @@ fn prepare_erosion_bind_groups(
                 None,
                 &pipeline_cache.get_bind_group_layout(&pipeline.layout_erosion),
                 &BindGroupEntries::sequential((
-                    &height, &uniform, &random, &brush_idx, &brush_w, &flow, &deposition, &erosion,
+                    &height, &uniform, &random, &flow, &deposition, &erosion,
                 )),
             );
             let blit = render_device.create_bind_group(
@@ -744,8 +695,6 @@ fn prepare_erosion_bind_groups(
                 uniform,
                 height,
                 random,
-                brush_idx,
-                brush_w,
                 flow,
                 deposition,
                 erosion,
@@ -1013,12 +962,7 @@ impl Node for ErosionNode {
         }
 
         // Keep buffers alive (not strictly necessary, but avoids drop before usage on some backends)
-        let _keep = (
-            &buffers.uniform,
-            &buffers.random,
-            &buffers.brush_idx,
-            &buffers.brush_w,
-        );
+        let _keep = (&buffers.uniform, &buffers.random);
 
         Ok(())
     }
