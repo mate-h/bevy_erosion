@@ -1,9 +1,7 @@
 use bevy::{
     core_pipeline::tonemapping::Tonemapping,
     light::{
-        atmosphere::ScatteringMedium,
-        light_consts::lux,
-        Atmosphere, AtmosphereEnvironmentMapLight,
+        Atmosphere, AtmosphereEnvironmentMapLight, atmosphere::ScatteringMedium, light_consts::lux,
     },
     material::OpaqueRendererMethod,
     math::{cubic_splines::LinearSpline, vec2},
@@ -14,13 +12,14 @@ use bevy::{
     },
     prelude::*,
 };
-use bevy_erosion::{
-    camera::{OrbitCameraPlugin, OrbitController},
-    sun::{SunPlugin, Sun, SunController},
-    ErosionConfig, *,
-};
 #[cfg(feature = "ui")]
 use bevy_erosion::ui::ErosionParamsPlugin;
+use bevy_erosion::{
+    ErosionConfig,
+    camera::{OrbitCameraPlugin, OrbitController},
+    sun::{Sun, SunController, SunPlugin},
+    *,
+};
 
 /// Map size (width and height). Customize this to change erosion resolution.
 const MAP_SIZE: UVec2 = UVec2::new(512, 512);
@@ -147,8 +146,8 @@ fn spawn_terrain(
             vec2(-4.0, UNDER_EXPOSURE_AMOUNT * 1.67), // Dark scenes: more under-exposure
             vec2(-2.0, UNDER_EXPOSURE_AMOUNT * 1.33), // Medium-dark: moderate under-exposure
             vec2(0.0, UNDER_EXPOSURE_AMOUNT),         // Middle gray: base under-exposure
-            vec2(2.0, UNDER_EXPOSURE_AMOUNT * 0.67), // Medium-bright: less under-exposure
-            vec2(4.0, UNDER_EXPOSURE_AMOUNT * 0.33), // Bright scenes: minimal under-exposure
+            vec2(2.0, UNDER_EXPOSURE_AMOUNT * 0.67),  // Medium-bright: less under-exposure
+            vec2(4.0, UNDER_EXPOSURE_AMOUNT * 0.33),  // Bright scenes: minimal under-exposure
         ]))
         .expect("Failed to create compensation curve"),
     );
@@ -222,7 +221,12 @@ fn handle_preview_mode_input(
     mut materials: ResMut<Assets<TerrainMaterial>>,
     mut commands: Commands,
     mut cameras: Query<
-        (Entity, &mut Tonemapping, &mut Bloom, Has<AtmosphereSettings>),
+        (
+            Entity,
+            &mut Tonemapping,
+            &mut Bloom,
+            Has<AtmosphereSettings>,
+        ),
         With<Camera3d>,
     >,
     mut atmosphere_query: Query<(&mut Atmosphere, &mut Visibility), With<DemoAtmosphere>>,
@@ -295,4 +299,3 @@ fn handle_preview_mode_input(
         }
     }
 }
-

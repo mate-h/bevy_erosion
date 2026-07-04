@@ -1,6 +1,6 @@
 use bevy::{
+    input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel},
     prelude::*,
-    input::mouse::{MouseMotion, MouseWheel, MouseScrollUnit},
 };
 
 /// When true, orbit camera input (rotate/zoom) is ignored. Set by UI when pointer is over the panel.
@@ -11,8 +11,10 @@ pub struct OrbitCameraPlugin;
 
 impl Plugin for OrbitCameraPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<OrbitInputBlocked>()
-            .add_systems(Update, (orbit_mouse_rotate, orbit_mouse_zoom, apply_orbit_transform));
+        app.init_resource::<OrbitInputBlocked>().add_systems(
+            Update,
+            (orbit_mouse_rotate, orbit_mouse_zoom, apply_orbit_transform),
+        );
     }
 }
 
@@ -34,8 +36,8 @@ pub struct OrbitController {
 
 impl Default for OrbitController {
     fn default() -> Self {
-        let initial_yaw = std::f32::consts::FRAC_PI_4;      // 45°
-        let initial_pitch = std::f32::consts::FRAC_PI_6;    // 30°
+        let initial_yaw = std::f32::consts::FRAC_PI_4; // 45°
+        let initial_pitch = std::f32::consts::FRAC_PI_6; // 30°
         Self {
             target: Vec3::new(0.0, 1.0, 0.0),
             distance: 200.0,
@@ -100,21 +102,21 @@ fn orbit_mouse_zoom(
             }
         }
     }
-    if total_y == 0.0 { return; }
+    if total_y == 0.0 {
+        return;
+    }
     for mut ctrl in &mut query {
         ctrl.distance = (ctrl.distance - total_y * ctrl.zoom_sensitivity)
             .clamp(ctrl.min_distance, ctrl.max_distance);
     }
 }
 
-fn apply_orbit_transform(
-    mut query: Query<(&mut Transform, &mut OrbitController), With<Camera3d>>,
-) {
+fn apply_orbit_transform(mut query: Query<(&mut Transform, &mut OrbitController), With<Camera3d>>) {
     for (mut transform, mut ctrl) in &mut query {
         // Lerp current yaw and pitch towards target values
         ctrl.yaw = ctrl.yaw + (ctrl.target_yaw - ctrl.yaw) * ctrl.damping_factor;
         ctrl.pitch = ctrl.pitch + (ctrl.target_pitch - ctrl.pitch) * ctrl.damping_factor;
-        
+
         // Spherical coordinates around target
         let x = ctrl.distance * ctrl.pitch.cos() * ctrl.yaw.sin();
         let y = ctrl.distance * ctrl.pitch.sin();

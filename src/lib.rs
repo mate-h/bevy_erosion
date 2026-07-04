@@ -1,19 +1,18 @@
 use bevy::{
     asset::RenderAssetUsages,
     core_pipeline::schedule::camera_driver,
-    pbr::{
-        ExtendedMaterial, MaterialExtension, StandardMaterial,
-    },
+    pbr::{ExtendedMaterial, MaterialExtension, StandardMaterial},
     prelude::*,
     render::{
         Render, RenderApp, RenderStartup, RenderSystems,
         extract_resource::{ExtractResource, ExtractResourcePlugin},
         render_asset::RenderAssets,
         render_resource::{
+            TextureFormat, TextureUsages,
             binding_types::{
                 storage_buffer, storage_buffer_read_only, texture_storage_2d, uniform_buffer,
             },
-            TextureFormat, TextureUsages, *,
+            *,
         },
         renderer::{RenderContext, RenderDevice, RenderGraph, RenderQueue},
         texture::GpuImage,
@@ -38,8 +37,8 @@ pub struct ErosionImages {
     pub color: Handle<Image>,
     pub normal: Handle<Image>,
     pub analysis: Handle<Image>, // Combined: R=flow_mag, G=sediment, B=erosion, A=flow_dir_encoded
-    pub ao: Handle<Image>,        // Ambient occlusion texture
-    pub ao_temp: Handle<Image>,   // Temporary texture for AO blur
+    pub ao: Handle<Image>,       // Ambient occlusion texture
+    pub ao_temp: Handle<Image>,  // Temporary texture for AO blur
 }
 
 /// Creates all erosion render-target images for the given map size and adds them to `images`.
@@ -48,8 +47,9 @@ pub fn create_erosion_images(images: &mut Assets<Image>, size: UVec2) -> Erosion
     let add = |images: &mut Assets<Image>, format: TextureFormat| {
         let mut image = Image::new_target_texture(size.x, size.y, format, None);
         image.asset_usage = RenderAssetUsages::RENDER_WORLD;
-        image.texture_descriptor.usage =
-            TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
+        image.texture_descriptor.usage = TextureUsages::COPY_DST
+            | TextureUsages::STORAGE_BINDING
+            | TextureUsages::TEXTURE_BINDING;
         images.add(image)
     };
     ErosionImages {
@@ -241,7 +241,6 @@ pub struct SimControl {
     pub step_counter: u64,
 }
 
-
 /// User-facing configuration for the erosion simulation.
 #[derive(Resource, Clone)]
 pub struct ErosionConfig {
@@ -293,7 +292,6 @@ fn setup_erosion_resources(
     commands.insert_resource(ResetSim::default());
     commands.insert_resource(SimControl::default());
 }
-
 
 impl Plugin for ErosionComputePlugin {
     fn build(&self, app: &mut App) {
@@ -387,7 +385,7 @@ fn init_erosion_pipeline(
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                storage_buffer::<u32>(false),           // height (atomic<u32> in shader, fixed-point)
+                storage_buffer::<u32>(false), // height (atomic<u32> in shader, fixed-point)
                 uniform_buffer::<ErodeParams>(false),
                 storage_buffer_read_only::<u32>(false), // random_indices
                 storage_buffer::<u32>(false),           // flow (atomic<u32> in shader)
@@ -660,7 +658,12 @@ fn prepare_erosion_bind_groups(
                 None,
                 &pipeline_cache.get_bind_group_layout(&pipeline.layout_erosion),
                 &BindGroupEntries::sequential((
-                    &height, &uniform, &random, &flow, &deposition, &erosion,
+                    &height,
+                    &uniform,
+                    &random,
+                    &flow,
+                    &deposition,
+                    &erosion,
                 )),
             );
             let blit = render_device.create_bind_group(
@@ -747,18 +750,16 @@ fn update_erosion_state(
         state.allow_erode_this_frame = true;
     }
     match state.phase {
-        ErosionPhase::Loading => {
-            match cache.get_compute_pipeline_state(pipeline.pipeline_init) {
-                CachedPipelineState::Ok(_) => {
-                    state.phase = ErosionPhase::Init;
-                }
-                CachedPipelineState::Err(ShaderCacheError::ShaderNotLoaded(_)) => {}
-                CachedPipelineState::Err(err) => {
-                    panic!("Initializing assets/{EROSION_SHADER}:\n{err}")
-                }
-                _ => {}
+        ErosionPhase::Loading => match cache.get_compute_pipeline_state(pipeline.pipeline_init) {
+            CachedPipelineState::Ok(_) => {
+                state.phase = ErosionPhase::Init;
             }
-        }
+            CachedPipelineState::Err(ShaderCacheError::ShaderNotLoaded(_)) => {}
+            CachedPipelineState::Err(err) => {
+                panic!("Initializing assets/{EROSION_SHADER}:\n{err}")
+            }
+            _ => {}
+        },
         ErosionPhase::Init => {
             let color_ready = matches!(
                 cache.get_compute_pipeline_state(pipeline.pipeline_init_color),
@@ -801,14 +802,12 @@ fn erosion_compute(
                 pass.dispatch_workgroups(gx, gy, 1);
             }
             // Pass 1b: init color bands (uses height as input, writes color storage texture)
-            if let Some(p_color_ok) =
-                match cache.get_compute_pipeline_state(pipes.pipeline_init_color) {
-                    CachedPipelineState::Ok(_) => {
-                        cache.get_compute_pipeline(pipes.pipeline_init_color)
-                    }
-                    _ => None,
-                }
+            if let Some(p_color_ok) = match cache
+                .get_compute_pipeline_state(pipes.pipeline_init_color)
             {
+                CachedPipelineState::Ok(_) => cache.get_compute_pipeline(pipes.pipeline_init_color),
+                _ => None,
+            } {
                 let mut pass = render_context
                     .command_encoder()
                     .begin_compute_pass(&ComputePassDescriptor::default());
@@ -951,4 +950,3 @@ fn erosion_compute(
     // Keep buffers alive (not strictly necessary, but avoids drop before usage on some backends)
     let _keep = (&buffers.uniform, &buffers.random);
 }
-

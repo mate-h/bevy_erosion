@@ -2,20 +2,21 @@
 
 use bevy::{
     feathers::{
+        FeathersPlugins,
         constants::fonts,
         controls::{ButtonVariant, FeathersButton, FeathersCheckbox, FeathersSlider},
         dark_theme::create_dark_theme,
         font_styles::InheritableFont,
         theme::{ThemeBackgroundColor, ThemedText, UiTheme},
-        tokens, FeathersPlugins,
+        tokens,
     },
     input_focus::tab_navigation::TabGroup,
     prelude::*,
     text::FontWeight,
     ui::Checked,
     ui_widgets::{
-        checkbox_self_update, slider_self_update, Activate, Button, Checkbox, SliderPrecision,
-        SliderStep, ValueChange,
+        Activate, Button, Checkbox, SliderPrecision, SliderStep, ValueChange, checkbox_self_update,
+        slider_self_update,
     },
 };
 
@@ -102,7 +103,11 @@ impl Plugin for ErosionParamsPlugin {
             .add_systems(Startup, spawn_erosion_params_panel)
             .add_systems(
                 PostStartup,
-                (shrink_slider_heights, shrink_slider_value_font, shrink_button_checkbox_font),
+                (
+                    shrink_slider_heights,
+                    shrink_slider_value_font,
+                    shrink_button_checkbox_font,
+                ),
             );
     }
 }
