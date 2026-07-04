@@ -1,10 +1,13 @@
 use bevy::{
     core_pipeline::tonemapping::Tonemapping,
-    light::{AtmosphereEnvironmentMapLight, light_consts::lux},
-    math::{cubic_splines::LinearSpline, vec2},
-    pbr::{
-        Atmosphere, AtmosphereSettings, EarthlikeAtmosphere, ExtendedMaterial, MaterialPlugin, OpaqueRendererMethod, StandardMaterial
+    light::{
+        atmosphere::ScatteringMedium,
+        light_consts::lux,
+        Atmosphere, AtmosphereEnvironmentMapLight,
     },
+    material::OpaqueRendererMethod,
+    math::{cubic_splines::LinearSpline, vec2},
+    pbr::{AtmosphereSettings, ExtendedMaterial, MaterialPlugin, StandardMaterial},
     post_process::{
         auto_exposure::{AutoExposure, AutoExposureCompensationCurve, AutoExposurePlugin},
         bloom::Bloom,
@@ -59,6 +62,12 @@ struct CurrentPreviewMode {
     mode: PreviewMode,
 }
 
+#[derive(Component)]
+struct DemoAtmosphere;
+
+#[derive(Resource)]
+struct DemoEarthMedium(Handle<ScatteringMedium>);
+
 fn setup(mut commands: Commands) {
     commands.insert_resource(CurrentPreviewMode::default());
     commands.insert_resource(GlobalAmbientLight::NONE);
@@ -83,7 +92,7 @@ fn spawn_terrain(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
     mut compensation_curves: ResMut<Assets<AutoExposureCompensationCurve>>,
-    earth_atmosphere: Res<EarthlikeAtmosphere>,
+    mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
     erosion_images: Res<ErosionImages>,
     config: Res<ErosionConfig>,
 ) {
@@ -123,8 +132,12 @@ fn spawn_terrain(
         Transform::from_xyz(0.0, 0.0, 0.0),
     ));
 
-    let mut atmosphere = earth_atmosphere.get();
+    let earth_medium = scattering_mediums.add(ScatteringMedium::earth(256, 256));
+    commands.insert_resource(DemoEarthMedium(earth_medium.clone()));
+
+    let mut atmosphere = Atmosphere::earth(earth_medium);
     atmosphere.ground_albedo = Vec3::splat(0.3);
+    commands.spawn((atmosphere, DemoAtmosphere));
 
     // Create a compensation curve that slightly under-exposes
     // Negative compensation values = darker/under-exposed
@@ -149,12 +162,7 @@ fn spawn_terrain(
             distance: 225.0,
             ..Default::default()
         },
-        atmosphere,
-        AtmosphereSettings {
-            scene_units_to_m: 1.0,
-            // rendering_method: AtmosphereMode::Raymarched,
-            ..Default::default()
-        },
+        AtmosphereSettings::default(),
         AtmosphereEnvironmentMapLight::default(),
         Tonemapping::AcesFitted,
         Bloom::NATURAL,
@@ -169,7 +177,7 @@ fn spawn_terrain(
     let initial_sun_dir = -initial_sun_pos.normalize(); // Direction from origin to sun
     commands.spawn((
         DirectionalLight {
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             illuminance: lux::RAW_SUNLIGHT,
             ..default()
         },
@@ -212,8 +220,13 @@ fn handle_preview_mode_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut preview_mode: ResMut<CurrentPreviewMode>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
-    mut cameras: Query<(&mut Atmosphere, &mut Tonemapping, &mut Bloom), With<Camera3d>>,
-    earth_atmosphere: Res<EarthlikeAtmosphere>,
+    mut commands: Commands,
+    mut cameras: Query<
+        (Entity, &mut Tonemapping, &mut Bloom, Has<AtmosphereSettings>),
+        With<Camera3d>,
+    >,
+    mut atmosphere_query: Query<(&mut Atmosphere, &mut Visibility), With<DemoAtmosphere>>,
+    demo_earth_medium: Res<DemoEarthMedium>,
 ) {
     let new_mode = if keys.just_pressed(KeyCode::Digit1) {
         Some(PreviewMode::Pbr)
@@ -252,22 +265,29 @@ fn handle_preview_mode_input(
             }
 
             // Toggle atmosphere, tonemapping, and bloom based on mode
-            for (mut atmosphere, mut tonemapping, mut bloom) in cameras.iter_mut() {
+            for (camera, mut tonemapping, mut bloom, has_atmosphere_settings) in cameras.iter_mut()
+            {
                 if mode == PreviewMode::Pbr {
-                    // Enable atmosphere and bloom for PBR
-                    *atmosphere = earth_atmosphere.get();
+                    let mut atmosphere = Atmosphere::earth(demo_earth_medium.0.clone());
+                    atmosphere.ground_albedo = Vec3::splat(0.3);
+                    for (mut atmosphere_component, mut visibility) in atmosphere_query.iter_mut() {
+                        *atmosphere_component = atmosphere.clone();
+                        *visibility = Visibility::Visible;
+                    }
+                    if !has_atmosphere_settings {
+                        commands
+                            .entity(camera)
+                            .insert(AtmosphereSettings::default());
+                    }
                     *tonemapping = Tonemapping::AcesFitted;
                     *bloom = Bloom::NATURAL;
                 } else {
-                    // Disable atmosphere and bloom for debug modes
-                    // Preserve the medium handle to avoid invalid asset errors
-                    let medium_handle = atmosphere.medium.clone();
-                    *atmosphere = Atmosphere {
-                        bottom_radius: 0.0,
-                        top_radius: 0.0,
-                        ground_albedo: Vec3::ZERO,
-                        medium: medium_handle,
-                    };
+                    for (_, mut visibility) in atmosphere_query.iter_mut() {
+                        *visibility = Visibility::Hidden;
+                    }
+                    if has_atmosphere_settings {
+                        commands.entity(camera).remove::<AtmosphereSettings>();
+                    }
                     *tonemapping = Tonemapping::None;
                     bloom.intensity = 0.0;
                 }

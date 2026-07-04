@@ -1,5 +1,6 @@
 use bevy::{
     asset::RenderAssetUsages,
+    core_pipeline::schedule::camera_driver,
     pbr::{
         ExtendedMaterial, MaterialExtension, StandardMaterial,
     },
@@ -8,17 +9,16 @@ use bevy::{
         Render, RenderApp, RenderStartup, RenderSystems,
         extract_resource::{ExtractResource, ExtractResourcePlugin},
         render_asset::RenderAssets,
-        render_graph::{Node, NodeRunError, RenderGraph, RenderGraphContext, RenderLabel},
         render_resource::{
             binding_types::{
                 storage_buffer, storage_buffer_read_only, texture_storage_2d, uniform_buffer,
             },
             TextureFormat, TextureUsages, *,
         },
-        renderer::{RenderContext, RenderDevice, RenderQueue},
+        renderer::{RenderContext, RenderDevice, RenderGraph, RenderQueue},
         texture::GpuImage,
     },
-    shader::ShaderRef,
+    shader::{ShaderCacheError, ShaderRef},
 };
 use std::borrow::Cow;
 
@@ -46,7 +46,7 @@ pub struct ErosionImages {
 /// Called automatically by `ErosionComputePlugin` from `ErosionConfig`; exposed for custom setups.
 pub fn create_erosion_images(images: &mut Assets<Image>, size: UVec2) -> ErosionImages {
     let add = |images: &mut Assets<Image>, format: TextureFormat| {
-        let mut image = Image::new_target_texture(size.x, size.y, format);
+        let mut image = Image::new_target_texture(size.x, size.y, format, None);
         image.asset_usage = RenderAssetUsages::RENDER_WORLD;
         image.texture_descriptor.usage =
             TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
@@ -282,9 +282,6 @@ impl ErosionConfig {
 /// Plugin for erosion compute simulation
 pub struct ErosionComputePlugin;
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-struct ErosionLabel;
-
 fn setup_erosion_resources(
     config: Res<ErosionConfig>,
     mut commands: Commands,
@@ -309,17 +306,20 @@ impl Plugin for ErosionComputePlugin {
             ))
             .add_systems(Startup, setup_erosion_resources);
 
-        let render_app = app.sub_app_mut(RenderApp);
+        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+            return;
+        };
         render_app
+            .init_resource::<ErosionState>()
             .add_systems(RenderStartup, init_erosion_pipeline)
             .add_systems(
                 Render,
-                prepare_erosion_bind_groups.in_set(RenderSystems::PrepareBindGroups),
-            );
-
-        let mut render_graph = render_app.world_mut().resource_mut::<RenderGraph>();
-        render_graph.add_node(ErosionLabel, ErosionNode::default());
-        render_graph.add_node_edge(ErosionLabel, bevy::render::graph::CameraDriverLabel);
+                (
+                    prepare_erosion_bind_groups.in_set(RenderSystems::PrepareBindGroups),
+                    update_erosion_state.in_set(RenderSystems::Prepare),
+                ),
+            )
+            .add_systems(RenderGraph, erosion_compute.before(camera_driver));
     }
 }
 
@@ -709,262 +709,246 @@ fn prepare_erosion_bind_groups(
     }
 }
 
-enum ErosionState {
-    Loading,
-    Init,
-    Erode,
-}
-
-struct ErosionNode {
-    state: ErosionState,
+#[derive(Resource, Default)]
+struct ErosionState {
+    phase: ErosionPhase,
     last_reset_gen: u32,
     allow_erode_this_frame: bool,
     last_step_seen: u64,
 }
 
-impl Default for ErosionNode {
-    fn default() -> Self {
-        Self {
-            state: ErosionState::Loading,
-            last_reset_gen: 0,
-            allow_erode_this_frame: true,
-            last_step_seen: 0,
-        }
-    }
+#[derive(Default)]
+enum ErosionPhase {
+    #[default]
+    Loading,
+    Init,
+    Erode,
 }
 
-impl Node for ErosionNode {
-    fn update(&mut self, world: &mut World) {
-        let pipeline = world.resource::<ErosionPipeline>();
-        let cache = world.resource::<PipelineCache>();
-        let reset = world.resource::<ResetSim>();
-        let sim = world.resource::<SimControl>();
-        if reset.generation != self.last_reset_gen {
-            self.last_reset_gen = reset.generation;
-            self.state = ErosionState::Loading;
-        }
-        if sim.paused {
-            if sim.step_counter > self.last_step_seen {
-                self.allow_erode_this_frame = true;
-                self.last_step_seen = sim.step_counter;
-            } else {
-                self.allow_erode_this_frame = false;
-            }
+fn update_erosion_state(
+    pipeline: Res<ErosionPipeline>,
+    cache: Res<PipelineCache>,
+    reset: Res<ResetSim>,
+    sim: Res<SimControl>,
+    mut state: ResMut<ErosionState>,
+) {
+    if reset.generation != state.last_reset_gen {
+        state.last_reset_gen = reset.generation;
+        state.phase = ErosionPhase::Loading;
+    }
+    if sim.paused {
+        if sim.step_counter > state.last_step_seen {
+            state.allow_erode_this_frame = true;
+            state.last_step_seen = sim.step_counter;
         } else {
-            self.allow_erode_this_frame = true;
+            state.allow_erode_this_frame = false;
         }
-        match self.state {
-            ErosionState::Loading => match cache.get_compute_pipeline_state(pipeline.pipeline_init)
-            {
+    } else {
+        state.allow_erode_this_frame = true;
+    }
+    match state.phase {
+        ErosionPhase::Loading => {
+            match cache.get_compute_pipeline_state(pipeline.pipeline_init) {
                 CachedPipelineState::Ok(_) => {
-                    self.state = ErosionState::Init;
+                    state.phase = ErosionPhase::Init;
                 }
-                CachedPipelineState::Err(bevy::shader::PipelineCacheError::ShaderNotLoaded(_)) => {}
+                CachedPipelineState::Err(ShaderCacheError::ShaderNotLoaded(_)) => {}
                 CachedPipelineState::Err(err) => {
                     panic!("Initializing assets/{EROSION_SHADER}:\n{err}")
                 }
                 _ => {}
-            },
-            ErosionState::Init => {
-                // Wait one frame after color pipeline is ready before transitioning,
-                // guaranteeing that `init_color_bands` runs at least once.
-                let color_ready = matches!(
-                    cache.get_compute_pipeline_state(pipeline.pipeline_init_color),
-                    CachedPipelineState::Ok(_)
-                );
-                let erode_ready = matches!(
-                    cache.get_compute_pipeline_state(pipeline.pipeline_erode),
-                    CachedPipelineState::Ok(_)
-                );
-                if color_ready && erode_ready {
-                    self.state = ErosionState::Erode;
-                }
             }
-            ErosionState::Erode => {}
         }
+        ErosionPhase::Init => {
+            let color_ready = matches!(
+                cache.get_compute_pipeline_state(pipeline.pipeline_init_color),
+                CachedPipelineState::Ok(_)
+            );
+            let erode_ready = matches!(
+                cache.get_compute_pipeline_state(pipeline.pipeline_erode),
+                CachedPipelineState::Ok(_)
+            );
+            if color_ready && erode_ready {
+                state.phase = ErosionPhase::Erode;
+            }
+        }
+        ErosionPhase::Erode => {}
     }
+}
 
-    fn run(
-        &self,
-        _graph: &mut RenderGraphContext,
-        render_context: &mut RenderContext,
-        world: &World,
-    ) -> Result<(), NodeRunError> {
-        let cache = world.resource::<PipelineCache>();
-        let pipes = world.resource::<ErosionPipeline>();
-        let groups = world.resource::<ErosionBindGroups>();
-        let params = world.resource::<ErodeParams>();
-        let buffers = world.resource::<ErosionBuffers>();
-
-        match self.state {
-            ErosionState::Loading => {}
-            ErosionState::Init => {
-                // Pass 1: init FBM (writes buffer)
-                {
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    let p_init = cache.get_compute_pipeline(pipes.pipeline_init).unwrap();
-                    pass.set_pipeline(p_init);
-                    pass.set_bind_group(0, &groups.erosion, &[]);
-                    let gx = (params.map_size.x + 7) / 8;
-                    let gy = (params.map_size.y + 7) / 8;
-                    pass.dispatch_workgroups(gx, gy, 1);
-                }
-                // Pass 1b: init color bands (uses height as input, writes color storage texture)
-                if let Some(p_color_ok) =
-                    match cache.get_compute_pipeline_state(pipes.pipeline_init_color) {
-                        CachedPipelineState::Ok(_) => {
-                            cache.get_compute_pipeline(pipes.pipeline_init_color)
-                        }
-                        _ => None,
+fn erosion_compute(
+    mut render_context: RenderContext,
+    cache: Res<PipelineCache>,
+    pipes: Res<ErosionPipeline>,
+    groups: Res<ErosionBindGroups>,
+    params: Res<ErodeParams>,
+    buffers: Res<ErosionBuffers>,
+    state: Res<ErosionState>,
+) {
+    match state.phase {
+        ErosionPhase::Loading => {}
+        ErosionPhase::Init => {
+            // Pass 1: init FBM (writes buffer)
+            {
+                let mut pass = render_context
+                    .command_encoder()
+                    .begin_compute_pass(&ComputePassDescriptor::default());
+                let p_init = cache.get_compute_pipeline(pipes.pipeline_init).unwrap();
+                pass.set_pipeline(p_init);
+                pass.set_bind_group(0, &groups.erosion, &[]);
+                let gx = (params.map_size.x + 7) / 8;
+                let gy = (params.map_size.y + 7) / 8;
+                pass.dispatch_workgroups(gx, gy, 1);
+            }
+            // Pass 1b: init color bands (uses height as input, writes color storage texture)
+            if let Some(p_color_ok) =
+                match cache.get_compute_pipeline_state(pipes.pipeline_init_color) {
+                    CachedPipelineState::Ok(_) => {
+                        cache.get_compute_pipeline(pipes.pipeline_init_color)
                     }
-                {
+                    _ => None,
+                }
+            {
+                let mut pass = render_context
+                    .command_encoder()
+                    .begin_compute_pass(&ComputePassDescriptor::default());
+                pass.set_pipeline(p_color_ok);
+                pass.set_bind_group(0, &groups.erosion, &[]);
+                pass.set_bind_group(1, &groups.color, &[]);
+                let gx = (params.map_size.x + 7) / 8;
+                let gy = (params.map_size.y + 7) / 8;
+                pass.dispatch_workgroups(gx, gy, 1);
+            }
+            // Pass 2: blit (samples)
+            {
+                let mut pass = render_context
+                    .command_encoder()
+                    .begin_compute_pass(&ComputePassDescriptor::default());
+                let p_blit = cache.get_compute_pipeline(pipes.pipeline_blit).unwrap();
+                pass.set_pipeline(p_blit);
+                pass.set_bind_group(0, &groups.erosion, &[]);
+                pass.set_bind_group(1, &groups.blit, &[]);
+                let gx = (params.map_size.x + 7) / 8;
+                let gy = (params.map_size.y + 7) / 8;
+                pass.dispatch_workgroups(gx, gy, 1);
+            }
+            // Pass 3: compute AO
+            if let Some(p_ao) = cache.get_compute_pipeline(pipes.pipeline_ao) {
+                let mut pass = render_context
+                    .command_encoder()
+                    .begin_compute_pass(&ComputePassDescriptor::default());
+                pass.set_pipeline(p_ao);
+                pass.set_bind_group(0, &groups.erosion, &[]);
+                pass.set_bind_group(1, &groups.blit, &[]);
+                let gx = (params.map_size.x + 7) / 8;
+                let gy = (params.map_size.y + 7) / 8;
+                pass.dispatch_workgroups(gx, gy, 1);
+            }
+            // Pass 4: blur AO horizontally
+            if let Some(p_blur_h) = cache.get_compute_pipeline(pipes.pipeline_blur_h) {
+                let mut pass = render_context
+                    .command_encoder()
+                    .begin_compute_pass(&ComputePassDescriptor::default());
+                pass.set_pipeline(p_blur_h);
+                pass.set_bind_group(0, &groups.erosion, &[]);
+                pass.set_bind_group(1, &groups.blit_blur, &[]);
+                let gx = (params.map_size.x + 7) / 8;
+                let gy = (params.map_size.y + 7) / 8;
+                pass.dispatch_workgroups(gx, gy, 1);
+            }
+            // Pass 5: blur AO vertically
+            if let Some(p_blur_v) = cache.get_compute_pipeline(pipes.pipeline_blur_v) {
+                let mut pass = render_context
+                    .command_encoder()
+                    .begin_compute_pass(&ComputePassDescriptor::default());
+                pass.set_pipeline(p_blur_v);
+                pass.set_bind_group(0, &groups.erosion, &[]);
+                pass.set_bind_group(1, &groups.blit_blur, &[]);
+                let gx = (params.map_size.x + 7) / 8;
+                let gy = (params.map_size.y + 7) / 8;
+                pass.dispatch_workgroups(gx, gy, 1);
+            }
+        }
+        ErosionPhase::Erode => {
+            // Pass 1: erode (writes storage) — gated by pause/step
+            if state.allow_erode_this_frame {
+                if let Some(p_erode) = cache.get_compute_pipeline(pipes.pipeline_erode) {
                     let mut pass = render_context
                         .command_encoder()
                         .begin_compute_pass(&ComputePassDescriptor::default());
-                    pass.set_pipeline(p_color_ok);
+                    pass.set_pipeline(p_erode);
                     pass.set_bind_group(0, &groups.erosion, &[]);
                     pass.set_bind_group(1, &groups.color, &[]);
-                    let gx = (params.map_size.x + 7) / 8;
-                    let gy = (params.map_size.y + 7) / 8;
-                    pass.dispatch_workgroups(gx, gy, 1);
-                }
-                // Pass 2: blit (samples)
-                {
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    let p_blit = cache.get_compute_pipeline(pipes.pipeline_blit).unwrap();
-                    pass.set_pipeline(p_blit);
-                    pass.set_bind_group(0, &groups.erosion, &[]);
-                    pass.set_bind_group(1, &groups.blit, &[]);
-                    let gx = (params.map_size.x + 7) / 8;
-                    let gy = (params.map_size.y + 7) / 8;
-                    pass.dispatch_workgroups(gx, gy, 1);
-                }
-                // Pass 3: compute AO
-                if let Some(p_ao) = cache.get_compute_pipeline(pipes.pipeline_ao) {
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    pass.set_pipeline(p_ao);
-                    pass.set_bind_group(0, &groups.erosion, &[]);
-                    pass.set_bind_group(1, &groups.blit, &[]);
-                    let gx = (params.map_size.x + 7) / 8;
-                    let gy = (params.map_size.y + 7) / 8;
-                    pass.dispatch_workgroups(gx, gy, 1);
-                }
-                // Pass 4: blur AO horizontally
-                if let Some(p_blur_h) = cache.get_compute_pipeline(pipes.pipeline_blur_h) {
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    pass.set_pipeline(p_blur_h);
-                    pass.set_bind_group(0, &groups.erosion, &[]);
-                    pass.set_bind_group(1, &groups.blit_blur, &[]);
-                    let gx = (params.map_size.x + 7) / 8;
-                    let gy = (params.map_size.y + 7) / 8;
-                    pass.dispatch_workgroups(gx, gy, 1);
-                }
-                // Pass 5: blur AO vertically
-                if let Some(p_blur_v) = cache.get_compute_pipeline(pipes.pipeline_blur_v) {
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    pass.set_pipeline(p_blur_v);
-                    pass.set_bind_group(0, &groups.erosion, &[]);
-                    pass.set_bind_group(1, &groups.blit_blur, &[]);
-                    let gx = (params.map_size.x + 7) / 8;
-                    let gy = (params.map_size.y + 7) / 8;
-                    pass.dispatch_workgroups(gx, gy, 1);
+                    let workgroups = (params.num_particles + 1023) / 1024;
+                    pass.dispatch_workgroups(workgroups, 1, 1);
+                } else {
+                    error!("Erode pipeline not ready!");
                 }
             }
-            ErosionState::Erode => {
-                // If reset happened recently, restore from initial before eroding
-                // (Handled via state transition to Loading/Init above)
-                // Pass 1: erode (writes storage) — gated by pause/step
-                if self.allow_erode_this_frame {
-                    if let Some(p_erode) = cache.get_compute_pipeline(pipes.pipeline_erode) {
-                        let mut pass = render_context
-                            .command_encoder()
-                            .begin_compute_pass(&ComputePassDescriptor::default());
-                        pass.set_pipeline(p_erode);
-                        pass.set_bind_group(0, &groups.erosion, &[]);
-                        pass.set_bind_group(1, &groups.color, &[]);
-                        let workgroups = (params.num_particles + 1023) / 1024;
-                        pass.dispatch_workgroups(workgroups, 1, 1);
-                    } else {
-                        error!("Erode pipeline not ready!");
-                    }
-                }
-                // Pass 1b: write_back (uplift, sediment compaction)
-                if let Some(p_wb) = cache.get_compute_pipeline(pipes.pipeline_write_back) {
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    pass.set_pipeline(p_wb);
-                    pass.set_bind_group(0, &groups.erosion, &[]);
-                    let gx = (params.map_size.x + 7) / 8;
-                    let gy = (params.map_size.y + 7) / 8;
-                    pass.dispatch_workgroups(gx, gy, 1);
-                }
-                // Pass 2: blit (samples)
-                {
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    let p_blit = cache.get_compute_pipeline(pipes.pipeline_blit).unwrap();
-                    pass.set_pipeline(p_blit);
-                    pass.set_bind_group(0, &groups.erosion, &[]);
-                    pass.set_bind_group(1, &groups.blit, &[]);
-                    let gx = (params.map_size.x + 7) / 8;
-                    let gy = (params.map_size.y + 7) / 8;
-                    pass.dispatch_workgroups(gx, gy, 1);
-                }
-                // Pass 3: compute AO
-                if let Some(p_ao) = cache.get_compute_pipeline(pipes.pipeline_ao) {
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    pass.set_pipeline(p_ao);
-                    pass.set_bind_group(0, &groups.erosion, &[]);
-                    pass.set_bind_group(1, &groups.blit, &[]);
-                    let gx = (params.map_size.x + 7) / 8;
-                    let gy = (params.map_size.y + 7) / 8;
-                    pass.dispatch_workgroups(gx, gy, 1);
-                }
-                // Pass 4: blur AO horizontally
-                if let Some(p_blur_h) = cache.get_compute_pipeline(pipes.pipeline_blur_h) {
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    pass.set_pipeline(p_blur_h);
-                    pass.set_bind_group(0, &groups.erosion, &[]);
-                    pass.set_bind_group(1, &groups.blit_blur, &[]);
-                    let gx = (params.map_size.x + 7) / 8;
-                    let gy = (params.map_size.y + 7) / 8;
-                    pass.dispatch_workgroups(gx, gy, 1);
-                }
-                // Pass 5: blur AO vertically
-                if let Some(p_blur_v) = cache.get_compute_pipeline(pipes.pipeline_blur_v) {
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    pass.set_pipeline(p_blur_v);
-                    pass.set_bind_group(0, &groups.erosion, &[]);
-                    pass.set_bind_group(1, &groups.blit_blur, &[]);
-                    let gx = (params.map_size.x + 7) / 8;
-                    let gy = (params.map_size.y + 7) / 8;
-                    pass.dispatch_workgroups(gx, gy, 1);
-                }
+            // Pass 1b: write_back (uplift, sediment compaction)
+            if let Some(p_wb) = cache.get_compute_pipeline(pipes.pipeline_write_back) {
+                let mut pass = render_context
+                    .command_encoder()
+                    .begin_compute_pass(&ComputePassDescriptor::default());
+                pass.set_pipeline(p_wb);
+                pass.set_bind_group(0, &groups.erosion, &[]);
+                let gx = (params.map_size.x + 7) / 8;
+                let gy = (params.map_size.y + 7) / 8;
+                pass.dispatch_workgroups(gx, gy, 1);
+            }
+            // Pass 2: blit (samples)
+            {
+                let mut pass = render_context
+                    .command_encoder()
+                    .begin_compute_pass(&ComputePassDescriptor::default());
+                let p_blit = cache.get_compute_pipeline(pipes.pipeline_blit).unwrap();
+                pass.set_pipeline(p_blit);
+                pass.set_bind_group(0, &groups.erosion, &[]);
+                pass.set_bind_group(1, &groups.blit, &[]);
+                let gx = (params.map_size.x + 7) / 8;
+                let gy = (params.map_size.y + 7) / 8;
+                pass.dispatch_workgroups(gx, gy, 1);
+            }
+            // Pass 3: compute AO
+            if let Some(p_ao) = cache.get_compute_pipeline(pipes.pipeline_ao) {
+                let mut pass = render_context
+                    .command_encoder()
+                    .begin_compute_pass(&ComputePassDescriptor::default());
+                pass.set_pipeline(p_ao);
+                pass.set_bind_group(0, &groups.erosion, &[]);
+                pass.set_bind_group(1, &groups.blit, &[]);
+                let gx = (params.map_size.x + 7) / 8;
+                let gy = (params.map_size.y + 7) / 8;
+                pass.dispatch_workgroups(gx, gy, 1);
+            }
+            // Pass 4: blur AO horizontally
+            if let Some(p_blur_h) = cache.get_compute_pipeline(pipes.pipeline_blur_h) {
+                let mut pass = render_context
+                    .command_encoder()
+                    .begin_compute_pass(&ComputePassDescriptor::default());
+                pass.set_pipeline(p_blur_h);
+                pass.set_bind_group(0, &groups.erosion, &[]);
+                pass.set_bind_group(1, &groups.blit_blur, &[]);
+                let gx = (params.map_size.x + 7) / 8;
+                let gy = (params.map_size.y + 7) / 8;
+                pass.dispatch_workgroups(gx, gy, 1);
+            }
+            // Pass 5: blur AO vertically
+            if let Some(p_blur_v) = cache.get_compute_pipeline(pipes.pipeline_blur_v) {
+                let mut pass = render_context
+                    .command_encoder()
+                    .begin_compute_pass(&ComputePassDescriptor::default());
+                pass.set_pipeline(p_blur_v);
+                pass.set_bind_group(0, &groups.erosion, &[]);
+                pass.set_bind_group(1, &groups.blit_blur, &[]);
+                let gx = (params.map_size.x + 7) / 8;
+                let gy = (params.map_size.y + 7) / 8;
+                pass.dispatch_workgroups(gx, gy, 1);
             }
         }
-
-        // Keep buffers alive (not strictly necessary, but avoids drop before usage on some backends)
-        let _keep = (&buffers.uniform, &buffers.random);
-
-        Ok(())
     }
+
+    // Keep buffers alive (not strictly necessary, but avoids drop before usage on some backends)
+    let _keep = (&buffers.uniform, &buffers.random);
 }
 
