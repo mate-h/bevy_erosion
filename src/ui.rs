@@ -2,20 +2,21 @@
 
 use bevy::{
     feathers::{
+        FeathersPlugins,
         constants::fonts,
-        controls::{button, checkbox, slider, ButtonProps, ButtonVariant, SliderProps},
+        controls::{ButtonVariant, FeathersButton, FeathersCheckbox, FeathersSlider},
         dark_theme::create_dark_theme,
         font_styles::InheritableFont,
-        handle_or_path::HandleOrPath,
         theme::{ThemeBackgroundColor, ThemedText, UiTheme},
-        tokens, FeathersPlugins,
+        tokens,
     },
     input_focus::tab_navigation::TabGroup,
     prelude::*,
+    text::FontWeight,
     ui::Checked,
     ui_widgets::{
-        checkbox_self_update, observe, slider_self_update, Activate, Button, Checkbox,
-        SliderPrecision, SliderStep, ValueChange,
+        Activate, Button, Checkbox, SliderPrecision, SliderStep, ValueChange, checkbox_self_update,
+        slider_self_update,
     },
 };
 
@@ -23,11 +24,11 @@ use crate::camera::OrbitInputBlocked;
 use crate::{ErodeParams, ResetSim, SimControl};
 
 /// Marker for the erosion params panel root.
-#[derive(Component)]
+#[derive(Component, Clone, Default)]
 pub struct ErosionParamsPanel;
 
 /// Marks erosion param sliders for styling (height, font).
-#[derive(Component)]
+#[derive(Component, Clone, Default)]
 struct ErosionSliderField;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -79,6 +80,10 @@ impl ErosionSliderFieldKind {
             Self::NoiseScale => params.noise_scale = value,
         }
     }
+
+    fn resets_sim(&self) -> bool {
+        matches!(self, Self::NoiseFrequency | Self::NoiseScale)
+    }
 }
 
 /// Plugin that adds the erosion parameters UI panel using Bevy Feathers.
@@ -98,112 +103,52 @@ impl Plugin for ErosionParamsPlugin {
             .add_systems(Startup, spawn_erosion_params_panel)
             .add_systems(
                 PostStartup,
-                (shrink_slider_heights, shrink_slider_value_font, shrink_button_checkbox_font),
+                (
+                    shrink_slider_heights,
+                    shrink_slider_value_font,
+                    shrink_button_checkbox_font,
+                ),
             );
     }
 }
 
 fn spawn_erosion_params_panel(mut commands: Commands) {
     let params = ErodeParams::default();
+    commands.spawn_scene(erosion_params_panel(params));
+}
 
-    commands.spawn((
+fn erosion_params_panel(params: ErodeParams) -> impl Scene {
+    bsn! {
         Node {
             position_type: PositionType::Absolute,
-            top: Val::Px(10.0),
-            left: Val::Px(10.0),
-            width: Val::Px(260.0),
-            padding: UiRect::all(Val::Px(PADDING)),
-            row_gap: Val::Px(ROW_GAP),
-            column_gap: Val::Px(ROW_GAP),
+            top: px(10.0),
+            left: px(10.0),
+            width: px(260.0),
+            padding: UiRect::all(px(PADDING)),
+            row_gap: px(ROW_GAP),
+            column_gap: px(ROW_GAP),
             display: Display::Flex,
             flex_direction: FlexDirection::Column,
             align_items: AlignItems::Stretch,
             justify_content: JustifyContent::Start,
-            ..default()
-        },
-        TabGroup::default(),
-        ThemeBackgroundColor(tokens::WINDOW_BG),
-        ErosionParamsPanel,
+        }
+        TabGroup
+        ThemeBackgroundColor(tokens::WINDOW_BG)
+        ErosionParamsPanel
+        ThemedText
         InheritableFont {
-            font: HandleOrPath::Path(fonts::REGULAR.to_string()),
-            font_size: FONT_SIZE.into(),
-        },
-        observe(|_: On<Pointer<Over>>, mut blocked: ResMut<OrbitInputBlocked>| {
+            font: fonts::REGULAR,
+            font_size: FontSize::Px(FONT_SIZE),
+            weight: FontWeight::NORMAL,
+        }
+        on(|_: On<Pointer<Over>>, mut blocked: ResMut<OrbitInputBlocked>| {
             blocked.0 = true;
-        }),
-        observe(|_: On<Pointer<Out>>, mut blocked: ResMut<OrbitInputBlocked>| {
+        })
+        on(|_: On<Pointer<Out>>, mut blocked: ResMut<OrbitInputBlocked>| {
             blocked.0 = false;
-        }),
-        children![
-            // Header + sim controls
-            (
-                Node {
-                    display: Display::Flex,
-                    flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(ROW_GAP),
-                    ..default()
-                },
-                ThemedText,
-                InheritableFont {
-                    font: HandleOrPath::Path(fonts::REGULAR.to_string()),
-                    font_size: FONT_SIZE.into(),
-                },
-                children![
-                    (Text::new("Erosion Parameters"), ThemedText),
-                    (
-                        Node {
-                            display: Display::Flex,
-                            flex_direction: FlexDirection::Row,
-                            column_gap: Val::Px(ROW_GAP),
-                            align_items: AlignItems::Center,
-                            ..default()
-                        },
-                        ThemedText,
-                        InheritableFont {
-                            font: HandleOrPath::Path(fonts::REGULAR.to_string()),
-                            font_size: FONT_SIZE.into(),
-                        },
-                        children![
-                            (
-                                button(
-                                    ButtonProps {
-                                        variant: ButtonVariant::Primary,
-                                        ..default()
-                                    },
-                                    (),
-                                    Spawn((Text::new("Reset"), ThemedText)),
-                                ),
-                                observe(|_: On<Activate>, mut reset: ResMut<ResetSim>| {
-                                    reset.generation = reset.generation.wrapping_add(1);
-                                }),
-                            ),
-                            (
-                                checkbox((), Spawn((Text::new("Pause"), ThemedText))),
-                                observe(checkbox_self_update),
-                                observe(
-                                    |change: On<ValueChange<bool>>, mut sim: ResMut<SimControl>| {
-                                        sim.paused = change.value;
-                                    },
-                                ),
-                            ),
-                            (
-                                button(
-                                    ButtonProps::default(),
-                                    (),
-                                    Spawn((Text::new("Step"), ThemedText)),
-                                ),
-                                observe(
-                                    |_: On<Activate>, mut sim: ResMut<SimControl>| {
-                                        if sim.paused {
-                                            sim.step_counter = sim.step_counter.wrapping_add(1);
-                                        }
-                                    },
-                                ),
-                            ),
-                        ],
-                    ),
-                ],
-            ),
+        })
+        Children [
+            header_controls(),
             section_label("Noise"),
             slider_row("Noise Freq", 0.001, 0.05, params.noise_frequency, ErosionSliderFieldKind::NoiseFrequency),
             slider_row("Noise Scale", 0.5, 5.0, params.noise_scale, ErosionSliderFieldKind::NoiseScale),
@@ -215,128 +160,104 @@ fn spawn_erosion_params_panel(mut commands: Commands) {
             section_label("Angles (°)"),
             slider_row("Wear Angle", 0.0, 90.0, params.wear_angle, ErosionSliderFieldKind::WearAngle),
             slider_row("Talus Angle", 0.0, 90.0, params.talus_angle, ErosionSliderFieldKind::TalusAngle),
-            slider_row(
-                "Max Deposit Angle",
-                0.0,
-                90.0,
-                params.max_deposit_angle,
-                ErosionSliderFieldKind::MaxDepositAngle,
-            ),
+            slider_row("Max Deposit Angle", 0.0, 90.0, params.max_deposit_angle, ErosionSliderFieldKind::MaxDepositAngle),
             section_label("Ridge Erosion"),
             (
-                checkbox(
-                    Checked, // default: ridge erosion on (compute_ridge_erosion=1)
-                    Spawn((Text::new("Enable Ridge"), ThemedText)),
-                ),
-                observe(checkbox_self_update),
-                observe(
-                    |change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>| {
-                        params.compute_ridge_erosion = if change.value { 1 } else { 0 };
-                    },
-                ),
+                @FeathersCheckbox {
+                    @caption: bsn! { (Text("Enable Ridge") ThemedText) },
+                }
+                Checked
+                on(checkbox_self_update)
+                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>| {
+                    params.compute_ridge_erosion = if change.value { 1 } else { 0 };
+                })
             ),
-            slider_row(
-                "Ridge Steps",
-                1.0,
-                100.0,
-                params.ridge_erosion_steps as f32,
-                ErosionSliderFieldKind::RidgeErosionSteps,
-            ),
-            slider_row(
-                "Ridge Amount",
-                0.0,
-                2.0,
-                params.ridge_erosion_amount,
-                ErosionSliderFieldKind::RidgeErosionAmount,
-            ),
-            slider_row(
-                "Ridge Softening",
-                0.0,
-                5.0,
-                params.ridge_softening_amount,
-                ErosionSliderFieldKind::RidgeSofteningAmount,
-            ),
+            slider_row("Ridge Steps", 1.0, 100.0, params.ridge_erosion_steps as f32, ErosionSliderFieldKind::RidgeErosionSteps),
+            slider_row("Ridge Amount", 0.0, 2.0, params.ridge_erosion_amount, ErosionSliderFieldKind::RidgeErosionAmount),
+            slider_row("Ridge Softening", 0.0, 5.0, params.ridge_softening_amount, ErosionSliderFieldKind::RidgeSofteningAmount),
             section_label("Flow"),
             slider_row("Flow Length", 16.0, 512.0, params.flow_length, ErosionSliderFieldKind::FlowLength),
             slider_row("Friction", 0.0, 1.0, params.friction, ErosionSliderFieldKind::Friction),
             slider_row("Rock Friction", 0.0, 1.0, params.rock_friction, ErosionSliderFieldKind::RockFriction),
             section_label("Sediment"),
-            slider_row(
-                "Compaction",
-                0.0,
-                1.0,
-                params.sediment_compaction,
-                ErosionSliderFieldKind::SedimentCompaction,
-            ),
-            slider_row(
-                "Compaction Threshold",
-                0.0,
-                1.0,
-                params.compaction_threshold,
-                ErosionSliderFieldKind::CompactionThreshold,
-            ),
+            slider_row("Compaction", 0.0, 1.0, params.sediment_compaction, ErosionSliderFieldKind::SedimentCompaction),
+            slider_row("Compaction Threshold", 0.0, 1.0, params.compaction_threshold, ErosionSliderFieldKind::CompactionThreshold),
             section_label("Effects"),
             slider_row("Channeling", 0.0, 1.0, params.channeling, ErosionSliderFieldKind::Channeling),
-            slider_row(
-                "Sediment Removal",
-                0.0,
-                1.0,
-                params.sediment_removal,
-                ErosionSliderFieldKind::SedimentRemoval,
-            ),
+            slider_row("Sediment Removal", 0.0, 1.0, params.sediment_removal, ErosionSliderFieldKind::SedimentRemoval),
             slider_row("Uplift", 0.0, 0.01, params.uplift, ErosionSliderFieldKind::Uplift),
-        ],
-    ));
-}
-
-fn shrink_slider_heights(
-    mut q: Query<&mut Node, With<ErosionSliderField>>,
-) {
-    for mut node in &mut q {
-        node.height = Val::Px(SLIDER_HEIGHT);
+        ]
     }
 }
 
-fn shrink_slider_value_font(
-    q: Query<(Entity, &Children), With<ErosionSliderField>>,
-    mut commands: Commands,
-) {
-    for (_slider, children) in &q {
-        if let Some(&text_container) = children.first() {
-            commands.entity(text_container).insert(InheritableFont {
-                font: HandleOrPath::Path(fonts::MONO.to_string()),
-                font_size: SLIDER_VALUE_FONT_SIZE.into(),
-            });
-        }
-    }
-}
-
-fn shrink_button_checkbox_font(
-    mut q: Query<
-        (Entity, &mut Node),
-        Or<(With<Button>, With<Checkbox>)>,
-    >,
-    mut commands: Commands,
-) {
-    let small_font = InheritableFont {
-        font: HandleOrPath::Path(fonts::REGULAR.to_string()),
-        font_size: FONT_SIZE.into(),
-    };
-    for (entity, mut node) in &mut q {
-        node.height = Val::Px(BUTTON_HEIGHT);
-        commands.entity(entity).insert(small_font.clone());
-    }
-}
-
-fn section_label(text: &str) -> impl Bundle {
-    (
-        Text::new(text),
-        ThemedText,
+fn header_controls() -> impl Scene {
+    bsn! {
         Node {
-            margin: UiRect::top(Val::Px(4.0)),
-            ..default()
-        },
-    )
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            row_gap: px(ROW_GAP),
+        }
+        ThemedText
+        Children [
+            (Text("Erosion Parameters") ThemedText),
+            (
+                Node {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Row,
+                    column_gap: px(ROW_GAP),
+                    align_items: AlignItems::Center,
+                }
+                ThemedText
+                Children [
+                    (
+                        @FeathersButton {
+                            @caption: bsn! { (Text("Reset") ThemedText) },
+                            @variant: ButtonVariant::Primary,
+                        }
+                        on(|_: On<Activate>, mut reset: ResMut<ResetSim>| {
+                            reset.generation = reset.generation.wrapping_add(1);
+                        })
+                    ),
+                    (
+                        @FeathersCheckbox {
+                            @caption: bsn! { (Text("Pause") ThemedText) },
+                        }
+                        on(checkbox_self_update)
+                        on(|change: On<ValueChange<bool>>, mut sim: ResMut<SimControl>| {
+                            sim.paused = change.value;
+                        })
+                    ),
+                    (
+                        @FeathersButton {
+                            @caption: bsn! { (Text("Step") ThemedText) },
+                        }
+                        on(|_: On<Activate>, mut sim: ResMut<SimControl>| {
+                            if sim.paused {
+                                sim.step_counter = sim.step_counter.wrapping_add(1);
+                            }
+                        })
+                    ),
+                ]
+            ),
+        ]
+    }
+}
+
+fn section_label(text: &str) -> impl Scene {
+    let text = Text::new(text.to_string());
+    bsn! {
+        (
+            Node {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                margin: UiRect::top(px(4.0)),
+                width: percent(100),
+            }
+            ThemedText
+            template_value(text)
+        )
+    }
 }
 
 fn slider_row(
@@ -345,53 +266,89 @@ fn slider_row(
     max: f32,
     value: f32,
     field: ErosionSliderFieldKind,
-) -> impl Bundle {
-    (
+) -> impl Scene {
+    let label = label.to_string();
+    bsn! {
         Node {
             display: Display::Flex,
             flex_direction: FlexDirection::Row,
             align_items: AlignItems::Center,
-            column_gap: Val::Px(4.0),
-            min_height: Val::Px(SLIDER_HEIGHT),
-            ..default()
-        },
-        ThemedText,
-        InheritableFont {
-            font: HandleOrPath::Path(fonts::REGULAR.to_string()),
-            font_size: FONT_SIZE.into(),
-        },
-        children![
+            column_gap: px(4.0),
+            min_height: px(SLIDER_HEIGHT),
+        }
+        ThemedText
+        Children [
             (
                 Node {
-                    min_width: Val::Px(110.0),
-                    ..default()
-                },
-                (Text::new(label), ThemedText),
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    min_width: px(110.0),
+                }
+                ThemedText
+                template_value(Text::new(label))
             ),
             (
                 Node {
                     flex_grow: 1.0,
-                    min_width: Val::Px(60.0),
-                    ..default()
-                },
-                children![(
-                    slider(
-                        SliderProps { value, min, max, ..default() },
-                        (
-                            SliderStep(0.01),
-                            SliderPrecision(3),
-                            ErosionSliderField,
-                        ),
-                    ),
-                    observe(slider_self_update),
-                    observe(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
+                    min_width: px(60.0),
+                }
+                Children [(
+                    @FeathersSlider {
+                        @value: value,
+                        @min: min,
+                        @max: max,
+                    }
+                    SliderStep(0.01)
+                    SliderPrecision(3)
+                    ErosionSliderField
+                    on(slider_self_update)
+                    on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
                         field.apply(&mut params, change.value);
-                        if matches!(field, ErosionSliderFieldKind::NoiseFrequency | ErosionSliderFieldKind::NoiseScale) {
+                        if field.resets_sim() {
                             reset.generation = reset.generation.wrapping_add(1);
                         }
-                    }),
-                )],
+                    })
+                )]
             ),
-        ],
-    )
+        ]
+    }
+}
+
+fn shrink_slider_heights(mut q: Query<&mut Node, With<ErosionSliderField>>) {
+    for mut node in &mut q {
+        node.height = Val::Px(SLIDER_HEIGHT);
+    }
+}
+
+fn shrink_slider_value_font(
+    q: Query<(Entity, &Children), With<ErosionSliderField>>,
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+) {
+    for (_slider, children) in &q {
+        if let Some(&text_container) = children.first() {
+            commands.entity(text_container).insert(InheritableFont {
+                font: asset_server.load(fonts::MONO),
+                font_size: FontSize::Px(SLIDER_VALUE_FONT_SIZE),
+                weight: FontWeight::NORMAL,
+            });
+        }
+    }
+}
+
+fn shrink_button_checkbox_font(
+    mut q: Query<(Entity, &mut Node), Or<(With<Button>, With<Checkbox>)>>,
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+) {
+    let small_font = InheritableFont {
+        font: asset_server.load(fonts::REGULAR),
+        font_size: FontSize::Px(FONT_SIZE),
+        weight: FontWeight::NORMAL,
+    };
+    for (entity, mut node) in &mut q {
+        node.height = Val::Px(BUTTON_HEIGHT);
+        commands.entity(entity).insert(small_font.clone());
+    }
 }
