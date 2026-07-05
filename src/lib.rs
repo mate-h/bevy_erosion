@@ -9,9 +9,7 @@ use bevy::{
         render_asset::RenderAssets,
         render_resource::{
             TextureFormat, TextureUsages,
-            binding_types::{
-                storage_buffer, storage_buffer_read_only, texture_storage_2d, uniform_buffer,
-            },
+            binding_types::{storage_buffer, texture_storage_2d, uniform_buffer},
             *,
         },
         renderer::{RenderContext, RenderDevice, RenderGraph, RenderQueue},
@@ -28,6 +26,8 @@ pub mod sun;
 pub mod ui;
 
 const EROSION_SHADER: &str = "erosion.wgsl";
+/// Erode dispatches per `writeBack` at geological age 0 (all modes).
+const ERODE_ITERS_PER_WRITEBACK: u32 = 200;
 const TERRAIN_SHADER: &str = "terrain_extended.wgsl";
 
 /// Resource containing handles to all erosion-related images
@@ -145,15 +145,18 @@ impl MaterialExtension for TerrainExtension {
     }
 }
 
-/// Erosion parameters
+/// Erosion parameters — fields store reference UI parm values from `ref/node_tree.json`.
 #[derive(Resource, Clone, ExtractResource, ShaderType)]
 #[repr(C)]
 pub struct ErodeParams {
     pub map_size: UVec2,
     pub num_particles: u32,
     pub iteration: u32,
+    /// Batch size passed to writeBack (reference parm `NumIterations`).
     pub num_iterations: u32,
+    /// Reference parm `Reference_Detail_Scale` → kernel `Detail_Scale`.
     pub detail_scale: f32,
+    /// Reference parm `Do_Ridge_Erosion`.
     pub compute_ridge_erosion: u32,
     pub erosion_strength: f32,
     pub rock_softness: f32,
@@ -167,34 +170,50 @@ pub struct ErodeParams {
     pub talus_angle: f32,
     pub max_deposit_angle: f32,
     pub flow_length: f32,
+    /// Reference parm `Ridge_Erosion_Steps` → kernel `Ridge_Erosion_Samples`.
     pub ridge_erosion_steps: u32,
     pub ridge_softening_amount: f32,
-    pub trail_density: f32,
+    /// Reference parm `Erosion_Amount` → kernel `Trail_Density` via `× 0.1`.
+    pub erosion_amount: f32,
     pub ridge_erosion_amount: f32,
+    /// Reference parm `Friction` (sediment) → kernel `Friction`.
     pub friction: f32,
     pub rock_friction: f32,
     pub flow_volume: f32,
     pub velocity_randomness: f32,
     pub velocity_randomness_refinement: f32,
+    /// Reference parm `Suspended_Sediment` → kernel `Suspended_Load`.
     pub suspended_load: f32,
-    pub river_scarring: f32,
-    pub river_scarring_character: f32,
+    /// Reference parm `River_Scale` → kernel `River_Scarring` via `× 0.25`.
+    pub river_scale: f32,
+    pub river_character: f32,
     pub river_friction_reduction: f32,
     pub river_volume: f32,
+    pub do_rivers: u32,
+    pub river_channeling: f32,
+    pub momentum_coherence: f32,
+    pub meander_longevity: f32,
+    pub uplift_river_carving: f32,
+    /// Reference parm `Uplift_Amount`.
     pub uplift: f32,
+    /// Bevy-only: initial height FBM (not an erosion simulation parm).
     pub noise_frequency: f32,
     pub noise_scale: f32,
 }
 
 impl Default for ErodeParams {
     fn default() -> Self {
+        // --- Root node UI defaults (`ref/node_tree.json`) ---
+        // Shader applies binding scales where Houdini expressions do (must match `erosion.wgsl`):
+        //   Trail_Density = Erosion_Amount * 0.1
+        //   River_Scarring = River_Scale * 0.25
         Self {
             map_size: UVec2::new(512, 512),
             num_particles: 256 * 256,
             iteration: 0,
-            num_iterations: 2,
-            detail_scale: 1.0,
-            compute_ridge_erosion: 1,
+            num_iterations: ERODE_ITERS_PER_WRITEBACK,
+            detail_scale: 1.0,        // Reference_Detail_Scale
+            compute_ridge_erosion: 1, // Do_Ridge_Erosion
             erosion_strength: 0.5,
             rock_softness: 0.5,
             sediment_compaction: 0.0,
@@ -207,23 +226,28 @@ impl Default for ErodeParams {
             talus_angle: 0.0,
             max_deposit_angle: 45.0,
             flow_length: 256.0,
-            ridge_erosion_steps: 25,
+            ridge_erosion_steps: 25, // Ridge_Erosion_Steps
             ridge_softening_amount: 0.0,
-            trail_density: 0.1,
+            erosion_amount: 0.1, // Erosion_Amount
             ridge_erosion_amount: 1.0,
-            friction: 1.0,
+            friction: 1.0, // UI "Friction" → kernel Sediment Friction
             rock_friction: 1.0,
             flow_volume: 0.0,
             velocity_randomness: 0.0,
             velocity_randomness_refinement: 0.0,
-            suspended_load: 0.0,
-            river_scarring: 0.0,
-            river_scarring_character: 1.0,
+            suspended_load: 0.0, // Suspended_Sediment
+            river_scale: 0.25,   // River_Scale
+            river_character: 1.0,
             river_friction_reduction: 1.0,
-            river_volume: 0.0,
-            uplift: 0.0,
-            noise_frequency: 0.008,
-            noise_scale: 1.0,
+            river_volume: 0.5,
+            do_rivers: 0,
+            river_channeling: 0.5,
+            momentum_coherence: 0.0,
+            meander_longevity: 0.9,
+            uplift_river_carving: 1.0,
+            uplift: 0.0, // Uplift_Amount
+            noise_frequency: 0.005,
+            noise_scale: 1.5,
         }
     }
 }
@@ -246,18 +270,18 @@ pub struct SimControl {
 pub struct ErosionConfig {
     /// Map width and height (e.g. 512×512).
     pub map_size: UVec2,
-    /// Erosion amount / trail density (0–1). Higher = more particles, slower.
-    pub trail_density: f32,
-    /// Feature scale for terrain detail.
-    pub feature_size: f32,
+    /// Reference parm `Erosion_Amount`.
+    pub erosion_amount: f32,
+    /// Reference parm `Reference_Detail_Scale` → kernel `Detail_Scale`.
+    pub reference_detail_scale: f32,
 }
 
 impl Default for ErosionConfig {
     fn default() -> Self {
         Self {
             map_size: UVec2::new(512, 512),
-            trail_density: 0.1,
-            feature_size: 8.0,
+            erosion_amount: 0.1,         // Erosion_Amount
+            reference_detail_scale: 1.0, // Reference_Detail_Scale
         }
     }
 }
@@ -270,9 +294,9 @@ impl ErosionConfig {
             map_size: self.map_size,
             num_particles,
             iteration,
-            num_iterations: 2,
-            detail_scale: self.feature_size / 8.0,
-            trail_density: self.trail_density,
+            num_iterations: ERODE_ITERS_PER_WRITEBACK,
+            detail_scale: self.reference_detail_scale,
+            erosion_amount: self.erosion_amount,
             ..Default::default()
         }
     }
@@ -349,29 +373,12 @@ struct ErosionBindGroups {
 struct ErosionBuffers {
     uniform: UniformBuffer<ErodeParams>,
     height: StorageBuffer<Vec<u32>>,
-    random: StorageBuffer<Vec<u32>>,
+    macc: StorageBuffer<Vec<u32>>,
     flow: StorageBuffer<Vec<u32>>,
     deposition: StorageBuffer<Vec<i32>>, // loose sediment per cell (atomic<i32> in shader)
     erosion: StorageBuffer<Vec<u32>>,
-}
-
-#[derive(Resource, Clone)]
-struct ErosionRngState {
-    state: u64,
-}
-
-/// Generate random indices using a seeded RNG
-pub fn generate_random_indices_seeded(count: u32, max_index: u32, mut state: u64) -> Vec<u32> {
-    let mut v = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        // xorshift64*
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
-        let r = (state.wrapping_mul(2685821657736338717) >> 32) as u32;
-        v.push(if max_index == 0 { 0 } else { r % max_index });
-    }
-    v
+    mx: StorageBuffer<Vec<i32>>,
+    my: StorageBuffer<Vec<i32>>,
 }
 
 fn init_erosion_pipeline(
@@ -387,10 +394,12 @@ fn init_erosion_pipeline(
             (
                 storage_buffer::<u32>(false), // height (atomic<u32> in shader, fixed-point)
                 uniform_buffer::<ErodeParams>(false),
-                storage_buffer_read_only::<u32>(false), // random_indices
-                storage_buffer::<u32>(false),           // flow (atomic<u32> in shader)
-                storage_buffer::<i32>(false),           // deposition (atomic<i32> in shader)
-                storage_buffer::<u32>(false),           // erosion (atomic<u32> in shader)
+                storage_buffer::<u32>(false), // macc (atomic<u32> in shader)
+                storage_buffer::<u32>(false), // flow (atomic<u32> in shader)
+                storage_buffer::<i32>(false), // deposition (atomic<i32> in shader)
+                storage_buffer::<u32>(false), // erosion (atomic<u32> in shader)
+                storage_buffer::<i32>(false), // mx (atomic<i32> in shader)
+                storage_buffer::<i32>(false), // my (atomic<i32> in shader)
             ),
         ),
     );
@@ -512,7 +521,6 @@ fn prepare_erosion_bind_groups(
     render_device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     mut existing: Option<ResMut<ErosionBuffers>>,
-    rng_state: Option<ResMut<ErosionRngState>>,
 ) {
     let view_height = gpu_images.get(&images.height).unwrap();
     let view_color = gpu_images.get(&images.color).unwrap();
@@ -524,9 +532,13 @@ fn prepare_erosion_bind_groups(
     // Check if we need to verify buffer structure
     let texels = (params.map_size.x * params.map_size.y) as usize;
     let needs_recreation = if let Some(ref buffers) = existing {
-        buffers.flow.buffer().is_none()
+        buffers.macc.buffer().is_none()
+            || buffers.mx.buffer().is_none()
+            || buffers.my.buffer().is_none()
+            || buffers.flow.buffer().is_none()
             || buffers.deposition.buffer().is_none()
             || buffers.erosion.buffer().is_none()
+            || buffers.macc.get().len() != texels
             || buffers.flow.get().len() != texels
             || buffers.deposition.get().len() != texels
             || buffers.erosion.get().len() != texels
@@ -541,42 +553,21 @@ fn prepare_erosion_bind_groups(
 
     match existing {
         Some(mut buffers) => {
-            // Update uniform with current params each frame
-            buffers.uniform = UniformBuffer::from(params.clone());
+            *buffers.uniform.get_mut() = params.clone();
             buffers.uniform.write_buffer(&render_device, &queue);
 
-            // Ensure we have RNG state
-            let mut seed = if let Some(ref rs) = rng_state {
-                rs.state
-            } else {
-                0xCAFEBABE_1234_5678
-            };
-            // Regenerate start positions every frame using evolving RNG state
-            let new_random = generate_random_indices_seeded(
-                params.num_particles,
-                params.map_size.x * params.map_size.y,
-                seed,
-            );
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            if let Some(mut rs) = rng_state {
-                rs.state = seed;
-            } else {
-                commands.insert_resource(ErosionRngState { state: seed });
-            }
-            buffers.random = StorageBuffer::from(new_random);
-            buffers.random.write_buffer(&render_device, &queue);
-
-            // Reuse existing buffers, just rebuild bind groups (safe across frames)
             let erosion = render_device.create_bind_group(
                 None,
                 &pipeline_cache.get_bind_group_layout(&pipeline.layout_erosion),
                 &BindGroupEntries::sequential((
                     &buffers.height,
                     &buffers.uniform,
-                    &buffers.random,
+                    &buffers.macc,
                     &buffers.flow,
                     &buffers.deposition,
                     &buffers.erosion,
+                    &buffers.mx,
+                    &buffers.my,
                 )),
             );
             let blit = render_device.create_bind_group(
@@ -622,28 +613,9 @@ fn prepare_erosion_bind_groups(
             let mut height = StorageBuffer::from(vec![0u32; texels]);
             height.write_buffer(&render_device, &queue);
 
-            // Initialize RNG state
-            let mut seed = if let Some(ref rs) = rng_state {
-                rs.state
-            } else {
-                0xCAFEBABE_1234_5678
-            };
-            let first_random = generate_random_indices_seeded(
-                params.num_particles,
-                params.map_size.x * params.map_size.y,
-                seed,
-            );
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            if let Some(mut rs) = rng_state {
-                rs.state = seed;
-            } else {
-                commands.insert_resource(ErosionRngState { state: seed });
-            }
-            let mut random = StorageBuffer::from(first_random);
-            random.write_buffer(&render_device, &queue);
+            let mut macc = StorageBuffer::from(vec![0u32; texels]);
+            macc.write_buffer(&render_device, &queue);
 
-            // Initialize buffers for atomic operations
-            // All buffers store single scalar per pixel (1 u32 per pixel)
             let mut flow = StorageBuffer::from(vec![0u32; texels]);
             flow.write_buffer(&render_device, &queue);
 
@@ -653,17 +625,24 @@ fn prepare_erosion_bind_groups(
             let mut erosion = StorageBuffer::from(vec![0u32; texels]);
             erosion.write_buffer(&render_device, &queue);
 
-            // Build bind groups using these buffers
+            let mut mx = StorageBuffer::from(vec![0i32; texels]);
+            mx.write_buffer(&render_device, &queue);
+
+            let mut my = StorageBuffer::from(vec![0i32; texels]);
+            my.write_buffer(&render_device, &queue);
+
             let erosion_bg = render_device.create_bind_group(
                 None,
                 &pipeline_cache.get_bind_group_layout(&pipeline.layout_erosion),
                 &BindGroupEntries::sequential((
                     &height,
                     &uniform,
-                    &random,
+                    &macc,
                     &flow,
                     &deposition,
                     &erosion,
+                    &mx,
+                    &my,
                 )),
             );
             let blit = render_device.create_bind_group(
@@ -697,10 +676,12 @@ fn prepare_erosion_bind_groups(
             commands.insert_resource(ErosionBuffers {
                 uniform,
                 height,
-                random,
+                macc,
                 flow,
                 deposition,
                 erosion,
+                mx,
+                my,
             });
             commands.insert_resource(ErosionBindGroups {
                 erosion: erosion_bg,
@@ -718,6 +699,31 @@ struct ErosionState {
     last_reset_gen: u32,
     allow_erode_this_frame: bool,
     last_step_seen: u64,
+    opencl_iteration: u32,
+    erode_since_writeback: u32,
+}
+
+fn writeback_interval(_params: &ErodeParams) -> u32 {
+    // ~200 erosion dispatches per writeBack at geological age 0 regardless of rivers.
+    ERODE_ITERS_PER_WRITEBACK
+}
+
+/// `Detail_Bias = iteration % 2`: 0 = ridge-biased, 1 = flow-biased.
+/// See `ref/KTT_SMOOTH_FLUVIAL_EROSION.md`.
+fn detail_bias(iteration: u32) -> u32 {
+    iteration % 2
+}
+
+/// Whether `Erosion` does work for this iteration (`ref/compute_erosion.cl`).
+///
+/// ```c
+/// if (!Compute_Ridge_Erosion && !Detail_Bias) return;
+/// ```
+///
+/// When ridge erosion is off, even iterations are no-ops; the host may skip
+/// dispatch but must still advance `opencl_iteration` so batch timing matches the reference impl.
+fn erosion_pass_active(params: &ErodeParams, iteration: u32) -> bool {
+    params.compute_ridge_erosion != 0 || detail_bias(iteration) != 0
 }
 
 #[derive(Default)]
@@ -737,6 +743,8 @@ fn update_erosion_state(
 ) {
     if reset.generation != state.last_reset_gen {
         state.last_reset_gen = reset.generation;
+        state.opencl_iteration = 0;
+        state.erode_since_writeback = 0;
         state.phase = ErosionPhase::Loading;
     }
     if sim.paused {
@@ -783,8 +791,10 @@ fn erosion_compute(
     pipes: Res<ErosionPipeline>,
     groups: Res<ErosionBindGroups>,
     params: Res<ErodeParams>,
-    buffers: Res<ErosionBuffers>,
-    state: Res<ErosionState>,
+    mut buffers: ResMut<ErosionBuffers>,
+    mut state: ResMut<ErosionState>,
+    render_device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
 ) {
     match state.phase {
         ErosionPhase::Loading => {}
@@ -869,84 +879,105 @@ fn erosion_compute(
             }
         }
         ErosionPhase::Erode => {
-            // Pass 1: erode (writes storage) — gated by pause/step
             if state.allow_erode_this_frame {
-                if let Some(p_erode) = cache.get_compute_pipeline(pipes.pipeline_erode) {
+                let iter = state.opencl_iteration;
+                if erosion_pass_active(&params, iter) {
+                    if let Some(p_erode) = cache.get_compute_pipeline(pipes.pipeline_erode) {
+                        let workgroups = (params.num_particles + 255) / 256;
+                        *buffers.uniform.get_mut() = ErodeParams {
+                            iteration: iter,
+                            ..params.clone()
+                        };
+                        buffers.uniform.write_buffer(&render_device, &queue);
+
+                        let mut pass = render_context
+                            .command_encoder()
+                            .begin_compute_pass(&ComputePassDescriptor::default());
+                        pass.set_pipeline(p_erode);
+                        pass.set_bind_group(0, &groups.erosion, &[]);
+                        pass.set_bind_group(1, &groups.color, &[]);
+                        pass.dispatch_workgroups(workgroups, 1, 1);
+                    } else {
+                        error!("Erode pipeline not ready!");
+                    }
+                }
+                // Always advance the OpenCL iteration counter (all N slots in a batch are counted,
+                // including ridge slots that early-return when ridge erosion is disabled).
+                state.opencl_iteration += 1;
+                state.erode_since_writeback += 1;
+            }
+
+            let do_writeback = state.erode_since_writeback >= writeback_interval(&params);
+            if do_writeback {
+                state.erode_since_writeback = 0;
+                if let Some(p_wb) = cache.get_compute_pipeline(pipes.pipeline_write_back) {
+                    *buffers.uniform.get_mut() = ErodeParams {
+                        iteration: state.opencl_iteration,
+                        ..params.clone()
+                    };
+                    buffers.uniform.write_buffer(&render_device, &queue);
+
                     let mut pass = render_context
                         .command_encoder()
                         .begin_compute_pass(&ComputePassDescriptor::default());
-                    pass.set_pipeline(p_erode);
+                    pass.set_pipeline(p_wb);
                     pass.set_bind_group(0, &groups.erosion, &[]);
-                    pass.set_bind_group(1, &groups.color, &[]);
-                    let workgroups = (params.num_particles + 1023) / 1024;
-                    pass.dispatch_workgroups(workgroups, 1, 1);
-                } else {
-                    error!("Erode pipeline not ready!");
+                    let gx = (params.map_size.x + 7) / 8;
+                    let gy = (params.map_size.y + 7) / 8;
+                    pass.dispatch_workgroups(gx, gy, 1);
                 }
             }
-            // Pass 1b: write_back (uplift, sediment compaction)
-            if let Some(p_wb) = cache.get_compute_pipeline(pipes.pipeline_write_back) {
-                let mut pass = render_context
-                    .command_encoder()
-                    .begin_compute_pass(&ComputePassDescriptor::default());
-                pass.set_pipeline(p_wb);
-                pass.set_bind_group(0, &groups.erosion, &[]);
-                let gx = (params.map_size.x + 7) / 8;
-                let gy = (params.map_size.y + 7) / 8;
-                pass.dispatch_workgroups(gx, gy, 1);
-            }
-            // Pass 2: blit (samples)
-            {
-                let mut pass = render_context
-                    .command_encoder()
-                    .begin_compute_pass(&ComputePassDescriptor::default());
-                let p_blit = cache.get_compute_pipeline(pipes.pipeline_blit).unwrap();
-                pass.set_pipeline(p_blit);
-                pass.set_bind_group(0, &groups.erosion, &[]);
-                pass.set_bind_group(1, &groups.blit, &[]);
-                let gx = (params.map_size.x + 7) / 8;
-                let gy = (params.map_size.y + 7) / 8;
-                pass.dispatch_workgroups(gx, gy, 1);
-            }
-            // Pass 3: compute AO
-            if let Some(p_ao) = cache.get_compute_pipeline(pipes.pipeline_ao) {
-                let mut pass = render_context
-                    .command_encoder()
-                    .begin_compute_pass(&ComputePassDescriptor::default());
-                pass.set_pipeline(p_ao);
-                pass.set_bind_group(0, &groups.erosion, &[]);
-                pass.set_bind_group(1, &groups.blit, &[]);
-                let gx = (params.map_size.x + 7) / 8;
-                let gy = (params.map_size.y + 7) / 8;
-                pass.dispatch_workgroups(gx, gy, 1);
-            }
-            // Pass 4: blur AO horizontally
-            if let Some(p_blur_h) = cache.get_compute_pipeline(pipes.pipeline_blur_h) {
-                let mut pass = render_context
-                    .command_encoder()
-                    .begin_compute_pass(&ComputePassDescriptor::default());
-                pass.set_pipeline(p_blur_h);
-                pass.set_bind_group(0, &groups.erosion, &[]);
-                pass.set_bind_group(1, &groups.blit_blur, &[]);
-                let gx = (params.map_size.x + 7) / 8;
-                let gy = (params.map_size.y + 7) / 8;
-                pass.dispatch_workgroups(gx, gy, 1);
-            }
-            // Pass 5: blur AO vertically
-            if let Some(p_blur_v) = cache.get_compute_pipeline(pipes.pipeline_blur_v) {
-                let mut pass = render_context
-                    .command_encoder()
-                    .begin_compute_pass(&ComputePassDescriptor::default());
-                pass.set_pipeline(p_blur_v);
-                pass.set_bind_group(0, &groups.erosion, &[]);
-                pass.set_bind_group(1, &groups.blit_blur, &[]);
-                let gx = (params.map_size.x + 7) / 8;
-                let gy = (params.map_size.y + 7) / 8;
-                pass.dispatch_workgroups(gx, gy, 1);
+
+            // Blit height/analysis to display textures every erode frame (not just on writeBack).
+            if state.allow_erode_this_frame {
+                {
+                    let mut pass = render_context
+                        .command_encoder()
+                        .begin_compute_pass(&ComputePassDescriptor::default());
+                    let p_blit = cache.get_compute_pipeline(pipes.pipeline_blit).unwrap();
+                    pass.set_pipeline(p_blit);
+                    pass.set_bind_group(0, &groups.erosion, &[]);
+                    pass.set_bind_group(1, &groups.blit, &[]);
+                    let gx = (params.map_size.x + 7) / 8;
+                    let gy = (params.map_size.y + 7) / 8;
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
+                if let Some(p_ao) = cache.get_compute_pipeline(pipes.pipeline_ao) {
+                    let mut pass = render_context
+                        .command_encoder()
+                        .begin_compute_pass(&ComputePassDescriptor::default());
+                    pass.set_pipeline(p_ao);
+                    pass.set_bind_group(0, &groups.erosion, &[]);
+                    pass.set_bind_group(1, &groups.blit, &[]);
+                    let gx = (params.map_size.x + 7) / 8;
+                    let gy = (params.map_size.y + 7) / 8;
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
+                if let Some(p_blur_h) = cache.get_compute_pipeline(pipes.pipeline_blur_h) {
+                    let mut pass = render_context
+                        .command_encoder()
+                        .begin_compute_pass(&ComputePassDescriptor::default());
+                    pass.set_pipeline(p_blur_h);
+                    pass.set_bind_group(0, &groups.erosion, &[]);
+                    pass.set_bind_group(1, &groups.blit_blur, &[]);
+                    let gx = (params.map_size.x + 7) / 8;
+                    let gy = (params.map_size.y + 7) / 8;
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
+                if let Some(p_blur_v) = cache.get_compute_pipeline(pipes.pipeline_blur_v) {
+                    let mut pass = render_context
+                        .command_encoder()
+                        .begin_compute_pass(&ComputePassDescriptor::default());
+                    pass.set_pipeline(p_blur_v);
+                    pass.set_bind_group(0, &groups.erosion, &[]);
+                    pass.set_bind_group(1, &groups.blit_blur, &[]);
+                    let gx = (params.map_size.x + 7) / 8;
+                    let gy = (params.map_size.y + 7) / 8;
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
             }
         }
     }
 
-    // Keep buffers alive (not strictly necessary, but avoids drop before usage on some backends)
-    let _keep = (&buffers.uniform, &buffers.random);
+    let _keep = (&buffers.uniform, &buffers.macc, &buffers.mx, &buffers.my);
 }

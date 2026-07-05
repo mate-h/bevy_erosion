@@ -27,6 +27,12 @@ use crate::{ErodeParams, ResetSim, SimControl};
 #[derive(Component, Clone, Default)]
 pub struct ErosionParamsPanel;
 
+#[derive(Component, Clone, Default)]
+struct EnableRiversCheckbox;
+
+#[derive(Component, Clone, Default)]
+struct EnableRidgeCheckbox;
+
 /// Marks erosion param sliders for styling (height, font).
 #[derive(Component, Clone, Default)]
 struct ErosionSliderField;
@@ -35,22 +41,36 @@ struct ErosionSliderField;
 enum ErosionSliderFieldKind {
     ErosionStrength,
     RockSoftness,
-    TrailDensity,
-    DetailScale,
+    ErosionAmount,
+    ReferenceDetailScale,
     WearAngle,
     TalusAngle,
     MaxDepositAngle,
     FlowLength,
+    FlowVolume,
     RidgeErosionSteps,
     RidgeSofteningAmount,
     RidgeErosionAmount,
-    Friction,
+    SedimentFriction,
     RockFriction,
     SedimentCompaction,
     CompactionThreshold,
     Channeling,
+    ChannelingCharacter,
     SedimentRemoval,
-    Uplift,
+    RemovalCharacter,
+    SuspendedSediment,
+    VelocityRandomness,
+    VelocityRandomnessRefinement,
+    UpliftAmount,
+    RiverScale,
+    RiverCharacter,
+    RiverVolume,
+    RiverFrictionReduction,
+    RiverChanneling,
+    MeanderLongevity,
+    MomentumCoherence,
+    UpliftRiverCarving,
     NoiseFrequency,
     NoiseScale,
 }
@@ -60,22 +80,36 @@ impl ErosionSliderFieldKind {
         match self {
             Self::ErosionStrength => params.erosion_strength = value,
             Self::RockSoftness => params.rock_softness = value,
-            Self::TrailDensity => params.trail_density = value,
-            Self::DetailScale => params.detail_scale = value,
+            Self::ErosionAmount => params.erosion_amount = value,
+            Self::ReferenceDetailScale => params.detail_scale = value,
             Self::WearAngle => params.wear_angle = value,
             Self::TalusAngle => params.talus_angle = value,
             Self::MaxDepositAngle => params.max_deposit_angle = value,
             Self::FlowLength => params.flow_length = value,
+            Self::FlowVolume => params.flow_volume = value,
             Self::RidgeErosionSteps => params.ridge_erosion_steps = value as u32,
             Self::RidgeSofteningAmount => params.ridge_softening_amount = value,
             Self::RidgeErosionAmount => params.ridge_erosion_amount = value,
-            Self::Friction => params.friction = value,
+            Self::SedimentFriction => params.friction = value,
             Self::RockFriction => params.rock_friction = value,
             Self::SedimentCompaction => params.sediment_compaction = value,
             Self::CompactionThreshold => params.compaction_threshold = value,
             Self::Channeling => params.channeling = value,
+            Self::ChannelingCharacter => params.channeling_character = value,
             Self::SedimentRemoval => params.sediment_removal = value,
-            Self::Uplift => params.uplift = value,
+            Self::RemovalCharacter => params.removal_character = value,
+            Self::SuspendedSediment => params.suspended_load = value,
+            Self::VelocityRandomness => params.velocity_randomness = value,
+            Self::VelocityRandomnessRefinement => params.velocity_randomness_refinement = value,
+            Self::UpliftAmount => params.uplift = value,
+            Self::RiverScale => params.river_scale = value,
+            Self::RiverCharacter => params.river_character = value,
+            Self::RiverVolume => params.river_volume = value,
+            Self::RiverFrictionReduction => params.river_friction_reduction = value,
+            Self::RiverChanneling => params.river_channeling = value,
+            Self::MeanderLongevity => params.meander_longevity = value,
+            Self::MomentumCoherence => params.momentum_coherence = value,
+            Self::UpliftRiverCarving => params.uplift_river_carving = value,
             Self::NoiseFrequency => params.noise_frequency = value,
             Self::NoiseScale => params.noise_scale = value,
         }
@@ -100,21 +134,42 @@ impl Plugin for ErosionParamsPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(FeathersPlugins)
             .insert_resource(UiTheme(create_dark_theme()))
-            .add_systems(Startup, spawn_erosion_params_panel)
             .add_systems(
                 PostStartup,
                 (
-                    shrink_slider_heights,
-                    shrink_slider_value_font,
-                    shrink_button_checkbox_font,
+                    spawn_erosion_params_panel,
+                    (
+                        init_param_checkboxes,
+                        shrink_slider_heights,
+                        shrink_slider_value_font,
+                        shrink_button_checkbox_font,
+                    )
+                        .after(spawn_erosion_params_panel),
                 ),
             );
     }
 }
 
-fn spawn_erosion_params_panel(mut commands: Commands) {
-    let params = ErodeParams::default();
-    commands.spawn_scene(erosion_params_panel(params));
+fn spawn_erosion_params_panel(params: Res<ErodeParams>, mut commands: Commands) {
+    commands.spawn_scene(erosion_params_panel(params.clone()));
+}
+
+fn init_param_checkboxes(
+    mut commands: Commands,
+    params: Res<ErodeParams>,
+    rivers: Query<Entity, With<EnableRiversCheckbox>>,
+    ridge: Query<Entity, With<EnableRidgeCheckbox>>,
+) {
+    if params.do_rivers != 0 {
+        if let Ok(entity) = rivers.single() {
+            commands.entity(entity).insert(Checked);
+        }
+    }
+    if params.compute_ridge_erosion != 0 {
+        if let Ok(entity) = ridge.single() {
+            commands.entity(entity).insert(Checked);
+        }
+    }
 }
 
 fn erosion_params_panel(params: ErodeParams) -> impl Scene {
@@ -155,8 +210,8 @@ fn erosion_params_panel(params: ErodeParams) -> impl Scene {
             section_label("Main"),
             slider_row("Erosion Strength", 0.0, 1.0, params.erosion_strength, ErosionSliderFieldKind::ErosionStrength),
             slider_row("Rock Softness", 0.0, 1.0, params.rock_softness, ErosionSliderFieldKind::RockSoftness),
-            slider_row("Trail Density", 0.01, 0.5, params.trail_density, ErosionSliderFieldKind::TrailDensity),
-            slider_row("Detail Scale", 0.5, 16.0, params.detail_scale, ErosionSliderFieldKind::DetailScale),
+            slider_row("Erosion Amount", 0.0, 1.0, params.erosion_amount, ErosionSliderFieldKind::ErosionAmount),
+            slider_row("Reference Detail Scale", 0.25, 4.0, params.detail_scale, ErosionSliderFieldKind::ReferenceDetailScale),
             section_label("Angles (°)"),
             slider_row("Wear Angle", 0.0, 90.0, params.wear_angle, ErosionSliderFieldKind::WearAngle),
             slider_row("Talus Angle", 0.0, 90.0, params.talus_angle, ErosionSliderFieldKind::TalusAngle),
@@ -164,28 +219,54 @@ fn erosion_params_panel(params: ErodeParams) -> impl Scene {
             section_label("Ridge Erosion"),
             (
                 @FeathersCheckbox {
-                    @caption: bsn! { (Text("Enable Ridge") ThemedText) },
+                    @caption: bsn! { (Text("Do Ridge Erosion") ThemedText) },
                 }
-                Checked
+                EnableRidgeCheckbox
                 on(checkbox_self_update)
                 on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>| {
-                    params.compute_ridge_erosion = if change.value { 1 } else { 0 };
+                    params.compute_ridge_erosion = u32::from(change.value);
                 })
             ),
-            slider_row("Ridge Steps", 1.0, 100.0, params.ridge_erosion_steps as f32, ErosionSliderFieldKind::RidgeErosionSteps),
-            slider_row("Ridge Amount", 0.0, 2.0, params.ridge_erosion_amount, ErosionSliderFieldKind::RidgeErosionAmount),
-            slider_row("Ridge Softening", 0.0, 5.0, params.ridge_softening_amount, ErosionSliderFieldKind::RidgeSofteningAmount),
+            slider_row("Ridge Erosion Steps", 1.0, 100.0, params.ridge_erosion_steps as f32, ErosionSliderFieldKind::RidgeErosionSteps),
+            slider_row("Ridge Erosion Amount", 0.0, 2.0, params.ridge_erosion_amount, ErosionSliderFieldKind::RidgeErosionAmount),
+            slider_row("Ridge Softening Amount", 0.0, 5.0, params.ridge_softening_amount, ErosionSliderFieldKind::RidgeSofteningAmount),
             section_label("Flow"),
             slider_row("Flow Length", 16.0, 512.0, params.flow_length, ErosionSliderFieldKind::FlowLength),
-            slider_row("Friction", 0.0, 1.0, params.friction, ErosionSliderFieldKind::Friction),
+            slider_row("Flow Volume", 0.0, 2.0, params.flow_volume, ErosionSliderFieldKind::FlowVolume),
+            slider_row("Sediment Friction", 0.0, 1.0, params.friction, ErosionSliderFieldKind::SedimentFriction),
             slider_row("Rock Friction", 0.0, 1.0, params.rock_friction, ErosionSliderFieldKind::RockFriction),
+            slider_row("Velocity Randomness", 0.0, 1.0, params.velocity_randomness, ErosionSliderFieldKind::VelocityRandomness),
+            slider_row("Velocity Rand. Refine", 0.0, 1.0, params.velocity_randomness_refinement, ErosionSliderFieldKind::VelocityRandomnessRefinement),
             section_label("Sediment"),
-            slider_row("Compaction", 0.0, 1.0, params.sediment_compaction, ErosionSliderFieldKind::SedimentCompaction),
+            slider_row("Sediment Compaction", 0.0, 1.0, params.sediment_compaction, ErosionSliderFieldKind::SedimentCompaction),
             slider_row("Compaction Threshold", 0.0, 1.0, params.compaction_threshold, ErosionSliderFieldKind::CompactionThreshold),
+            slider_row("Suspended Sediment", 0.0, 1.0, params.suspended_load, ErosionSliderFieldKind::SuspendedSediment),
             section_label("Effects"),
             slider_row("Channeling", 0.0, 1.0, params.channeling, ErosionSliderFieldKind::Channeling),
+            slider_row("Channeling Character", 0.0, 2.0, params.channeling_character, ErosionSliderFieldKind::ChannelingCharacter),
             slider_row("Sediment Removal", 0.0, 1.0, params.sediment_removal, ErosionSliderFieldKind::SedimentRemoval),
-            slider_row("Uplift", 0.0, 0.01, params.uplift, ErosionSliderFieldKind::Uplift),
+            slider_row("Removal Character", 0.0, 2.0, params.removal_character, ErosionSliderFieldKind::RemovalCharacter),
+            slider_row("Uplift Amount", 0.0, 0.01, params.uplift, ErosionSliderFieldKind::UpliftAmount),
+            section_label("Rivers"),
+            (
+                @FeathersCheckbox {
+                    @caption: bsn! { (Text("Do Rivers") ThemedText) },
+                }
+                EnableRiversCheckbox
+                on(checkbox_self_update)
+                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
+                    params.do_rivers = u32::from(change.value);
+                    reset.generation = reset.generation.wrapping_add(1);
+                })
+            ),
+            slider_row("River Scale", 0.0, 1.0, params.river_scale, ErosionSliderFieldKind::RiverScale),
+            slider_row("River Character", 0.0, 2.0, params.river_character, ErosionSliderFieldKind::RiverCharacter),
+            slider_row("River Volume", 0.0, 2.0, params.river_volume, ErosionSliderFieldKind::RiverVolume),
+            slider_row("River Friction Reduction", 0.0, 2.0, params.river_friction_reduction, ErosionSliderFieldKind::RiverFrictionReduction),
+            slider_row("River Channeling", 0.0, 1.0, params.river_channeling, ErosionSliderFieldKind::RiverChanneling),
+            slider_row("Meander Longevity", 0.0, 1.0, params.meander_longevity, ErosionSliderFieldKind::MeanderLongevity),
+            slider_row("Momentum Coherence", 0.0, 10.0, params.momentum_coherence, ErosionSliderFieldKind::MomentumCoherence),
+            slider_row("Uplift River Carving", 0.0, 2.0, params.uplift_river_carving, ErosionSliderFieldKind::UpliftRiverCarving),
         ]
     }
 }
