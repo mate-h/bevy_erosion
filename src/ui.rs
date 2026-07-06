@@ -15,13 +15,15 @@ use bevy::{
     text::FontWeight,
     ui::Checked,
     ui_widgets::{
-        Activate, Button, Checkbox, SliderPrecision, SliderStep, ValueChange, checkbox_self_update,
-        slider_self_update,
+        Activate, Button, Checkbox, SliderPrecision, SliderRange, SliderStep, SliderValue,
+        ValueChange, checkbox_self_update, slider_self_update,
     },
 };
 
 use crate::camera::OrbitInputBlocked;
-use crate::{ErodeParams, ResetSim, SimControl};
+use crate::{
+    ErodeParams, ResetSim, SimControl, active_pyramid_level_size, compute_pyramid_level_count,
+};
 
 /// Marker for the erosion params panel root.
 #[derive(Component, Clone, Default)]
@@ -32,6 +34,15 @@ struct EnableRiversCheckbox;
 
 #[derive(Component, Clone, Default)]
 struct EnableRidgeCheckbox;
+
+#[derive(Component, Clone, Default)]
+struct PyramidLevelCountText;
+
+#[derive(Component, Clone, Default)]
+struct PyramidResolutionText;
+
+#[derive(Component, Clone, Default)]
+struct ActivePyramidLevelSlider;
 
 /// Marks erosion param sliders for styling (height, font).
 #[derive(Component, Clone, Default)]
@@ -73,6 +84,7 @@ enum ErosionSliderFieldKind {
     UpliftRiverCarving,
     NoiseFrequency,
     NoiseScale,
+    ActivePyramidLevel,
 }
 
 impl ErosionSliderFieldKind {
@@ -112,11 +124,15 @@ impl ErosionSliderFieldKind {
             Self::UpliftRiverCarving => params.uplift_river_carving = value,
             Self::NoiseFrequency => params.noise_frequency = value,
             Self::NoiseScale => params.noise_scale = value,
+            Self::ActivePyramidLevel => params.active_pyramid_level = value as u32,
         }
     }
 
     fn resets_sim(&self) -> bool {
-        matches!(self, Self::NoiseFrequency | Self::NoiseScale)
+        matches!(
+            self,
+            Self::NoiseFrequency | Self::NoiseScale | Self::ActivePyramidLevel
+        )
     }
 }
 
@@ -146,7 +162,8 @@ impl Plugin for ErosionParamsPlugin {
                     )
                         .after(spawn_erosion_params_panel),
                 ),
-            );
+            )
+            .add_systems(PostUpdate, update_pyramid_ui_labels);
     }
 }
 
@@ -212,6 +229,15 @@ fn erosion_params_panel(params: ErodeParams) -> impl Scene {
             slider_row("Rock Softness", 0.0, 1.0, params.rock_softness, ErosionSliderFieldKind::RockSoftness),
             slider_row("Erosion Amount", 0.0, 1.0, params.erosion_amount, ErosionSliderFieldKind::ErosionAmount),
             slider_row("Reference Detail Scale", 0.25, 4.0, params.detail_scale, ErosionSliderFieldKind::ReferenceDetailScale),
+            section_label("Pyramid"),
+            pyramid_info_row(params.pyramid_level_count, active_pyramid_level_size(&params)),
+            slider_row_int(
+                "Pyramid Level",
+                0.0,
+                (params.pyramid_level_count.saturating_sub(1)).max(0) as f32,
+                params.active_pyramid_level as f32,
+                ErosionSliderFieldKind::ActivePyramidLevel,
+            ),
             section_label("Angles (°)"),
             slider_row("Wear Angle", 0.0, 90.0, params.wear_angle, ErosionSliderFieldKind::WearAngle),
             slider_row("Talus Angle", 0.0, 90.0, params.talus_angle, ErosionSliderFieldKind::TalusAngle),
@@ -321,6 +347,135 @@ fn header_controls() -> impl Scene {
                 ]
             ),
         ]
+    }
+}
+
+fn pyramid_info_row(level_count: u32, level_size: bevy::prelude::UVec2) -> impl Scene {
+    bsn! {
+        Node {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            row_gap: px(2.0),
+        }
+        ThemedText
+        Children [
+            (
+                Node {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    min_height: px(SLIDER_HEIGHT),
+                }
+                ThemedText
+                Children [(
+                    Text(format!("Pyramid Levels: {level_count}"))
+                    ThemedText
+                    PyramidLevelCountText
+                )]
+            ),
+            (
+                Node {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    min_height: px(SLIDER_HEIGHT),
+                }
+                ThemedText
+                Children [(
+                    Text(format!("Resolution: {}×{}", level_size.x, level_size.y))
+                    ThemedText
+                    PyramidResolutionText
+                )]
+            ),
+        ]
+    }
+}
+
+fn slider_row_int(
+    label: &str,
+    min: f32,
+    max: f32,
+    value: f32,
+    field: ErosionSliderFieldKind,
+) -> impl Scene {
+    let label = label.to_string();
+    bsn! {
+        Node {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            column_gap: px(4.0),
+            min_height: px(SLIDER_HEIGHT),
+        }
+        ThemedText
+        Children [
+            (
+                Node {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    min_width: px(110.0),
+                }
+                ThemedText
+                template_value(Text::new(label))
+            ),
+            (
+                Node {
+                    flex_grow: 1.0,
+                    min_width: px(60.0),
+                }
+                Children [(
+                    @FeathersSlider {
+                        @value: value,
+                        @min: min,
+                        @max: max,
+                    }
+                    SliderStep(1.0)
+                    SliderPrecision(0)
+                    ErosionSliderField
+                    ActivePyramidLevelSlider
+                    on(slider_self_update)
+                    on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
+                        field.apply(&mut params, change.value);
+                        if field.resets_sim() {
+                            reset.generation = reset.generation.wrapping_add(1);
+                        }
+                    })
+                )]
+            ),
+        ]
+    }
+}
+
+fn update_pyramid_ui_labels(
+    params: Res<ErodeParams>,
+    mut commands: Commands,
+    mut count_q: Query<&mut Text, (With<PyramidLevelCountText>, Without<PyramidResolutionText>)>,
+    mut resolution_q: Query<
+        &mut Text,
+        (With<PyramidResolutionText>, Without<PyramidLevelCountText>),
+    >,
+    slider_q: Query<Entity, With<ActivePyramidLevelSlider>>,
+) {
+    if !params.is_changed() {
+        return;
+    }
+    let level_count = compute_pyramid_level_count(params.map_size, params.detail_scale);
+    let level_size = active_pyramid_level_size(&params);
+    let max_level = level_count.saturating_sub(1) as f32;
+    let clamped_level = params.active_pyramid_level.min(level_count.saturating_sub(1)) as f32;
+
+    if let Ok(mut text) = count_q.single_mut() {
+        **text = format!("Pyramid Levels: {level_count}");
+    }
+    if let Ok(mut text) = resolution_q.single_mut() {
+        **text = format!("Resolution: {}×{}", level_size.x, level_size.y);
+    }
+    if let Ok(entity) = slider_q.single() {
+        commands.entity(entity).insert((
+            SliderRange::new(0.0, max_level),
+            SliderValue(clamped_level),
+        ));
     }
 }
 
