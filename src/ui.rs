@@ -34,6 +34,12 @@ struct EnableRiversCheckbox;
 struct EnableRidgeCheckbox;
 
 #[derive(Component, Clone, Default)]
+struct ClampRiverChannelingCheckbox;
+
+#[derive(Component, Clone, Default)]
+struct HydroConditioningCheckbox;
+
+#[derive(Component, Clone, Default)]
 struct PyramidLevelCountText;
 
 #[derive(Component, Clone, Default)]
@@ -52,6 +58,8 @@ enum ErosionSliderFieldKind {
     WearAngle,
     TalusAngle,
     MaxDepositAngle,
+    ErosionCutoffAngle,
+    HydroSearchDistance,
     FlowLength,
     FlowVolume,
     RidgeErosionSteps,
@@ -95,6 +103,8 @@ impl ErosionSliderFieldKind {
             Self::WearAngle => params.wear_angle = value,
             Self::TalusAngle => params.talus_angle = value,
             Self::MaxDepositAngle => params.max_deposit_angle = value,
+            Self::ErosionCutoffAngle => params.erosion_cutoff_angle = value,
+            Self::HydroSearchDistance => params.hydro_conditioning_search_distance = value,
             Self::FlowLength => params.flow_length = value,
             Self::FlowVolume => params.flow_volume = value,
             Self::RidgeErosionSteps => params.ridge_erosion_steps = value as u32,
@@ -186,7 +196,19 @@ fn init_param_checkboxes(
     params: Res<ErodeParams>,
     rivers: Query<Entity, With<EnableRiversCheckbox>>,
     ridge: Query<Entity, With<EnableRidgeCheckbox>>,
+    clamp_channeling: Query<Entity, With<ClampRiverChannelingCheckbox>>,
+    hydro: Query<Entity, With<HydroConditioningCheckbox>>,
 ) {
+    if params.clamp_river_channeling != 0 {
+        if let Ok(entity) = clamp_channeling.single() {
+            commands.entity(entity).insert(Checked);
+        }
+    }
+    if params.use_hydro_conditioning != 0 {
+        if let Ok(entity) = hydro.single() {
+            commands.entity(entity).insert(Checked);
+        }
+    }
     if params.do_rivers != 0 {
         if let Ok(entity) = rivers.single() {
             commands.entity(entity).insert(Checked);
@@ -258,6 +280,7 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
             slider_row("Wear Angle", 0.0, 90.0, params.wear_angle, ErosionSliderFieldKind::WearAngle),
             slider_row("Talus Angle", 0.0, 90.0, params.talus_angle, ErosionSliderFieldKind::TalusAngle),
             slider_row("Max Deposit Angle", 0.0, 90.0, params.max_deposit_angle, ErosionSliderFieldKind::MaxDepositAngle),
+            slider_row("Erosion Cutoff Angle", 0.0, 90.0, params.erosion_cutoff_angle, ErosionSliderFieldKind::ErosionCutoffAngle),
             section_label("Ridge Erosion"),
             (
                 @FeathersCheckbox {
@@ -306,9 +329,31 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
             slider_row("River Volume", 0.0, 2.0, params.river_volume, ErosionSliderFieldKind::RiverVolume),
             slider_row("River Friction Reduction", 0.0, 2.0, params.river_friction_reduction, ErosionSliderFieldKind::RiverFrictionReduction),
             slider_row("River Channeling", 0.0, 1.0, params.river_channeling, ErosionSliderFieldKind::RiverChanneling),
+            (
+                @FeathersCheckbox {
+                    @caption: bsn! { (Text("Clamp River Channeling") ThemedText) },
+                }
+                ClampRiverChannelingCheckbox
+                on(checkbox_self_update)
+                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>| {
+                    params.clamp_river_channeling = u32::from(change.value);
+                })
+            ),
             slider_row("Meander Longevity", 0.0, 1.0, params.meander_longevity, ErosionSliderFieldKind::MeanderLongevity),
             slider_row("Momentum Coherence", 0.0, 10.0, params.momentum_coherence, ErosionSliderFieldKind::MomentumCoherence),
             slider_row("Uplift River Carving", 0.0, 2.0, params.uplift_river_carving, ErosionSliderFieldKind::UpliftRiverCarving),
+            section_label("Hydro Conditioning"),
+            (
+                @FeathersCheckbox {
+                    @caption: bsn! { (Text("Use Hydro Conditioning") ThemedText) },
+                }
+                HydroConditioningCheckbox
+                on(checkbox_self_update)
+                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>| {
+                    params.use_hydro_conditioning = u32::from(change.value);
+                })
+            ),
+            slider_row("Search Distance", 1.0, 64.0, params.hydro_conditioning_search_distance, ErosionSliderFieldKind::HydroSearchDistance),
         ]
     }
 }

@@ -285,6 +285,7 @@ pub fn create_erosion_images(images: &mut Assets<Image>, size: UVec2) -> Erosion
         let mut image = Image::new_target_texture(size.x, size.y, format, None);
         image.asset_usage = RenderAssetUsages::RENDER_WORLD;
         image.texture_descriptor.usage = TextureUsages::COPY_DST
+            | TextureUsages::COPY_SRC
             | TextureUsages::STORAGE_BINDING
             | TextureUsages::TEXTURE_BINDING;
         images.add(image)
@@ -382,7 +383,7 @@ impl MaterialExtension for TerrainExtension {
     }
 }
 
-/// Erosion parameters — fields store reference UI parm values from `ref/node_tree.json`.
+/// Erosion parameters — fields store reference UI parm values from `ref/houdini22/node_tree.json`.
 #[derive(Resource, Clone, ExtractResource, ShaderType)]
 #[repr(C)]
 pub struct ErodeParams {
@@ -446,11 +447,19 @@ pub struct ErodeParams {
     pub voxel_size: f32,
     /// Per-dispatch: `Trail_Density` multiplier for the current level.
     pub trail_weight: f32,
+    /// Reference parm `Erosion_Cutoff_Angle` (degrees); trails stop on steeper drops.
+    pub erosion_cutoff_angle: f32,
+    /// Reference parm `Clamp_River_Channeling`.
+    pub clamp_river_channeling: u32,
+    /// Reference parm `Use_Hydro_Conditioning`.
+    pub use_hydro_conditioning: u32,
+    /// Reference parm `Hydro_Conditioning_Search_Distance` (voxels).
+    pub hydro_conditioning_search_distance: f32,
 }
 
 impl Default for ErodeParams {
     fn default() -> Self {
-        // --- Root node UI defaults (`ref/node_tree.json`) ---
+        // --- Root node UI defaults (`ref/houdini22/node_tree.json`) ---
         // Shader applies binding scales where Houdini expressions do (must match `erosion.wgsl`):
         //   Trail_Density = Erosion_Amount * 0.1
         //   River_Scarring = River_Scale * 0.25
@@ -500,6 +509,10 @@ impl Default for ErodeParams {
             geological_age: 0.0,          // Geological_Age
             voxel_size: 1.0,
             trail_weight: 1.0,
+            erosion_cutoff_angle: 90.0, // Erosion_Cutoff_Angle
+            clamp_river_channeling: 0,  // Clamp_River_Channeling
+            use_hydro_conditioning: 0,  // Use_Hydro_Conditioning
+            hydro_conditioning_search_distance: 16.0,
         }
     }
 }
@@ -679,12 +692,11 @@ fn init_erosion_pipeline(
             (
                 storage_buffer::<u32>(false), // height (atomic<u32> in shader, fixed-point)
                 uniform_buffer::<ErodeParams>(true),
-                storage_buffer::<u32>(false), // macc (atomic<u32> in shader)
                 storage_buffer::<u32>(false), // flow (atomic<u32> in shader)
                 storage_buffer::<i32>(false), // deposition (atomic<i32> in shader)
                 storage_buffer::<u32>(false), // erosion (atomic<u32> in shader)
-                storage_buffer::<i32>(false), // mx (atomic<i32> in shader)
-                storage_buffer::<i32>(false), // my (atomic<i32> in shader)
+                storage_buffer::<f32>(false), // mx (f32 bits in atomic<u32>)
+                storage_buffer::<f32>(false), // my (f32 bits in atomic<u32>)
             ),
         ),
     );
@@ -748,12 +760,10 @@ fn init_erosion_pipeline(
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                storage_buffer_read_only::<u32>(false), // src macc
-                storage_buffer_read_only::<i32>(false), // src mx
-                storage_buffer_read_only::<i32>(false), // src my
-                storage_buffer::<u32>(false),           // dst macc
-                storage_buffer::<i32>(false),           // dst mx
-                storage_buffer::<i32>(false),           // dst my
+                storage_buffer_read_only::<f32>(false), // src mx
+                storage_buffer_read_only::<f32>(false), // src my
+                storage_buffer::<f32>(false),           // dst mx
+                storage_buffer::<f32>(false),           // dst my
                 storage_buffer::<u32>(false),           // dst flow
                 storage_buffer::<u32>(false),           // dst erosion
                 uniform_buffer::<PyramidResampleParams>(false),
@@ -860,27 +870,24 @@ fn init_erosion_pipeline(
 /// One full-capacity set of simulation fields; pyramid levels index it at their own width.
 struct FieldSet {
     height: StorageBuffer<Vec<u32>>,
-    macc: StorageBuffer<Vec<u32>>,
     flow: StorageBuffer<Vec<u32>>,
     deposition: StorageBuffer<Vec<i32>>,
     erosion: StorageBuffer<Vec<u32>>,
-    mx: StorageBuffer<Vec<i32>>,
-    my: StorageBuffer<Vec<i32>>,
+    mx: StorageBuffer<Vec<f32>>,
+    my: StorageBuffer<Vec<f32>>,
 }
 
 impl FieldSet {
     fn new(texels: usize, device: &RenderDevice, queue: &RenderQueue) -> Self {
         let mut set = Self {
             height: StorageBuffer::from(vec![0u32; texels]),
-            macc: StorageBuffer::from(vec![0u32; texels]),
             flow: StorageBuffer::from(vec![0u32; texels]),
             deposition: StorageBuffer::from(vec![0i32; texels]),
             erosion: StorageBuffer::from(vec![0u32; texels]),
-            mx: StorageBuffer::from(vec![0i32; texels]),
-            my: StorageBuffer::from(vec![0i32; texels]),
+            mx: StorageBuffer::from(vec![0f32; texels]),
+            my: StorageBuffer::from(vec![0f32; texels]),
         };
         set.height.write_buffer(device, queue);
-        set.macc.write_buffer(device, queue);
         set.flow.write_buffer(device, queue);
         set.deposition.write_buffer(device, queue);
         set.erosion.write_buffer(device, queue);
@@ -988,7 +995,6 @@ fn prepare_erosion_bind_groups(
             &BindGroupEntries::sequential((
                 &set.height,
                 &buffers.params,
-                &set.macc,
                 &set.flow,
                 &set.deposition,
                 &set.erosion,
@@ -1019,10 +1025,8 @@ fn prepare_erosion_bind_groups(
             None,
             &layout(&pipeline.layout_upscale_rivers),
             &BindGroupEntries::sequential((
-                &src.macc,
                 &src.mx,
                 &src.my,
-                &dst.macc,
                 &dst.mx,
                 &dst.my,
                 &dst.flow,
