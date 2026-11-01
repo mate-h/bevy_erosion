@@ -11,6 +11,7 @@ struct PyramidResampleParams {
     first_level: u32,
     dst_voxel_size: f32,
     detail_smoothing: f32,
+    outflow_accumulate: u32,
 }
 
 @group(0) @binding(0) var<storage, read> src_mx: array<f32>;

@@ -33,6 +33,7 @@ pub mod ui;
 const EROSION_SHADER: &str = "erosion.wgsl";
 const PYRAMID_RESAMPLE_SHADER: &str = "pyramid_resample.wgsl";
 const PYRAMID_RIVERS_SHADER: &str = "pyramid_rivers.wgsl";
+const PYRAMID_MASKS_SHADER: &str = "pyramid_masks.wgsl";
 /// Erode dispatches per `writeBack` at geological age 0 (`Compute_Erosion.iterations`).
 const ERODE_ITERS_PER_WRITEBACK: u32 = 200;
 const TERRAIN_SHADER: &str = "terrain_extended.wgsl";
@@ -125,6 +126,8 @@ pub struct PyramidResampleParams {
     pub dst_voxel_size: f32,
     /// KTT `Source_Terrain_Detail_Smoothing`.
     pub detail_smoothing: f32,
+    /// KTT `Outflow_Integration_Method` (0 = Sharp, 1 = Accumulate).
+    pub outflow_accumulate: u32,
 }
 
 #[derive(Clone, Copy, ShaderType)]
@@ -455,6 +458,18 @@ pub struct ErodeParams {
     pub use_hydro_conditioning: u32,
     /// Reference parm `Hydro_Conditioning_Search_Distance` (voxels).
     pub hydro_conditioning_search_distance: f32,
+    /// Reference parm `Use_Softness_Mask`; scales `Rock_Softness` per cell.
+    pub use_softness_mask: u32,
+    /// Bevy-only: frequency of the procedural softness mask (hard/soft rock patches).
+    pub softness_mask_frequency: f32,
+    /// Reference parm `Use_Outflow_Map`; outflow cells neither erode nor uplift.
+    pub use_outflow: u32,
+    /// Reference parm `Outflow_Integration_Method`: 0 = Sharp, 1 = Accumulate across levels.
+    pub outflow_integration: u32,
+    /// Bevy-only: source terrain below this height becomes outflow (sea). 0 disables.
+    pub outflow_sea_level: f32,
+    /// Bevy-only: map borders within this many base voxels become outflow. 0 disables.
+    pub outflow_border: f32,
 }
 
 impl Default for ErodeParams {
@@ -513,6 +528,12 @@ impl Default for ErodeParams {
             clamp_river_channeling: 0,  // Clamp_River_Channeling
             use_hydro_conditioning: 0,  // Use_Hydro_Conditioning
             hydro_conditioning_search_distance: 16.0,
+            use_softness_mask: 0, // Use_Softness_Mask
+            softness_mask_frequency: 0.01,
+            use_outflow: 0,         // Use_Outflow_Map
+            outflow_integration: 0, // Outflow_Integration_Method (Sharp)
+            outflow_sea_level: 0.6,
+            outflow_border: 0.0,
         }
     }
 }
@@ -650,6 +671,7 @@ struct ErosionPipeline {
     layout_blit_level: BindGroupLayoutDescriptor,
     layout_upscale_height: BindGroupLayoutDescriptor,
     layout_upscale_rivers: BindGroupLayoutDescriptor,
+    layout_upscale_masks: BindGroupLayoutDescriptor,
     pipeline_init: CachedComputePipelineId,
     pipeline_init_color: CachedComputePipelineId,
     pipeline_erode: CachedComputePipelineId,
@@ -658,6 +680,7 @@ struct ErosionPipeline {
     pipeline_blit_level: CachedComputePipelineId,
     pipeline_upscale_height: CachedComputePipelineId,
     pipeline_upscale_rivers: CachedComputePipelineId,
+    pipeline_upscale_masks: CachedComputePipelineId,
     pipeline_ao: CachedComputePipelineId,
     pipeline_blur_h: CachedComputePipelineId,
     pipeline_blur_v: CachedComputePipelineId,
@@ -665,7 +688,7 @@ struct ErosionPipeline {
 
 impl ErosionPipeline {
     /// Pipelines the cascade needs before it can start.
-    fn required(&self) -> [CachedComputePipelineId; 8] {
+    fn required(&self) -> [CachedComputePipelineId; 9] {
         [
             self.pipeline_init,
             self.pipeline_init_color,
@@ -675,6 +698,7 @@ impl ErosionPipeline {
             self.pipeline_blit_level,
             self.pipeline_upscale_height,
             self.pipeline_upscale_rivers,
+            self.pipeline_upscale_masks,
         ]
     }
 }
@@ -697,6 +721,8 @@ fn init_erosion_pipeline(
                 storage_buffer::<u32>(false), // erosion (atomic<u32> in shader)
                 storage_buffer::<f32>(false), // mx (f32 bits in atomic<u32>)
                 storage_buffer::<f32>(false), // my (f32 bits in atomic<u32>)
+                storage_buffer::<f32>(false), // softness mask (written by init on the source set)
+                storage_buffer::<f32>(false), // outflow (written by init on the source set)
             ),
         ),
     );
@@ -749,6 +775,8 @@ fn init_erosion_pipeline(
                 storage_buffer_read_only::<u32>(false), // source terrain height
                 storage_buffer::<u32>(false),           // dst height
                 storage_buffer::<i32>(false),           // dst deposition
+                storage_buffer_read_only::<f32>(false), // dst outflow
+                storage_buffer_read_only::<f32>(false), // dst outflow accumulation
                 uniform_buffer::<PyramidResampleParams>(false),
             ),
         ),
@@ -766,6 +794,23 @@ fn init_erosion_pipeline(
                 storage_buffer::<f32>(false),           // dst my
                 storage_buffer::<u32>(false),           // dst flow
                 storage_buffer::<u32>(false),           // dst erosion
+                uniform_buffer::<PyramidResampleParams>(false),
+            ),
+        ),
+    );
+
+    // Level transition: softness / outflow masks resampled from the source terrain.
+    let layout_upscale_masks = BindGroupLayoutDescriptor::new(
+        "PyramidUpscaleMasks",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                storage_buffer_read_only::<f32>(false), // src outflow accumulation
+                storage_buffer_read_only::<f32>(false), // source softness mask
+                storage_buffer_read_only::<f32>(false), // source outflow
+                storage_buffer::<f32>(false),           // dst softness mask
+                storage_buffer::<f32>(false),           // dst outflow
+                storage_buffer::<f32>(false),           // dst outflow accumulation
                 uniform_buffer::<PyramidResampleParams>(false),
             ),
         ),
@@ -829,6 +874,11 @@ fn init_erosion_pipeline(
         &asset_server.load(PYRAMID_RIVERS_SHADER),
         "pyramid_upscale_rivers",
     );
+    let pipeline_upscale_masks = compute(
+        vec![layout_upscale_masks.clone()],
+        &asset_server.load(PYRAMID_MASKS_SHADER),
+        "pyramid_upscale_masks",
+    );
     let pipeline_ao = compute(
         vec![layout_erosion.clone(), layout_blit.clone()],
         &shader,
@@ -853,6 +903,7 @@ fn init_erosion_pipeline(
         layout_blit_level,
         layout_upscale_height,
         layout_upscale_rivers,
+        layout_upscale_masks,
         pipeline_init,
         pipeline_init_color,
         pipeline_erode,
@@ -861,6 +912,7 @@ fn init_erosion_pipeline(
         pipeline_blit_level,
         pipeline_upscale_height,
         pipeline_upscale_rivers,
+        pipeline_upscale_masks,
         pipeline_ao,
         pipeline_blur_h,
         pipeline_blur_v,
@@ -875,6 +927,12 @@ struct FieldSet {
     erosion: StorageBuffer<Vec<u32>>,
     mx: StorageBuffer<Vec<f32>>,
     my: StorageBuffer<Vec<f32>>,
+    /// KTT `__Softness_Mask` (1 = fully soft when no mask is used).
+    softness: StorageBuffer<Vec<f32>>,
+    /// KTT `__Outflow`.
+    outflow: StorageBuffer<Vec<f32>>,
+    /// KTT `__Outflow_Accumulation` (max outflow over coarser levels).
+    outflow_acc: StorageBuffer<Vec<f32>>,
 }
 
 impl FieldSet {
@@ -886,6 +944,9 @@ impl FieldSet {
             erosion: StorageBuffer::from(vec![0u32; texels]),
             mx: StorageBuffer::from(vec![0f32; texels]),
             my: StorageBuffer::from(vec![0f32; texels]),
+            softness: StorageBuffer::from(vec![1f32; texels]),
+            outflow: StorageBuffer::from(vec![0f32; texels]),
+            outflow_acc: StorageBuffer::from(vec![0f32; texels]),
         };
         set.height.write_buffer(device, queue);
         set.flow.write_buffer(device, queue);
@@ -893,6 +954,9 @@ impl FieldSet {
         set.erosion.write_buffer(device, queue);
         set.mx.write_buffer(device, queue);
         set.my.write_buffer(device, queue);
+        set.softness.write_buffer(device, queue);
+        set.outflow.write_buffer(device, queue);
+        set.outflow_acc.write_buffer(device, queue);
         set
     }
 }
@@ -917,6 +981,7 @@ struct ErosionBindGroups {
     /// Indexed by destination work set (source is the other one).
     upscale_height: [BindGroup; 2],
     upscale_rivers: [BindGroup; 2],
+    upscale_masks: [BindGroup; 2],
     level_blit: BindGroup,
     color: BindGroup,
     blit: BindGroup,
@@ -950,6 +1015,7 @@ fn prepare_erosion_buffers(
             first_level: 1,
             dst_voxel_size: 1.0,
             detail_smoothing: 0.0,
+            outflow_accumulate: 0,
         }),
         blit_display,
     });
@@ -1000,6 +1066,8 @@ fn prepare_erosion_bind_groups(
                 &set.erosion,
                 &set.mx,
                 &set.my,
+                &set.softness,
+                &set.outflow,
             )),
         )
     };
@@ -1015,6 +1083,8 @@ fn prepare_erosion_bind_groups(
                 &source.height,
                 &dst.height,
                 &dst.deposition,
+                &dst.outflow,
+                &dst.outflow_acc,
                 &buffers.resample_params,
             )),
         )
@@ -1036,10 +1106,28 @@ fn prepare_erosion_bind_groups(
         )
     };
 
+    let upscale_masks = |dst: usize| {
+        let (src, dst) = (&buffers.sets[1 - dst], &buffers.sets[dst]);
+        render_device.create_bind_group(
+            None,
+            &layout(&pipeline.layout_upscale_masks),
+            &BindGroupEntries::sequential((
+                &src.outflow_acc,
+                &source.softness,
+                &source.outflow,
+                &dst.softness,
+                &dst.outflow,
+                &dst.outflow_acc,
+                &buffers.resample_params,
+            )),
+        )
+    };
+
     commands.insert_resource(ErosionBindGroups {
         erosion: std::array::from_fn(|i| erosion(&buffers.sets[i])),
         upscale_height: [upscale_height(0), upscale_height(1)],
         upscale_rivers: [upscale_rivers(0), upscale_rivers(1)],
+        upscale_masks: [upscale_masks(0), upscale_masks(1)],
         level_blit: render_device.create_bind_group(
             None,
             &layout(&pipeline.layout_blit_level),
@@ -1193,6 +1281,7 @@ fn plan_erosion_frame(
                     first_level: u32::from(first),
                     dst_voxel_size: dst_level.voxel_size,
                     detail_smoothing: params.source_detail_smoothing,
+                    outflow_accumulate: params.outflow_integration,
                 };
                 debug_assert!(first || src == 1 - dst);
                 info!(
@@ -1305,6 +1394,12 @@ fn erosion_compute(
             }
             FrameCmd::Seed { dst, size } => {
                 let (gx, gy) = dispatch_grid(size);
+                // Masks first: the height pass reads this level's outflow (Smooth_Flows).
+                if let Some(p) = get(pipes.pipeline_upscale_masks) {
+                    pass.set_pipeline(p);
+                    pass.set_bind_group(0, &groups.upscale_masks[dst], &[]);
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
                 if let Some(p) = get(pipes.pipeline_upscale_height) {
                     pass.set_pipeline(p);
                     pass.set_bind_group(0, &groups.upscale_height[dst], &[]);

@@ -64,6 +64,12 @@ struct ErodeParams {
     clamp_river_channeling: u32,
     use_hydro_conditioning: u32,
     hydro_conditioning_search_distance: f32,
+    use_softness_mask: u32,
+    softness_mask_frequency: f32,
+    use_outflow: u32,
+    outflow_integration: u32,
+    outflow_sea_level: f32,
+    outflow_border: f32,
 }
 
 @group(0) @binding(1) var<uniform> params: ErodeParams;
@@ -77,6 +83,11 @@ struct ErodeParams {
 // Stored as f32 bits (KTT `__m` is a float field); adds go through a compare-exchange loop.
 @group(0) @binding(5) var<storage, read_write> mx: array<atomic<u32>>;
 @group(0) @binding(6) var<storage, read_write> my: array<atomic<u32>>;
+// KTT `__Softness_Mask` (scales Rock_Softness) and `__Outflow` (cells that drain away: no erosion,
+// deposition or uplift). Generated on the source set by init_fbm; resampled per pyramid level.
+// Without a mask they hold 1 and 0, which matches KTT compiled without HAS_Softness_Mask / HAS_Outflow.
+@group(0) @binding(7) var<storage, read_write> softness_mask: array<f32>;
+@group(0) @binding(8) var<storage, read_write> outflow: array<f32>;
 
 // Color image as read-write storage texture
 @group(1) @binding(0) var color_image: texture_storage_2d<rgba16float, read_write>;
@@ -123,6 +134,32 @@ fn fbm(p: vec2<f32>) -> f32 {
     return total;
 }
 
+// Bevy-only procedural softness mask: patches of hard (0) and soft (1) rock.
+fn softness_noise(p: vec2<f32>) -> f32 {
+    var total = 0.0;
+    var amp = 0.5;
+    var q = p * params.softness_mask_frequency + vec2<f32>(91.7, 37.1);
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        total += value_noise(q) * amp;
+        amp *= 0.5;
+        q *= 2.0;
+    }
+    return smoothstep(0.35, 0.6, total / 0.9375);
+}
+
+// Bevy-only procedural outflow: a sea below `outflow_sea_level` plus optional draining map borders.
+fn outflow_source(gid: vec2<u32>, h: f32) -> f32 {
+    var o = 0.0;
+    if (params.outflow_sea_level > 0.0) {
+        o = 1.0 - smoothstep(params.outflow_sea_level - 0.02, params.outflow_sea_level, h);
+    }
+    if (params.outflow_border > 0.0) {
+        let edge = min(min(gid.x, gid.y), min(params.map_size.x - 1u - gid.x, params.map_size.y - 1u - gid.y));
+        o = max(o, 1.0 - smoothstep(0.0, params.outflow_border, f32(edge)));
+    }
+    return o;
+}
+
 @compute @workgroup_size(8,8,1)
 fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
@@ -137,13 +174,30 @@ fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&erosion_buffer[idx], 0u);
     atomicStore(&mx[idx], 0u);
     atomicStore(&my[idx], 0u);
+
+    var soft = 1.0;
+    if (params.use_softness_mask != 0u) {
+        soft = softness_noise(uv);
+    }
+    var out = 0.0;
+    if (params.use_outflow != 0u) {
+        out = outflow_source(gid.xy, hval);
+    }
+    softness_mask[idx] = soft;
+    outflow[idx] = out;
 }
 
 @compute @workgroup_size(8,8,1)
 fn init_color_bands(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
-    let gray = vec3<f32>(0.5, 0.5, 0.5);
-    textureStore(color_image, vec2<i32>(gid.xy), vec4<f32>(gray, 1.0));
+    let idx = gid.y * params.map_size.x + gid.x;
+    // Tint the masks so they read in the PBR view: darker hard rock, blue outflow.
+    var base = vec3<f32>(0.5, 0.5, 0.5);
+    if (params.use_softness_mask != 0u) {
+        base = vec3<f32>(mix(0.38, 0.56, softness_mask[idx]));
+    }
+    base = mix(base, vec3<f32>(0.12, 0.26, 0.42), outflow[idx]);
+    textureStore(color_image, vec2<i32>(gid.xy), vec4<f32>(base, 1.0));
 }
 
 fn load_height(p: vec2<i32>) -> f32 {
@@ -571,7 +625,7 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
             return;
         }
 
-        dh = max(dh, -dep_val) + min(dh + dep_val, 0.0) * params.rock_softness;
+        dh = max(dh, -dep_val) + min(dh + dep_val, 0.0) * params.rock_softness * softness_mask[idx];
 
         // Release the carried material (scarring is 1 without rivers)
         dh += min((1.0 - params.suspended_load) * carry * scarring_coefficient, max_deposit_angle * dx_scaled);
@@ -593,6 +647,7 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
         let cell_h = load_height(cell);
         dh = max(dh, hmin - cell_h);
         dh = min(dh, hmax - cell_h);
+        dh *= 1.0 - outflow[idx];
 
         let dep_delta = max(dh, -dep_val);
         if (dh >= 0.0) {
@@ -694,13 +749,13 @@ fn write_back(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (do_rivers) {
         river_scarring = params.river_scale * RIVER_SCARRING_SCALE
             * min(1.0, pow(dx, params.river_character));
-        river_mom = river_momentum_at_idx(idx);
+        river_mom = river_momentum_at_idx(idx) * (1.0 - outflow[idx]);
         var river_uplift_negation = river_mom * params.uplift_river_carving * river_scarring * dx;
         river_uplift_negation = river_uplift_negation / (1.0 + river_uplift_negation);
         uplift *= 1.0 - river_uplift_negation;
     }
 
-    var h_new = h_old + uplift * dx;
+    var h_new = h_old + uplift * dx * (1.0 - outflow[idx]);
 
     let dep = f32(atomicLoad(&deposition[idx])) / DEPOSITION_SCALE;
     if (dep > params.compaction_threshold * params.detail_scale) {

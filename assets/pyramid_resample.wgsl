@@ -2,7 +2,8 @@
 //
 // heightfield_resample2 : gauss-upsample the previous level ×2 (filter scale 1.5).
 // Update_Upscaled_Fields: height = source(P) + upsampled(mask), mask = eroded − source(P).
-// Smooth_Flows          : deep deposits blend toward the previous level's smooth surface.
+// Smooth_Flows          : deep deposits blend toward the previous level's smooth surface, and
+//                         outflow cells reset to the source terrain.
 
 const HEIGHT_SCALE: f32 = 1000000.0;
 const DEPOSITION_SCALE: f32 = 100000.0;
@@ -16,6 +17,7 @@ struct PyramidResampleParams {
     first_level: u32,
     dst_voxel_size: f32,
     detail_smoothing: f32,
+    outflow_accumulate: u32,
 }
 
 @group(0) @binding(0) var<storage, read> src_height: array<u32>;
@@ -23,7 +25,10 @@ struct PyramidResampleParams {
 @group(0) @binding(2) var<storage, read> orig_height: array<u32>;
 @group(0) @binding(3) var<storage, read_write> dst_height: array<u32>;
 @group(0) @binding(4) var<storage, read_write> dst_deposition: array<i32>;
-@group(0) @binding(5) var<uniform> resample: PyramidResampleParams;
+// This level's masks, written by `pyramid_upscale_masks` just before this pass.
+@group(0) @binding(5) var<storage, read> dst_outflow: array<f32>;
+@group(0) @binding(6) var<storage, read> dst_outflow_acc: array<f32>;
+@group(0) @binding(7) var<uniform> resample: PyramidResampleParams;
 
 fn clamp_texel(q: vec2<i32>, size: vec2<u32>) -> u32 {
     let c = clamp(q, vec2<i32>(0), vec2<i32>(size) - 1);
@@ -66,7 +71,8 @@ fn pyramid_upscale_height(@builtin(global_invocation_id) gid: vec3<u32>) {
     let center = vec2<f32>(gid.xy) + 0.5;
     let dst_size = vec2<f32>(resample.dst_size);
     let orig_size = vec2<f32>(resample.orig_size);
-    var h = bilinear_orig(center * orig_size / dst_size);
+    let source_h = bilinear_orig(center * orig_size / dst_size);
+    var h = source_h;
     var dep = 0.0;
 
     if (resample.first_level == 0u) {
@@ -95,6 +101,13 @@ fn pyramid_upscale_height(@builtin(global_invocation_id) gid: vec3<u32>) {
         let bias = pow(0.1, dep * resample.detail_smoothing / resample.dst_voxel_size);
         h = mix(bilinear_src(sp), h, bias);
     }
+
+    // Smooth_Flows: lerp(height, source(P), Outflow_Integration_Method ? accumulation : outflow).
+    var outflow = dst_outflow[dst_idx];
+    if (resample.outflow_accumulate != 0u) {
+        outflow = dst_outflow_acc[dst_idx];
+    }
+    h = mix(h, source_h, outflow);
 
     dst_height[dst_idx] = u32(max(h, 0.0) * HEIGHT_SCALE);
     dst_deposition[dst_idx] = i32(dep * DEPOSITION_SCALE);

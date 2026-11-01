@@ -91,6 +91,9 @@ enum ErosionSliderFieldKind {
     SourceDetailSmoothing,
     GeologicalAge,
     IterationsPerFrame,
+    SoftnessMaskFrequency,
+    OutflowSeaLevel,
+    OutflowBorder,
 }
 
 impl ErosionSliderFieldKind {
@@ -136,6 +139,9 @@ impl ErosionSliderFieldKind {
             Self::SourceDetailSmoothing => params.source_detail_smoothing = value,
             Self::GeologicalAge => params.geological_age = value,
             Self::IterationsPerFrame => sim.iterations_per_frame = value as u32,
+            Self::SoftnessMaskFrequency => params.softness_mask_frequency = value,
+            Self::OutflowSeaLevel => params.outflow_sea_level = value,
+            Self::OutflowBorder => params.outflow_border = value,
         }
     }
 
@@ -148,6 +154,9 @@ impl ErosionSliderFieldKind {
                 | Self::FeatureSize
                 | Self::SourceDetailSmoothing
                 | Self::GeologicalAge
+                | Self::SoftnessMaskFrequency
+                | Self::OutflowSeaLevel
+                | Self::OutflowBorder
         )
     }
 }
@@ -354,6 +363,39 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                 })
             ),
             slider_row("Search Distance", 1.0, 64.0, params.hydro_conditioning_search_distance, ErosionSliderFieldKind::HydroSearchDistance),
+            section_label("Masks"),
+            (
+                @FeathersCheckbox {
+                    @caption: bsn! { (Text("Use Softness Mask") ThemedText) },
+                }
+                on(checkbox_self_update)
+                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
+                    params.use_softness_mask = u32::from(change.value);
+                    reset.generation = reset.generation.wrapping_add(1);
+                })
+            ),
+            slider_row("Softness Mask Freq", 0.001, 0.05, params.softness_mask_frequency, ErosionSliderFieldKind::SoftnessMaskFrequency),
+            (
+                @FeathersCheckbox {
+                    @caption: bsn! { (Text("Use Outflow") ThemedText) },
+                }
+                on(checkbox_self_update)
+                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
+                    params.use_outflow = u32::from(change.value);
+                    reset.generation = reset.generation.wrapping_add(1);
+                })
+            ),
+            (
+                @FeathersCheckbox {
+                    @caption: bsn! { (Text("Accumulate Outflow") ThemedText) },
+                }
+                on(checkbox_self_update)
+                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>| {
+                    params.outflow_integration = u32::from(change.value);
+                })
+            ),
+            slider_row("Sea Level", 0.0, 1.5, params.outflow_sea_level, ErosionSliderFieldKind::OutflowSeaLevel),
+            slider_row("Border Width", 0.0, 64.0, params.outflow_border, ErosionSliderFieldKind::OutflowBorder),
         ]
     }
 }
