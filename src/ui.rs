@@ -91,9 +91,14 @@ enum ErosionSliderFieldKind {
     SourceDetailSmoothing,
     GeologicalAge,
     IterationsPerFrame,
-    SoftnessMaskFrequency,
+    MaskFrequency,
     OutflowSeaLevel,
     OutflowBorder,
+    BedrockDepth,
+    GranularityAmount,
+    GranularityScale,
+    GranularityStrength,
+    AgeStrength,
 }
 
 impl ErosionSliderFieldKind {
@@ -139,9 +144,14 @@ impl ErosionSliderFieldKind {
             Self::SourceDetailSmoothing => params.source_detail_smoothing = value,
             Self::GeologicalAge => params.geological_age = value,
             Self::IterationsPerFrame => sim.iterations_per_frame = value as u32,
-            Self::SoftnessMaskFrequency => params.softness_mask_frequency = value,
+            Self::MaskFrequency => params.mask_frequency = value,
             Self::OutflowSeaLevel => params.outflow_sea_level = value,
             Self::OutflowBorder => params.outflow_border = value,
+            Self::BedrockDepth => params.bedrock_depth = value,
+            Self::GranularityAmount => params.granularity_amount = value,
+            Self::GranularityScale => params.granularity_scale = value,
+            Self::GranularityStrength => params.granularity_strength = value,
+            Self::AgeStrength => params.age_strength = value,
         }
     }
 
@@ -154,9 +164,10 @@ impl ErosionSliderFieldKind {
                 | Self::FeatureSize
                 | Self::SourceDetailSmoothing
                 | Self::GeologicalAge
-                | Self::SoftnessMaskFrequency
+                | Self::MaskFrequency
                 | Self::OutflowSeaLevel
                 | Self::OutflowBorder
+                | Self::BedrockDepth
         )
     }
 }
@@ -275,6 +286,9 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
             slider_row("Feature Size", 0.5, 64.0, params.feature_size, ErosionSliderFieldKind::FeatureSize),
             slider_row("Detail Smoothing", 0.0, 4.0, params.source_detail_smoothing, ErosionSliderFieldKind::SourceDetailSmoothing),
             slider_row("Geological Age", 0.0, 50.0, params.geological_age, ErosionSliderFieldKind::GeologicalAge),
+            slider_row("Granularity Amount", 0.0, 10.0, params.granularity_amount, ErosionSliderFieldKind::GranularityAmount),
+            slider_row("Granularity Scale", 0.0, 2.0, params.granularity_scale, ErosionSliderFieldKind::GranularityScale),
+            slider_row("Granularity Strength", 0.0, 1.0, params.granularity_strength, ErosionSliderFieldKind::GranularityStrength),
             slider_row_int("Iterations / Frame", 1.0, 64.0, sim.iterations_per_frame as f32, ErosionSliderFieldKind::IterationsPerFrame),
             (
                 @FeathersCheckbox {
@@ -374,7 +388,27 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                     reset.generation = reset.generation.wrapping_add(1);
                 })
             ),
-            slider_row("Softness Mask Freq", 0.001, 0.05, params.softness_mask_frequency, ErosionSliderFieldKind::SoftnessMaskFrequency),
+            slider_row("Mask Noise Freq", 0.001, 0.05, params.mask_frequency, ErosionSliderFieldKind::MaskFrequency),
+            (
+                @FeathersCheckbox {
+                    @caption: bsn! { (Text("Use Erosion Mask") ThemedText) },
+                }
+                on(checkbox_self_update)
+                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
+                    params.use_erosion_mask = u32::from(change.value);
+                    reset.generation = reset.generation.wrapping_add(1);
+                })
+            ),
+            (
+                @FeathersCheckbox {
+                    @caption: bsn! { (Text("Use Uplift Map") ThemedText) },
+                }
+                on(checkbox_self_update)
+                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
+                    params.use_uplift_map = u32::from(change.value);
+                    reset.generation = reset.generation.wrapping_add(1);
+                })
+            ),
             (
                 @FeathersCheckbox {
                     @caption: bsn! { (Text("Use Outflow") ThemedText) },
@@ -396,6 +430,49 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
             ),
             slider_row("Sea Level", 0.0, 1.5, params.outflow_sea_level, ErosionSliderFieldKind::OutflowSeaLevel),
             slider_row("Border Width", 0.0, 64.0, params.outflow_border, ErosionSliderFieldKind::OutflowBorder),
+            section_label("Bedrock"),
+            (
+                @FeathersCheckbox {
+                    @caption: bsn! { (Text("Use Bedrock") ThemedText) },
+                }
+                on(checkbox_self_update)
+                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
+                    params.use_bedrock = u32::from(change.value);
+                    reset.generation = reset.generation.wrapping_add(1);
+                })
+            ),
+            (
+                @FeathersCheckbox {
+                    @caption: bsn! { (Text("Use Bedrock Map") ThemedText) },
+                }
+                on(checkbox_self_update)
+                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
+                    params.use_bedrock_map = u32::from(change.value);
+                    reset.generation = reset.generation.wrapping_add(1);
+                })
+            ),
+            (
+                @FeathersCheckbox {
+                    @caption: bsn! { (Text("Additive Sediment") ThemedText) },
+                }
+                on(checkbox_self_update)
+                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
+                    params.additive_sediment = u32::from(change.value);
+                    reset.generation = reset.generation.wrapping_add(1);
+                })
+            ),
+            slider_row("Bedrock Depth", 0.0, 0.5, params.bedrock_depth, ErosionSliderFieldKind::BedrockDepth),
+            section_label("Age"),
+            slider_row("Age Strength", -4.0, 2.0, params.age_strength, ErosionSliderFieldKind::AgeStrength),
+            (
+                @FeathersCheckbox {
+                    @caption: bsn! { (Text("Normalize Age") ThemedText) },
+                }
+                on(checkbox_self_update)
+                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>| {
+                    params.normalize_age = u32::from(change.value);
+                })
+            ),
         ]
     }
 }

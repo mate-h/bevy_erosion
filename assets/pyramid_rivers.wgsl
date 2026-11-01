@@ -12,6 +12,11 @@ struct PyramidResampleParams {
     dst_voxel_size: f32,
     detail_smoothing: f32,
     outflow_accumulate: u32,
+    use_bedrock: u32,
+    detail_scale: f32,
+    granularity_amount: f32,
+    granularity_scale: f32,
+    granularity_strength: f32,
 }
 
 @group(0) @binding(0) var<storage, read> src_mx: array<f32>;

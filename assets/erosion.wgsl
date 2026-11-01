@@ -65,11 +65,22 @@ struct ErodeParams {
     use_hydro_conditioning: u32,
     hydro_conditioning_search_distance: f32,
     use_softness_mask: u32,
-    softness_mask_frequency: f32,
+    mask_frequency: f32,
     use_outflow: u32,
     outflow_integration: u32,
     outflow_sea_level: f32,
     outflow_border: f32,
+    use_erosion_mask: u32,
+    use_uplift_map: u32,
+    use_bedrock: u32,
+    use_bedrock_map: u32,
+    bedrock_depth: f32,
+    additive_sediment: u32,
+    granularity_amount: f32,
+    granularity_scale: f32,
+    granularity_strength: f32,
+    age_strength: f32,
+    normalize_age: u32,
 }
 
 @group(0) @binding(1) var<uniform> params: ErodeParams;
@@ -83,11 +94,21 @@ struct ErodeParams {
 // Stored as f32 bits (KTT `__m` is a float field); adds go through a compare-exchange loop.
 @group(0) @binding(5) var<storage, read_write> mx: array<atomic<u32>>;
 @group(0) @binding(6) var<storage, read_write> my: array<atomic<u32>>;
-// KTT `__Softness_Mask` (scales Rock_Softness) and `__Outflow` (cells that drain away: no erosion,
-// deposition or uplift). Generated on the source set by init_fbm; resampled per pyramid level.
-// Without a mask they hold 1 and 0, which matches KTT compiled without HAS_Softness_Mask / HAS_Outflow.
-@group(0) @binding(7) var<storage, read_write> softness_mask: array<f32>;
-@group(0) @binding(8) var<storage, read_write> outflow: array<f32>;
+// Per-cell masks, packed to stay within 8 storage buffers per stage:
+//   x = `__Softness_Mask` (scales Rock_Softness)
+//   y = `__Outflow` (cells that drain away: no erosion, deposition or uplift)
+//   z = `__Erode_Mask` (trails start only where > 0; scales Erosion_Strength)
+//   w = `__Uplift` map (scales Uplift_Amount)
+// Generated on the source set by init_fbm and resampled per pyramid level. Unused masks hold
+// 1, 0, 1, 1, which matches KTT compiled without the corresponding HAS_* define.
+@group(0) @binding(7) var<storage, read_write> masks: array<vec4<f32>>;
+// x = `__Bedrock` (only read when use_bedrock != 0), y = `__Age` (time since the cell last changed).
+@group(0) @binding(8) var<storage, read_write> layers: array<vec2<f32>>;
+
+const MASK_SOFTNESS_SEED: vec2<f32> = vec2<f32>(91.7, 37.1);
+const MASK_ERODE_SEED: vec2<f32> = vec2<f32>(13.3, 71.9);
+const MASK_UPLIFT_SEED: vec2<f32> = vec2<f32>(57.1, 5.3);
+const MASK_BEDROCK_SEED: vec2<f32> = vec2<f32>(29.9, 83.7);
 
 // Color image as read-write storage texture
 @group(1) @binding(0) var color_image: texture_storage_2d<rgba16float, read_write>;
@@ -134,11 +155,11 @@ fn fbm(p: vec2<f32>) -> f32 {
     return total;
 }
 
-// Bevy-only procedural softness mask: patches of hard (0) and soft (1) rock.
-fn softness_noise(p: vec2<f32>) -> f32 {
+// Bevy-only procedural mask (stands in for KTT's painted layers): patches of 0 and 1.
+fn mask_noise(p: vec2<f32>, seed: vec2<f32>) -> f32 {
     var total = 0.0;
     var amp = 0.5;
-    var q = p * params.softness_mask_frequency + vec2<f32>(91.7, 37.1);
+    var q = p * params.mask_frequency + seed;
     for (var i = 0u; i < 4u; i = i + 1u) {
         total += value_noise(q) * amp;
         amp *= 0.5;
@@ -164,9 +185,24 @@ fn outflow_source(gid: vec2<u32>, h: f32) -> f32 {
 fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
     let uv = vec2<f32>(gid.xy);
-    let hval = fbm(uv) * params.noise_scale;
+    var hval = fbm(uv) * params.noise_scale;
     let idx = gid.y * params.map_size.x + gid.x;
-    atomicStore(&height[idx], u32(hval * HEIGHT_SCALE));
+
+    // Adjust_Bedrock: bedrock = height - depth (× map in Depth mode). Additive_Sediment instead keeps
+    // the bedrock at the source surface and adds the depth as loose sediment on top.
+    var bedrock = 0.0;
+    if (params.use_bedrock != 0u) {
+        var depth = params.bedrock_depth;
+        if (params.use_bedrock_map != 0u) {
+            depth *= mask_noise(uv, MASK_BEDROCK_SEED);
+        }
+        bedrock = hval - depth;
+        if (params.additive_sediment != 0u) {
+            bedrock = hval;
+            hval += depth;
+        }
+    }
+    atomicStore(&height[idx], u32(max(hval, 0.0) * HEIGHT_SCALE));
     
     // Clear flow, deposition, erosion, and river/momentum buffers
     atomicStore(&flow_buffer[idx], 0u);
@@ -175,16 +211,21 @@ fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&mx[idx], 0u);
     atomicStore(&my[idx], 0u);
 
-    var soft = 1.0;
+    var m = vec4<f32>(1.0, 0.0, 1.0, 1.0);
     if (params.use_softness_mask != 0u) {
-        soft = softness_noise(uv);
+        m.x = mask_noise(uv, MASK_SOFTNESS_SEED);
     }
-    var out = 0.0;
     if (params.use_outflow != 0u) {
-        out = outflow_source(gid.xy, hval);
+        m.y = outflow_source(gid.xy, hval);
     }
-    softness_mask[idx] = soft;
-    outflow[idx] = out;
+    if (params.use_erosion_mask != 0u) {
+        m.z = mask_noise(uv, MASK_ERODE_SEED);
+    }
+    if (params.use_uplift_map != 0u) {
+        m.w = mask_noise(uv, MASK_UPLIFT_SEED);
+    }
+    masks[idx] = m;
+    layers[idx] = vec2<f32>(bedrock, 0.0);
 }
 
 @compute @workgroup_size(8,8,1)
@@ -194,9 +235,9 @@ fn init_color_bands(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Tint the masks so they read in the PBR view: darker hard rock, blue outflow.
     var base = vec3<f32>(0.5, 0.5, 0.5);
     if (params.use_softness_mask != 0u) {
-        base = vec3<f32>(mix(0.38, 0.56, softness_mask[idx]));
+        base = vec3<f32>(mix(0.38, 0.56, masks[idx].x));
     }
-    base = mix(base, vec3<f32>(0.12, 0.26, 0.42), outflow[idx]);
+    base = mix(base, vec3<f32>(0.12, 0.26, 0.42), masks[idx].y);
     textureStore(color_image, vec2<i32>(gid.xy), vec4<f32>(base, 1.0));
 }
 
@@ -406,6 +447,11 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dx_scaled = dx / detail_scale;
     let iteration = params.iteration;
 
+    // Age grows on every cell each dispatch; trails decay it where they change the height.
+    if (particle_id < total_pixels) {
+        layers[particle_id].y += dx_scaled;
+    }
+
     // Detail_Bias: ridge-biased (0) vs flow-biased (1), alternating each OpenCL iteration
     let detail_bias = f32(iteration % 2u);
     if (params.compute_ridge_erosion == 0u && detail_bias < 0.5) {
@@ -471,6 +517,17 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     var erosion_strength = params.erosion_strength;
+    let start_idx = u32(sample_idx.y * res_x + sample_idx.x);
+    // Erode_Mask: cull trails where the mask is 0 and scale erosion by it elsewhere.
+    let erode_mask = masks[start_idx].z;
+    if (erode_mask == 0.0) {
+        return;
+    }
+    erosion_strength *= erode_mask;
+    // Cull trails that start on exposed bedrock.
+    if (params.use_bedrock != 0u && load_height(sample_idx) <= layers[start_idx].x) {
+        return;
+    }
     var flow_steps = select(
         i32(params.ridge_erosion_steps),
         i32(params.flow_length / dx_scaled),
@@ -625,10 +682,16 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
             return;
         }
 
-        dh = max(dh, -dep_val) + min(dh + dep_val, 0.0) * params.rock_softness * softness_mask[idx];
+        dh = max(dh, -dep_val) + min(dh + dep_val, 0.0) * params.rock_softness * masks[idx].x;
 
         // Release the carried material (scarring is 1 without rivers)
         dh += min((1.0 - params.suspended_load) * carry * scarring_coefficient, max_deposit_angle * dx_scaled);
+
+        // Never cut into the bedrock
+        let bedrock = layers[idx].x;
+        if (params.use_bedrock != 0u) {
+            dh = max(dh, bedrock - load_height(cell));
+        }
         carry -= dh;
         carry = max(carry, 0.0);
 
@@ -647,7 +710,7 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
         let cell_h = load_height(cell);
         dh = max(dh, hmin - cell_h);
         dh = min(dh, hmax - cell_h);
-        dh *= 1.0 - outflow[idx];
+        dh *= 1.0 - masks[idx].y;
 
         let dep_delta = max(dh, -dep_val);
         if (dh >= 0.0) {
@@ -655,7 +718,11 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
         } else {
             atomicSub(&height[idx], u32(-dh * HEIGHT_SCALE));
         }
+        if (params.use_bedrock != 0u) {
+            atomicMax(&height[idx], u32(max(bedrock, 0.0) * HEIGHT_SCALE));
+        }
         atomicAdd(&deposition[idx], i32(dep_delta * DEPOSITION_SCALE));
+        layers[idx].y *= pow(0.1, abs(dh) * dx_inv);
         if (dh < 0.0) {
             atomicAdd(&erosion_buffer[idx], u32(-dh * 100000.0));
         }
@@ -741,7 +808,8 @@ fn write_back(@builtin(global_invocation_id) gid: vec3<u32>) {
     let do_rivers = params.do_rivers != 0u;
     let use_my = do_rivers && params.momentum_coherence > 0.0;
 
-    var uplift = params.uplift * params.erosion_amount * TRAIL_DENSITY_SCALE * params.trail_weight;
+    var uplift = params.uplift * params.erosion_amount * TRAIL_DENSITY_SCALE * params.trail_weight
+        * masks[idx].w;
     let h_old = load_height(vec2<i32>(px, py));
 
     var river_scarring = 0.0;
@@ -749,13 +817,13 @@ fn write_back(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (do_rivers) {
         river_scarring = params.river_scale * RIVER_SCARRING_SCALE
             * min(1.0, pow(dx, params.river_character));
-        river_mom = river_momentum_at_idx(idx) * (1.0 - outflow[idx]);
+        river_mom = river_momentum_at_idx(idx) * (1.0 - masks[idx].y);
         var river_uplift_negation = river_mom * params.uplift_river_carving * river_scarring * dx;
         river_uplift_negation = river_uplift_negation / (1.0 + river_uplift_negation);
         uplift *= 1.0 - river_uplift_negation;
     }
 
-    var h_new = h_old + uplift * dx * (1.0 - outflow[idx]);
+    var h_new = h_old + uplift * dx * (1.0 - masks[idx].y);
 
     let dep = f32(atomicLoad(&deposition[idx])) / DEPOSITION_SCALE;
     if (dep > params.compaction_threshold * params.detail_scale) {
@@ -792,6 +860,10 @@ fn write_back(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    // Final validation that the erosion doesn't eat into the bedrock
+    if (params.use_bedrock != 0u) {
+        h_new = max(h_new, layers[idx].x);
+    }
     atomicStore(&height[idx], u32(max(h_new, 0.0) * HEIGHT_SCALE));
 }
 
@@ -810,9 +882,9 @@ fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = u32(py * size_x + px);
     let h = f32(atomicLoad(&height[idx])) / HEIGHT_SCALE;
 
-    // grayscale height to display
+    // Height in R (and B); the Age view in G.
     let c = h;
-    textureStore(display_out, vec2<i32>(px, py), vec4<f32>(c, c, c, 1.0));
+    textureStore(display_out, vec2<i32>(px, py), vec4<f32>(c, age_display(layers[idx].y), c, 1.0));
 
     // compute normals from central differences of height field
     let xm1 = max(px - 1, 0);
@@ -856,6 +928,29 @@ fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(analysis_out, vec2<i32>(px, py), analysis);
 }
 
+// KTT age visualization: Age * 10^Age_Strength, optionally normalized to v / (1 + v).
+fn age_display(age: f32) -> f32 {
+    var v = age * pow(10.0, params.age_strength);
+    if (params.normalize_age != 0u) {
+        v = v / (1.0 + v);
+    }
+    return v;
+}
+
+fn bilinear_sample_age(pos: vec2<f32>) -> f32 {
+    let w = bilinear_grid_weights(pos);
+    let size = vec2<i32>(params.map_size);
+    let ix = i32(w.z);
+    let iy = i32(w.w);
+    let ix1 = min(ix + 1, size.x - 1);
+    let iy1 = min(iy + 1, size.y - 1);
+    let a00 = layers[u32(iy * size.x + ix)].y;
+    let a10 = layers[u32(iy * size.x + ix1)].y;
+    let a01 = layers[u32(iy1 * size.x + ix)].y;
+    let a11 = layers[u32(iy1 * size.x + ix1)].y;
+    return a00 * (1.0 - w.x) * (1.0 - w.y) + a10 * w.x * (1.0 - w.y) + a01 * (1.0 - w.x) * w.y + a11 * w.x * w.y;
+}
+
 struct BlitDisplayParams {
     display_size: vec2<u32>,
     _pad: vec2<u32>,
@@ -881,7 +976,8 @@ fn blit_level_to_display(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dpos = vec2<f32>(params.map_size.xy) / vec2<f32>(blit_display.display_size.xy);
 
     let h = bilinear_sample_height(pos);
-    textureStore(display_out, vec2<i32>(px, py), vec4<f32>(h, h, h, 1.0));
+    let age = age_display(bilinear_sample_age(pos));
+    textureStore(display_out, vec2<i32>(px, py), vec4<f32>(h, age, h, 1.0));
 
     let h_l = bilinear_sample_height(pos - vec2(dpos.x, 0.0));
     let h_r = bilinear_sample_height(pos + vec2(dpos.x, 0.0));

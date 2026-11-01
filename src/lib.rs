@@ -128,6 +128,13 @@ pub struct PyramidResampleParams {
     pub detail_smoothing: f32,
     /// KTT `Outflow_Integration_Method` (0 = Sharp, 1 = Accumulate).
     pub outflow_accumulate: u32,
+    /// KTT `Use_Bedrock`: upscaled heights are clamped to the bedrock.
+    pub use_bedrock: u32,
+    /// KTT `Detail_Scale`, `Granularity_Amount`, `Granularity_Scale`, `Granularity_Strength`.
+    pub detail_scale: f32,
+    pub granularity_amount: f32,
+    pub granularity_scale: f32,
+    pub granularity_strength: f32,
 }
 
 #[derive(Clone, Copy, ShaderType)]
@@ -317,6 +324,7 @@ pub enum PreviewMode {
     Height,
     Normals,
     Curvature,
+    Age,
 }
 
 /// Parameters for ambient occlusion computation
@@ -359,7 +367,7 @@ pub struct TerrainExtension {
     // Displacement height scale
     #[uniform(106)]
     pub height_scale: f32,
-    // Preview mode: 0=PBR, 1=Flow, 2=Sediment, 3=Erosion, 4=Height, 5=Normals, 6=Curvature
+    // Preview mode: 0=PBR, 1=Flow, 2=Sediment, 3=Erosion, 4=Height, 5=Normals, 6=Curvature, 7=Age
     #[uniform(107)]
     pub preview_mode: u32,
 }
@@ -460,8 +468,8 @@ pub struct ErodeParams {
     pub hydro_conditioning_search_distance: f32,
     /// Reference parm `Use_Softness_Mask`; scales `Rock_Softness` per cell.
     pub use_softness_mask: u32,
-    /// Bevy-only: frequency of the procedural softness mask (hard/soft rock patches).
-    pub softness_mask_frequency: f32,
+    /// Bevy-only: frequency of the procedural mask noise (softness, erosion, uplift and bedrock maps).
+    pub mask_frequency: f32,
     /// Reference parm `Use_Outflow_Map`; outflow cells neither erode nor uplift.
     pub use_outflow: u32,
     /// Reference parm `Outflow_Integration_Method`: 0 = Sharp, 1 = Accumulate across levels.
@@ -470,6 +478,29 @@ pub struct ErodeParams {
     pub outflow_sea_level: f32,
     /// Bevy-only: map borders within this many base voxels become outflow. 0 disables.
     pub outflow_border: f32,
+    /// Reference parm `Use_Erosion_Mask`: trails only start where the mask is > 0, scaled by it.
+    pub use_erosion_mask: u32,
+    /// Reference parm `Use_Uplift_Map`: scales `Uplift_Amount` per cell.
+    pub use_uplift_map: u32,
+    /// Reference parm `Use_Bedrock`: erosion never cuts below the bedrock layer.
+    pub use_bedrock: u32,
+    /// Reference parm `Use_Bedrock_Map` (Depth mode): the bedrock depth is scaled by mask noise.
+    pub use_bedrock_map: u32,
+    /// Reference parm `Bedrock_Depth`: bedrock sits this far below the source terrain.
+    pub bedrock_depth: f32,
+    /// Reference parm `Additive_Sediment`: bedrock is the source surface and a sediment layer of
+    /// `Bedrock_Depth` is added on top instead.
+    pub additive_sediment: u32,
+    /// Reference parm `Granularity_Amount` (`Smooth_Flows` noise on deep deposits; 0 = off).
+    pub granularity_amount: f32,
+    /// Reference parm `Granularity_Scale`.
+    pub granularity_scale: f32,
+    /// Reference parm `Granularity_Strength`.
+    pub granularity_strength: f32,
+    /// Reference parm `Age_Strength`: the Age view shows `age * 10^Age_Strength`.
+    pub age_strength: f32,
+    /// Reference parm `Normalize_Age_Field`: map the Age view through `v / (1 + v)`.
+    pub normalize_age: u32,
 }
 
 impl Default for ErodeParams {
@@ -529,11 +560,25 @@ impl Default for ErodeParams {
             use_hydro_conditioning: 0,  // Use_Hydro_Conditioning
             hydro_conditioning_search_distance: 16.0,
             use_softness_mask: 0, // Use_Softness_Mask
-            softness_mask_frequency: 0.01,
+            mask_frequency: 0.01,
             use_outflow: 0,         // Use_Outflow_Map
             outflow_integration: 0, // Outflow_Integration_Method (Sharp)
             outflow_sea_level: 0.6,
             outflow_border: 0.0,
+            use_erosion_mask: 0, // Use_Erosion_Mask
+            use_uplift_map: 0,   // Use_Uplift_Map
+            use_bedrock: 0,      // Use_Bedrock
+            use_bedrock_map: 0,  // Use_Bedrock_Map
+            // Bedrock_Depth is 1 world unit in KTT; this map's terrain is only ~1 unit tall.
+            bedrock_depth: 0.05,
+            additive_sediment: 0,    // Additive_Sediment
+            granularity_amount: 0.0, // Granularity_Amount
+            granularity_scale: 0.5,  // Granularity_Scale
+            // Granularity_Strength is 5 in KTT; its noise scales with voxel size, which is large
+            // relative to this map's ~1 unit terrain height, so 5 shreds the surface.
+            granularity_strength: 0.1,
+            age_strength: -1.0, // Age_Strength
+            normalize_age: 0,   // Normalize_Age_Field
         }
     }
 }
@@ -721,8 +766,8 @@ fn init_erosion_pipeline(
                 storage_buffer::<u32>(false), // erosion (atomic<u32> in shader)
                 storage_buffer::<f32>(false), // mx (f32 bits in atomic<u32>)
                 storage_buffer::<f32>(false), // my (f32 bits in atomic<u32>)
-                storage_buffer::<f32>(false), // softness mask (written by init on the source set)
-                storage_buffer::<f32>(false), // outflow (written by init on the source set)
+                storage_buffer::<Vec4>(false), // masks: softness, outflow, erode mask, uplift map
+                storage_buffer::<Vec2>(false), // layers: bedrock, age
             ),
         ),
     );
@@ -770,13 +815,14 @@ fn init_erosion_pipeline(
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                storage_buffer_read_only::<u32>(false), // src height
-                storage_buffer_read_only::<i32>(false), // src deposition
-                storage_buffer_read_only::<u32>(false), // source terrain height
-                storage_buffer::<u32>(false),           // dst height
-                storage_buffer::<i32>(false),           // dst deposition
-                storage_buffer_read_only::<f32>(false), // dst outflow
-                storage_buffer_read_only::<f32>(false), // dst outflow accumulation
+                storage_buffer_read_only::<u32>(false),  // src height
+                storage_buffer_read_only::<i32>(false),  // src deposition
+                storage_buffer_read_only::<u32>(false),  // source terrain height
+                storage_buffer::<u32>(false),            // dst height
+                storage_buffer::<i32>(false),            // dst deposition
+                storage_buffer_read_only::<Vec4>(false), // dst masks
+                storage_buffer_read_only::<f32>(false),  // dst outflow accumulation
+                storage_buffer_read_only::<Vec2>(false), // dst layers (bedrock)
                 uniform_buffer::<PyramidResampleParams>(false),
             ),
         ),
@@ -799,18 +845,19 @@ fn init_erosion_pipeline(
         ),
     );
 
-    // Level transition: softness / outflow masks resampled from the source terrain.
+    // Level transition: masks and bedrock resampled from the source terrain, age upsampled.
     let layout_upscale_masks = BindGroupLayoutDescriptor::new(
         "PyramidUpscaleMasks",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
                 storage_buffer_read_only::<f32>(false), // src outflow accumulation
-                storage_buffer_read_only::<f32>(false), // source softness mask
-                storage_buffer_read_only::<f32>(false), // source outflow
-                storage_buffer::<f32>(false),           // dst softness mask
-                storage_buffer::<f32>(false),           // dst outflow
+                storage_buffer_read_only::<Vec2>(false), // src layers (age)
+                storage_buffer_read_only::<Vec4>(false), // source masks
+                storage_buffer_read_only::<Vec2>(false), // source layers (bedrock)
+                storage_buffer::<Vec4>(false),          // dst masks
                 storage_buffer::<f32>(false),           // dst outflow accumulation
+                storage_buffer::<Vec2>(false),          // dst layers
                 uniform_buffer::<PyramidResampleParams>(false),
             ),
         ),
@@ -927,10 +974,10 @@ struct FieldSet {
     erosion: StorageBuffer<Vec<u32>>,
     mx: StorageBuffer<Vec<f32>>,
     my: StorageBuffer<Vec<f32>>,
-    /// KTT `__Softness_Mask` (1 = fully soft when no mask is used).
-    softness: StorageBuffer<Vec<f32>>,
-    /// KTT `__Outflow`.
-    outflow: StorageBuffer<Vec<f32>>,
+    /// KTT `__Softness_Mask`, `__Outflow`, `__Erode_Mask`, `__Uplift` (identity values when unused).
+    masks: StorageBuffer<Vec<Vec4>>,
+    /// KTT `__Bedrock` and `__Age`.
+    layers: StorageBuffer<Vec<Vec2>>,
     /// KTT `__Outflow_Accumulation` (max outflow over coarser levels).
     outflow_acc: StorageBuffer<Vec<f32>>,
 }
@@ -944,8 +991,8 @@ impl FieldSet {
             erosion: StorageBuffer::from(vec![0u32; texels]),
             mx: StorageBuffer::from(vec![0f32; texels]),
             my: StorageBuffer::from(vec![0f32; texels]),
-            softness: StorageBuffer::from(vec![1f32; texels]),
-            outflow: StorageBuffer::from(vec![0f32; texels]),
+            masks: StorageBuffer::from(vec![Vec4::new(1.0, 0.0, 1.0, 1.0); texels]),
+            layers: StorageBuffer::from(vec![Vec2::ZERO; texels]),
             outflow_acc: StorageBuffer::from(vec![0f32; texels]),
         };
         set.height.write_buffer(device, queue);
@@ -954,8 +1001,8 @@ impl FieldSet {
         set.erosion.write_buffer(device, queue);
         set.mx.write_buffer(device, queue);
         set.my.write_buffer(device, queue);
-        set.softness.write_buffer(device, queue);
-        set.outflow.write_buffer(device, queue);
+        set.masks.write_buffer(device, queue);
+        set.layers.write_buffer(device, queue);
         set.outflow_acc.write_buffer(device, queue);
         set
     }
@@ -1016,6 +1063,11 @@ fn prepare_erosion_buffers(
             dst_voxel_size: 1.0,
             detail_smoothing: 0.0,
             outflow_accumulate: 0,
+            use_bedrock: 0,
+            detail_scale: 1.0,
+            granularity_amount: 0.0,
+            granularity_scale: 0.0,
+            granularity_strength: 0.0,
         }),
         blit_display,
     });
@@ -1066,8 +1118,8 @@ fn prepare_erosion_bind_groups(
                 &set.erosion,
                 &set.mx,
                 &set.my,
-                &set.softness,
-                &set.outflow,
+                &set.masks,
+                &set.layers,
             )),
         )
     };
@@ -1083,8 +1135,9 @@ fn prepare_erosion_bind_groups(
                 &source.height,
                 &dst.height,
                 &dst.deposition,
-                &dst.outflow,
+                &dst.masks,
                 &dst.outflow_acc,
+                &dst.layers,
                 &buffers.resample_params,
             )),
         )
@@ -1113,11 +1166,12 @@ fn prepare_erosion_bind_groups(
             &layout(&pipeline.layout_upscale_masks),
             &BindGroupEntries::sequential((
                 &src.outflow_acc,
-                &source.softness,
-                &source.outflow,
-                &dst.softness,
-                &dst.outflow,
+                &src.layers,
+                &source.masks,
+                &source.layers,
+                &dst.masks,
                 &dst.outflow_acc,
+                &dst.layers,
                 &buffers.resample_params,
             )),
         )
@@ -1282,6 +1336,11 @@ fn plan_erosion_frame(
                     dst_voxel_size: dst_level.voxel_size,
                     detail_smoothing: params.source_detail_smoothing,
                     outflow_accumulate: params.outflow_integration,
+                    use_bedrock: params.use_bedrock,
+                    detail_scale: params.detail_scale,
+                    granularity_amount: params.granularity_amount,
+                    granularity_scale: params.granularity_scale,
+                    granularity_strength: params.granularity_strength,
                 };
                 debug_assert!(first || src == 1 - dst);
                 info!(
@@ -1394,7 +1453,7 @@ fn erosion_compute(
             }
             FrameCmd::Seed { dst, size } => {
                 let (gx, gy) = dispatch_grid(size);
-                // Masks first: the height pass reads this level's outflow (Smooth_Flows).
+                // Masks first: the height pass reads this level's outflow and bedrock.
                 if let Some(p) = get(pipes.pipeline_upscale_masks) {
                     pass.set_pipeline(p);
                     pass.set_bind_group(0, &groups.upscale_masks[dst], &[]);

@@ -84,6 +84,7 @@ fn print_controls() {
     println!("  5 - Height map preview");
     println!("  6 - View-space normals preview");
     println!("  7 - Curvature map preview");
+    println!("  8 - Age map preview");
 }
 
 fn spawn_terrain(
@@ -246,6 +247,8 @@ fn handle_preview_mode_input(
         Some(PreviewMode::Normals)
     } else if keys.just_pressed(KeyCode::Digit7) {
         Some(PreviewMode::Curvature)
+    } else if keys.just_pressed(KeyCode::Digit8) {
+        Some(PreviewMode::Age)
     } else {
         None
     };
@@ -265,6 +268,7 @@ fn handle_preview_mode_input(
                     PreviewMode::Height => 4,
                     PreviewMode::Normals => 5,
                     PreviewMode::Curvature => 6,
+                    PreviewMode::Age => 7,
                 };
             }
 

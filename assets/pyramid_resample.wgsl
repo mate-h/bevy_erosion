@@ -1,9 +1,10 @@
 // KTT pyramid level transition for height and deposition (see `ref/KTT_PYRAMID.md`).
 //
 // heightfield_resample2 : gauss-upsample the previous level ×2 (filter scale 1.5).
-// Update_Upscaled_Fields: height = source(P) + upsampled(mask), mask = eroded − source(P).
-// Smooth_Flows          : deep deposits blend toward the previous level's smooth surface, and
-//                         outflow cells reset to the source terrain.
+// Update_Upscaled_Fields: height = source(P) + upsampled(mask), mask = eroded − source(P),
+//                         clamped to the bedrock.
+// Smooth_Flows          : deep deposits blend toward the previous level's smooth surface, plus
+//                         granularity noise, and outflow cells reset to the source terrain.
 
 const HEIGHT_SCALE: f32 = 1000000.0;
 const DEPOSITION_SCALE: f32 = 100000.0;
@@ -18,6 +19,11 @@ struct PyramidResampleParams {
     dst_voxel_size: f32,
     detail_smoothing: f32,
     outflow_accumulate: u32,
+    use_bedrock: u32,
+    detail_scale: f32,
+    granularity_amount: f32,
+    granularity_scale: f32,
+    granularity_strength: f32,
 }
 
 @group(0) @binding(0) var<storage, read> src_height: array<u32>;
@@ -25,10 +31,16 @@ struct PyramidResampleParams {
 @group(0) @binding(2) var<storage, read> orig_height: array<u32>;
 @group(0) @binding(3) var<storage, read_write> dst_height: array<u32>;
 @group(0) @binding(4) var<storage, read_write> dst_deposition: array<i32>;
-// This level's masks, written by `pyramid_upscale_masks` just before this pass.
-@group(0) @binding(5) var<storage, read> dst_outflow: array<f32>;
+// This level's masks and layers, written by `pyramid_upscale_masks` just before this pass.
+@group(0) @binding(5) var<storage, read> dst_masks: array<vec4<f32>>;
 @group(0) @binding(6) var<storage, read> dst_outflow_acc: array<f32>;
-@group(0) @binding(7) var<uniform> resample: PyramidResampleParams;
+@group(0) @binding(7) var<storage, read> dst_layers: array<vec2<f32>>;
+@group(0) @binding(8) var<uniform> resample: PyramidResampleParams;
+
+// Per-voxel white noise in [0, 1) (VEX random(P)).
+fn random_at(p: vec2<f32>) -> f32 {
+    return fract(sin(dot(p, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+}
 
 fn clamp_texel(q: vec2<i32>, size: vec2<u32>) -> u32 {
     let c = clamp(q, vec2<i32>(0), vec2<i32>(size) - 1);
@@ -94,16 +106,29 @@ fn pyramid_upscale_height(@builtin(global_invocation_id) gid: vec3<u32>) {
                 wsum += w;
             }
         }
-        h += mask / wsum;
+        let mask_up = mask / wsum;
+        h += mask_up;
         dep = max(dsum / wsum, 0.0);
+        if (resample.use_bedrock != 0u) {
+            h = max(h, dst_layers[dst_idx].x);
+        }
 
         // Smooth_Flows: lerp(prev_height, height, 0.1^(deposition * smoothing / voxel)).
         let bias = pow(0.1, dep * resample.detail_smoothing / resample.dst_voxel_size);
         h = mix(bilinear_src(sp), h, bias);
+
+        // Granularity: g/(1+g) * (random(P) - 0.5) * strength * min(voxel, scale * Detail_Scale),
+        // g = max((deposition - mask) / Detail_Scale, 0) * amount.
+        if (resample.granularity_amount != 0.0) {
+            let g = max((dep - mask_up) / resample.detail_scale, 0.0) * resample.granularity_amount;
+            let noise = (random_at(center * resample.dst_voxel_size) - 0.5) * resample.granularity_strength;
+            h += g / (g + 1.0) * noise
+                * min(resample.dst_voxel_size, resample.granularity_scale * resample.detail_scale);
+        }
     }
 
     // Smooth_Flows: lerp(height, source(P), Outflow_Integration_Method ? accumulation : outflow).
-    var outflow = dst_outflow[dst_idx];
+    var outflow = dst_masks[dst_idx].y;
     if (resample.outflow_accumulate != 0u) {
         outflow = dst_outflow_acc[dst_idx];
     }
