@@ -15,15 +15,13 @@ use bevy::{
     text::FontWeight,
     ui::Checked,
     ui_widgets::{
-        Activate, Button, Checkbox, SliderPrecision, SliderRange, SliderStep, SliderValue,
-        ValueChange, checkbox_self_update, slider_self_update,
+        Activate, Button, Checkbox, SliderPrecision, SliderStep, ValueChange, checkbox_self_update,
+        slider_self_update,
     },
 };
 
 use crate::camera::OrbitInputBlocked;
-use crate::{
-    ErodeParams, ResetSim, SimControl, active_pyramid_level_size, compute_pyramid_level_count,
-};
+use crate::{ErodeParams, PyramidProgress, ResetSim, SimControl};
 
 /// Marker for the erosion params panel root.
 #[derive(Component, Clone, Default)]
@@ -39,10 +37,7 @@ struct EnableRidgeCheckbox;
 struct PyramidLevelCountText;
 
 #[derive(Component, Clone, Default)]
-struct PyramidResolutionText;
-
-#[derive(Component, Clone, Default)]
-struct ActivePyramidLevelSlider;
+struct PyramidStatusText;
 
 /// Marks erosion param sliders for styling (height, font).
 #[derive(Component, Clone, Default)]
@@ -84,11 +79,14 @@ enum ErosionSliderFieldKind {
     UpliftRiverCarving,
     NoiseFrequency,
     NoiseScale,
-    ActivePyramidLevel,
+    FeatureSize,
+    SourceDetailSmoothing,
+    GeologicalAge,
+    IterationsPerFrame,
 }
 
 impl ErosionSliderFieldKind {
-    fn apply(&self, params: &mut ErodeParams, value: f32) {
+    fn apply(&self, params: &mut ErodeParams, sim: &mut SimControl, value: f32) {
         match self {
             Self::ErosionStrength => params.erosion_strength = value,
             Self::RockSoftness => params.rock_softness = value,
@@ -124,14 +122,22 @@ impl ErosionSliderFieldKind {
             Self::UpliftRiverCarving => params.uplift_river_carving = value,
             Self::NoiseFrequency => params.noise_frequency = value,
             Self::NoiseScale => params.noise_scale = value,
-            Self::ActivePyramidLevel => params.active_pyramid_level = value as u32,
+            Self::FeatureSize => params.feature_size = value,
+            Self::SourceDetailSmoothing => params.source_detail_smoothing = value,
+            Self::GeologicalAge => params.geological_age = value,
+            Self::IterationsPerFrame => sim.iterations_per_frame = value as u32,
         }
     }
 
     fn resets_sim(&self) -> bool {
         matches!(
             self,
-            Self::NoiseFrequency | Self::NoiseScale | Self::ActivePyramidLevel
+            Self::NoiseFrequency
+                | Self::NoiseScale
+                | Self::ReferenceDetailScale
+                | Self::FeatureSize
+                | Self::SourceDetailSmoothing
+                | Self::GeologicalAge
         )
     }
 }
@@ -167,8 +173,12 @@ impl Plugin for ErosionParamsPlugin {
     }
 }
 
-fn spawn_erosion_params_panel(params: Res<ErodeParams>, mut commands: Commands) {
-    commands.spawn_scene(erosion_params_panel(params.clone()));
+fn spawn_erosion_params_panel(
+    params: Res<ErodeParams>,
+    sim: Res<SimControl>,
+    mut commands: Commands,
+) {
+    commands.spawn_scene(erosion_params_panel(params.clone(), sim.clone()));
 }
 
 fn init_param_checkboxes(
@@ -189,7 +199,7 @@ fn init_param_checkboxes(
     }
 }
 
-fn erosion_params_panel(params: ErodeParams) -> impl Scene {
+fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
     bsn! {
         Node {
             position_type: PositionType::Absolute,
@@ -230,13 +240,19 @@ fn erosion_params_panel(params: ErodeParams) -> impl Scene {
             slider_row("Erosion Amount", 0.0, 1.0, params.erosion_amount, ErosionSliderFieldKind::ErosionAmount),
             slider_row("Reference Detail Scale", 0.25, 4.0, params.detail_scale, ErosionSliderFieldKind::ReferenceDetailScale),
             section_label("Pyramid"),
-            pyramid_info_row(params.pyramid_level_count, active_pyramid_level_size(&params)),
-            slider_row_int(
-                "Pyramid Level",
-                0.0,
-                (params.pyramid_level_count.saturating_sub(1)).max(0) as f32,
-                params.active_pyramid_level as f32,
-                ErosionSliderFieldKind::ActivePyramidLevel,
+            pyramid_info_row(params.pyramid_levels().len()),
+            slider_row("Feature Size", 0.5, 64.0, params.feature_size, ErosionSliderFieldKind::FeatureSize),
+            slider_row("Detail Smoothing", 0.0, 4.0, params.source_detail_smoothing, ErosionSliderFieldKind::SourceDetailSmoothing),
+            slider_row("Geological Age", 0.0, 50.0, params.geological_age, ErosionSliderFieldKind::GeologicalAge),
+            slider_row_int("Iterations / Frame", 1.0, 64.0, sim.iterations_per_frame as f32, ErosionSliderFieldKind::IterationsPerFrame),
+            (
+                @FeathersCheckbox {
+                    @caption: bsn! { (Text("Continue At Finest") ThemedText) },
+                }
+                on(checkbox_self_update)
+                on(|change: On<ValueChange<bool>>, mut sim: ResMut<SimControl>| {
+                    sim.continue_after_cascade = change.value;
+                })
             ),
             section_label("Angles (°)"),
             slider_row("Wear Angle", 0.0, 90.0, params.wear_angle, ErosionSliderFieldKind::WearAngle),
@@ -350,7 +366,7 @@ fn header_controls() -> impl Scene {
     }
 }
 
-fn pyramid_info_row(level_count: u32, level_size: bevy::prelude::UVec2) -> impl Scene {
+fn pyramid_info_row(level_count: usize) -> impl Scene {
     bsn! {
         Node {
             display: Display::Flex,
@@ -382,9 +398,9 @@ fn pyramid_info_row(level_count: u32, level_size: bevy::prelude::UVec2) -> impl 
                 }
                 ThemedText
                 Children [(
-                    Text(format!("Resolution: {}×{}", level_size.x, level_size.y))
+                    Text("Level –")
                     ThemedText
-                    PyramidResolutionText
+                    PyramidStatusText
                 )]
             ),
         ]
@@ -433,10 +449,9 @@ fn slider_row_int(
                     SliderStep(1.0)
                     SliderPrecision(0)
                     ErosionSliderField
-                    ActivePyramidLevelSlider
                     on(slider_self_update)
-                    on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
-                        field.apply(&mut params, change.value);
+                    on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut reset: ResMut<ResetSim>| {
+                        field.apply(&mut params, &mut sim, change.value);
                         if field.resets_sim() {
                             reset.generation = reset.generation.wrapping_add(1);
                         }
@@ -449,33 +464,36 @@ fn slider_row_int(
 
 fn update_pyramid_ui_labels(
     params: Res<ErodeParams>,
-    mut commands: Commands,
-    mut count_q: Query<&mut Text, (With<PyramidLevelCountText>, Without<PyramidResolutionText>)>,
-    mut resolution_q: Query<
-        &mut Text,
-        (With<PyramidResolutionText>, Without<PyramidLevelCountText>),
-    >,
-    slider_q: Query<Entity, With<ActivePyramidLevelSlider>>,
+    progress: Res<PyramidProgress>,
+    mut count_q: Query<&mut Text, (With<PyramidLevelCountText>, Without<PyramidStatusText>)>,
+    mut status_q: Query<&mut Text, (With<PyramidStatusText>, Without<PyramidLevelCountText>)>,
 ) {
-    if !params.is_changed() {
+    if params.is_changed() {
+        if let Ok(mut text) = count_q.single_mut() {
+            **text = format!("Pyramid Levels: {}", params.pyramid_levels().len());
+        }
+    }
+    let p = progress.get();
+    if p.level_count == 0 {
         return;
     }
-    let level_count = compute_pyramid_level_count(params.map_size, params.detail_scale);
-    let level_size = active_pyramid_level_size(&params);
-    let max_level = level_count.saturating_sub(1) as f32;
-    let clamped_level = params.active_pyramid_level.min(level_count.saturating_sub(1)) as f32;
-
-    if let Ok(mut text) = count_q.single_mut() {
-        **text = format!("Pyramid Levels: {level_count}");
-    }
-    if let Ok(mut text) = resolution_q.single_mut() {
-        **text = format!("Resolution: {}×{}", level_size.x, level_size.y);
-    }
-    if let Ok(entity) = slider_q.single() {
-        commands.entity(entity).insert((
-            SliderRange::new(0.0, max_level),
-            SliderValue(clamped_level),
-        ));
+    let status = if p.finished {
+        format!("Done · {}×{}", p.size.x, p.size.y)
+    } else {
+        format!(
+            "Level {}/{} · {}×{} · {}/{}",
+            p.level + 1,
+            p.level_count,
+            p.size.x,
+            p.size.y,
+            p.batch_iter,
+            p.batch_len
+        )
+    };
+    if let Ok(mut text) = status_q.single_mut() {
+        if **text != status {
+            **text = status;
+        }
     }
 }
 
@@ -539,8 +557,8 @@ fn slider_row(
                     SliderPrecision(3)
                     ErosionSliderField
                     on(slider_self_update)
-                    on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
-                        field.apply(&mut params, change.value);
+                    on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut reset: ResMut<ResetSim>| {
+                        field.apply(&mut params, &mut sim, change.value);
                         if field.resets_sim() {
                             reset.generation = reset.generation.wrapping_add(1);
                         }

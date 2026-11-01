@@ -9,7 +9,9 @@ use bevy::{
         render_asset::RenderAssets,
         render_resource::{
             TextureFormat, TextureUsages,
-            binding_types::{storage_buffer, storage_buffer_read_only, texture_storage_2d, uniform_buffer},
+            binding_types::{
+                storage_buffer, storage_buffer_read_only, texture_storage_2d, uniform_buffer,
+            },
             *,
         },
         renderer::{RenderContext, RenderDevice, RenderGraph, RenderQueue},
@@ -17,7 +19,10 @@ use bevy::{
     },
     shader::{ShaderCacheError, ShaderRef},
 };
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    sync::{Arc, Mutex},
+};
 
 pub mod camera;
 pub mod sun;
@@ -27,104 +32,239 @@ pub mod ui;
 
 const EROSION_SHADER: &str = "erosion.wgsl";
 const PYRAMID_RESAMPLE_SHADER: &str = "pyramid_resample.wgsl";
-/// Erode dispatches per `writeBack` at geological age 0 (all modes).
+const PYRAMID_RIVERS_SHADER: &str = "pyramid_rivers.wgsl";
+/// Erode dispatches per `writeBack` at geological age 0 (`Compute_Erosion.iterations`).
 const ERODE_ITERS_PER_WRITEBACK: u32 = 200;
 const TERRAIN_SHADER: &str = "terrain_extended.wgsl";
-const PYRAMID_MIN_SIZE: u32 = 8;
+/// Smallest grid the cascade will seed from (caps the level count on small maps).
+const PYRAMID_MIN_SIZE: u32 = 4;
 
-/// KTT `Iterations` before deduplicating clamped resolutions (`Compute_Padding`).
-fn compute_pyramid_raw_level_count(map_size: UVec2, detail_scale: f32) -> u32 {
-    let min_res = map_size.x.min(map_size.y) as f32;
-    let scale = detail_scale.max(0.001);
-    let raw = (scale * min_res).log2() + 1.0;
-    (raw.max(1.0).min(8.0)).ceil() as u32
+/// One eroded resolution of the KTT coarse-to-fine cascade (see `ref/KTT_PYRAMID.md`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PyramidLevel {
+    pub size: UVec2,
+    /// Voxel size in base-resolution voxels (1 at the finest level).
+    pub voxel_size: f32,
+    /// Erosion dispatches before this level's `writeBack`.
+    pub iterations: u32,
+    /// `Trail_Density` multiplier (fades in a fractional coarsest level).
+    pub trail_weight: f32,
 }
 
-/// Coarsest pyramid resolution (`heightfield_resample1` with `resscale = pow(0.5, ceil(Iterations))`).
-pub fn pyramid_coarsest_size(base: UVec2, detail_scale: f32) -> UVec2 {
-    let steps = compute_pyramid_raw_level_count(base, detail_scale);
-    let div = 1u32 << steps.min(31);
-    UVec2::new(
-        (base.x / div).max(PYRAMID_MIN_SIZE),
-        (base.y / div).max(PYRAMID_MIN_SIZE),
-    )
+/// KTT `Iterations` (`Compute_Padding`): `log2(Feature_Size * Detail_Scale / voxel) + 1`, voxel = 1.
+pub fn pyramid_level_fraction(feature_size: f32, detail_scale: f32) -> f32 {
+    let detail_size = (feature_size * detail_scale).max(1e-3);
+    (detail_size.log2() + 1.0).max(1.0)
 }
 
-/// KTT pyramid level count (`Iterations`), after merging repeat slots that share a resolution.
-pub fn compute_pyramid_level_count(map_size: UVec2, detail_scale: f32) -> u32 {
-    pyramid_level_sizes(map_size, detail_scale).len() as u32
-}
-
-/// Distinct pyramid resolutions, coarsest first.
+/// Eroded pyramid levels, coarsest first; the last one is always `base`.
 ///
-/// Matches KTT's repeat block: initial downscale to [`pyramid_coarsest_size`], then each repeat
-/// iteration doubles resolution (`heightfield_resample` with `resscale = 2`) before eroding.
-pub fn pyramid_level_sizes(base: UVec2, detail_scale: f32) -> Vec<UVec2> {
-    let raw_count = compute_pyramid_raw_level_count(base, detail_scale);
-    let coarsest = pyramid_coarsest_size(base, detail_scale);
-    let mut sizes = Vec::with_capacity(raw_count as usize);
-    for level in 0..raw_count {
-        let mult = 1u32 << level.min(31);
-        let size = UVec2::new(
-            (coarsest.x * mult).min(base.x),
-            (coarsest.y * mult).min(base.y),
-        );
-        if sizes.last().copied() != Some(size) {
-            sizes.push(size);
-        }
-    }
-    if sizes.is_empty() {
-        sizes.push(base);
-    }
-    sizes
+/// `repeat_begin1` starts from `base / 2^ceil(Iterations)` and doubles the resolution before each
+/// of its `ceil(Iterations)` erosion passes. Non-divisible sizes are rounded up instead of padded.
+pub fn pyramid_levels(
+    base: UVec2,
+    feature_size: f32,
+    detail_scale: f32,
+    geological_age: f32,
+) -> Vec<PyramidLevel> {
+    let levels = pyramid_level_fraction(feature_size, detail_scale);
+    let max_steps = (base.min_element().max(PYRAMID_MIN_SIZE) / PYRAMID_MIN_SIZE).ilog2() + 1;
+    let wanted_steps = levels.ceil() as u32;
+    let steps = wanted_steps.min(max_steps).max(1);
+    // Compute_Erosion "Trail Density": frac(Iterations)^2 + (integral ? 1 : 0) on the first pass.
+    let frac = levels - levels.floor();
+    let first_weight = if steps < wanted_steps || frac == 0.0 {
+        1.0
+    } else {
+        frac * frac
+    };
+    let scale = detail_scale.max(1e-3);
+    (0..steps)
+        .rev()
+        .enumerate()
+        .map(|(pass, k)| {
+            let div = 1u32 << k;
+            let size = UVec2::new(base.x.div_ceil(div), base.y.div_ceil(div));
+            let voxel_size = base.x as f32 / size.x as f32;
+            let voxel_scale = (voxel_size / scale).max(1.0);
+            let iterations = (ERODE_ITERS_PER_WRITEBACK as f32
+                * voxel_scale.powf(geological_age / 10.0))
+            .round()
+            .max(1.0) as u32;
+            PyramidLevel {
+                size,
+                voxel_size,
+                iterations,
+                trail_weight: if pass == 0 { first_weight } else { 1.0 },
+            }
+        })
+        .collect()
 }
 
-/// Level 0 = coarsest, finest = full base resolution.
-pub fn pyramid_level_size(base: UVec2, level: u32, detail_scale: f32) -> UVec2 {
-    let sizes = pyramid_level_sizes(base, detail_scale);
-    let idx = (level as usize).min(sizes.len().saturating_sub(1));
-    sizes[idx]
-}
-
-/// Effective `Detail_Scale` for a pyramid level (larger voxels at coarser levels).
-pub fn pyramid_effective_detail_scale(base: UVec2, level: UVec2, detail_scale: f32) -> f32 {
-    detail_scale * (level.x as f32 / base.x as f32)
-}
-
-pub fn is_finest_pyramid_level(params: &ErodeParams) -> bool {
-    params.active_pyramid_level >= params.pyramid_level_count.saturating_sub(1)
-}
-
-pub fn active_pyramid_level_size(params: &ErodeParams) -> UVec2 {
-    pyramid_level_size(
-        params.map_size,
-        params.active_pyramid_level,
-        params.detail_scale,
-    )
-}
-
-pub fn level_erode_params(base: &ErodeParams, iteration: u32) -> ErodeParams {
-    let level_size = active_pyramid_level_size(base);
+/// `ErodeParams` for one dispatch at `level`.
+pub fn level_erode_params(base: &ErodeParams, level: &PyramidLevel, iteration: u32) -> ErodeParams {
     ErodeParams {
-        map_size: level_size,
-        num_particles: (level_size.x * level_size.y) as u32,
-        detail_scale: pyramid_effective_detail_scale(base.map_size, level_size, base.detail_scale),
+        map_size: level.size,
+        num_particles: level.size.x * level.size.y,
         iteration,
+        num_iterations: level.iterations,
+        voxel_size: level.voxel_size,
+        trail_weight: level.trail_weight,
         ..base.clone()
     }
 }
 
+/// Uniform for the level-transition passes (`pyramid_resample.wgsl`, `pyramid_rivers.wgsl`).
 #[derive(Clone, Copy, ShaderType)]
 pub struct PyramidResampleParams {
     pub src_size: UVec2,
     pub dst_size: UVec2,
-    pub _pad: UVec2,
+    pub orig_size: UVec2,
+    /// 1 when seeding the first level (no previous level to upsample).
+    pub first_level: u32,
+    pub dst_voxel_size: f32,
+    /// KTT `Source_Terrain_Detail_Smoothing`.
+    pub detail_smoothing: f32,
 }
 
 #[derive(Clone, Copy, ShaderType)]
 pub struct BlitDisplayParams {
     pub display_size: UVec2,
     pub _pad: UVec2,
+}
+
+/// One unit of GPU work produced by [`Cascade::advance`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CascadeStep {
+    /// Generate the source terrain.
+    Init,
+    /// Build work set `dst` for `level` from the source terrain and work set `src`.
+    Seed {
+        src: usize,
+        dst: usize,
+        level: usize,
+    },
+    Erode {
+        set: usize,
+        level: usize,
+        iteration: u32,
+    },
+    WriteBack {
+        set: usize,
+        level: usize,
+        iteration: u32,
+    },
+}
+
+/// Host-side state of the coarse-to-fine erosion cascade.
+#[derive(Clone, Debug, Default)]
+pub struct Cascade {
+    pub levels: Vec<PyramidLevel>,
+    pub level: usize,
+    /// Erode dispatches issued in the current `writeBack` batch.
+    pub batch_iter: u32,
+    /// Iterations of earlier batches at this level (only when continuing past the cascade).
+    pub iteration_base: u32,
+    /// Work set holding the current level.
+    pub current: usize,
+    pub finished: bool,
+    pub needs_init: bool,
+}
+
+impl Cascade {
+    pub fn restart(&mut self, levels: Vec<PyramidLevel>) {
+        *self = Self {
+            levels,
+            needs_init: true,
+            ..default()
+        };
+    }
+
+    pub fn current_level(&self) -> Option<&PyramidLevel> {
+        self.levels.get(self.level)
+    }
+
+    /// Emits up to `budget` erosion iterations (plus the init / seed / writeBack work around them).
+    ///
+    /// Stops after a level transition so a frame never needs two different seed uniforms.
+    pub fn advance(
+        &mut self,
+        mut budget: u32,
+        ridge_enabled: bool,
+        continue_after_cascade: bool,
+        out: &mut Vec<CascadeStep>,
+    ) {
+        if self.levels.is_empty() {
+            return;
+        }
+        if self.needs_init {
+            self.needs_init = false;
+            out.push(CascadeStep::Init);
+            out.push(CascadeStep::Seed {
+                src: 1,
+                dst: 0,
+                level: 0,
+            });
+        }
+        while budget > 0 && !self.finished {
+            let level = self.levels[self.level];
+            let iteration = self.iteration_base + self.batch_iter;
+            if ridge_enabled || iteration % 2 == 1 {
+                out.push(CascadeStep::Erode {
+                    set: self.current,
+                    level: self.level,
+                    iteration,
+                });
+            }
+            self.batch_iter += 1;
+            budget -= 1;
+            if self.batch_iter < level.iterations {
+                continue;
+            }
+            out.push(CascadeStep::WriteBack {
+                set: self.current,
+                level: self.level,
+                iteration: iteration,
+            });
+            self.batch_iter = 0;
+            if self.level + 1 < self.levels.len() {
+                self.level += 1;
+                self.iteration_base = 0;
+                let dst = 1 - self.current;
+                out.push(CascadeStep::Seed {
+                    src: self.current,
+                    dst,
+                    level: self.level,
+                });
+                self.current = dst;
+                break;
+            } else if continue_after_cascade {
+                self.iteration_base += level.iterations;
+            } else {
+                self.finished = true;
+            }
+        }
+    }
+}
+
+/// Cascade progress shared with the main world (for UI / logging).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PyramidProgressData {
+    pub level: usize,
+    pub level_count: usize,
+    pub size: UVec2,
+    pub batch_iter: u32,
+    pub batch_len: u32,
+    pub finished: bool,
+}
+
+#[derive(Resource, Clone, Default)]
+pub struct PyramidProgress(pub Arc<Mutex<PyramidProgressData>>);
+
+impl PyramidProgress {
+    pub fn get(&self) -> PyramidProgressData {
+        *self.0.lock().unwrap()
+    }
 }
 
 /// Resource containing handles to all erosion-related images
@@ -296,10 +436,16 @@ pub struct ErodeParams {
     /// Bevy-only: initial height FBM (not an erosion simulation parm).
     pub noise_frequency: f32,
     pub noise_scale: f32,
-    /// UI-selected pyramid level (0 = coarsest).
-    pub active_pyramid_level: u32,
-    /// Computed from map size and detail scale (KTT `Iterations`).
-    pub pyramid_level_count: u32,
+    /// Reference parm `Feature_Size` (in base voxels); sets the pyramid level count.
+    pub feature_size: f32,
+    /// Reference parm `Source_Terrain_Detail_Smoothing` (`Smooth_Flows`).
+    pub source_detail_smoothing: f32,
+    /// Reference parm `Geological_Age`; scales per-level batch size.
+    pub geological_age: f32,
+    /// Per-dispatch: level voxel size in base voxels (kernel `dx = voxel_size / Detail_Scale`).
+    pub voxel_size: f32,
+    /// Per-dispatch: `Trail_Density` multiplier for the current level.
+    pub trail_weight: f32,
 }
 
 impl Default for ErodeParams {
@@ -349,9 +495,24 @@ impl Default for ErodeParams {
             uplift: 0.0, // Uplift_Amount
             noise_frequency: 0.005,
             noise_scale: 1.5,
-            active_pyramid_level: 0,
-            pyramid_level_count: compute_pyramid_level_count(UVec2::new(512, 512), 1.0),
+            feature_size: 8.0,            // Feature_Size
+            source_detail_smoothing: 1.0, // Source_Terrain_Detail_Smoothing
+            geological_age: 0.0,          // Geological_Age
+            voxel_size: 1.0,
+            trail_weight: 1.0,
         }
+    }
+}
+
+impl ErodeParams {
+    /// Pyramid levels for the current settings.
+    pub fn pyramid_levels(&self) -> Vec<PyramidLevel> {
+        pyramid_levels(
+            self.map_size,
+            self.feature_size,
+            self.detail_scale,
+            self.geological_age,
+        )
     }
 }
 
@@ -362,10 +523,25 @@ pub struct ResetSim {
 }
 
 /// Resource to control simulation state
-#[derive(Resource, Clone, ExtractResource, Default)]
+#[derive(Resource, Clone, ExtractResource)]
 pub struct SimControl {
     pub paused: bool,
     pub step_counter: u64,
+    /// Erosion dispatches per frame while running.
+    pub iterations_per_frame: u32,
+    /// Keep eroding the finest level in `writeBack` batches once the cascade is done.
+    pub continue_after_cascade: bool,
+}
+
+impl Default for SimControl {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            step_counter: 0,
+            iterations_per_frame: 4,
+            continue_after_cascade: false,
+        }
+    }
 }
 
 /// User-facing configuration for the erosion simulation.
@@ -392,27 +568,15 @@ impl Default for ErosionConfig {
 impl ErosionConfig {
     /// Produces `ErodeParams` for the GPU.
     pub fn to_erode_params(&self, iteration: u32) -> ErodeParams {
-        let num_particles = (self.map_size.x * self.map_size.y) as u32;
-        let pyramid_level_count =
-            compute_pyramid_level_count(self.map_size, self.reference_detail_scale);
         ErodeParams {
             map_size: self.map_size,
-            num_particles,
+            num_particles: self.map_size.x * self.map_size.y,
             iteration,
             num_iterations: ERODE_ITERS_PER_WRITEBACK,
             detail_scale: self.reference_detail_scale,
             erosion_amount: self.erosion_amount,
-            pyramid_level_count,
             ..Default::default()
         }
-    }
-}
-
-fn sync_pyramid_levels(mut params: ResMut<ErodeParams>) {
-    let count = compute_pyramid_level_count(params.map_size, params.detail_scale);
-    params.pyramid_level_count = count;
-    if params.active_pyramid_level >= count {
-        params.active_pyramid_level = count.saturating_sub(1);
     }
 }
 
@@ -433,27 +597,31 @@ fn setup_erosion_resources(
 
 impl Plugin for ErosionComputePlugin {
     fn build(&self, app: &mut App) {
+        let progress = PyramidProgress::default();
         app.init_resource::<ErosionConfig>()
+            .insert_resource(progress.clone())
             .add_plugins((
                 ExtractResourcePlugin::<ErosionImages>::default(),
                 ExtractResourcePlugin::<ErodeParams>::default(),
                 ExtractResourcePlugin::<ResetSim>::default(),
                 ExtractResourcePlugin::<SimControl>::default(),
             ))
-            .add_systems(Startup, setup_erosion_resources)
-            .add_systems(PostUpdate, sync_pyramid_levels);
+            .add_systems(Startup, setup_erosion_resources);
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
         render_app
+            .insert_resource(progress)
             .init_resource::<ErosionState>()
             .add_systems(RenderStartup, init_erosion_pipeline)
             .add_systems(
                 Render,
                 (
+                    (prepare_erosion_buffers, plan_erosion_frame)
+                        .chain()
+                        .in_set(RenderSystems::PrepareResources),
                     prepare_erosion_bind_groups.in_set(RenderSystems::PrepareBindGroups),
-                    update_erosion_state.in_set(RenderSystems::Prepare),
                 ),
             )
             .add_systems(RenderGraph, erosion_compute.before(camera_driver));
@@ -467,53 +635,35 @@ struct ErosionPipeline {
     layout_blit: BindGroupLayoutDescriptor,
     layout_blit_blur: BindGroupLayoutDescriptor,
     layout_blit_level: BindGroupLayoutDescriptor,
-    layout_resample: BindGroupLayoutDescriptor,
+    layout_upscale_height: BindGroupLayoutDescriptor,
+    layout_upscale_rivers: BindGroupLayoutDescriptor,
     pipeline_init: CachedComputePipelineId,
     pipeline_init_color: CachedComputePipelineId,
     pipeline_erode: CachedComputePipelineId,
     pipeline_write_back: CachedComputePipelineId,
     pipeline_blit: CachedComputePipelineId,
     pipeline_blit_level: CachedComputePipelineId,
-    pipeline_clear_level: CachedComputePipelineId,
-    pipeline_pyramid_downscale: CachedComputePipelineId,
+    pipeline_upscale_height: CachedComputePipelineId,
+    pipeline_upscale_rivers: CachedComputePipelineId,
     pipeline_ao: CachedComputePipelineId,
     pipeline_blur_h: CachedComputePipelineId,
     pipeline_blur_v: CachedComputePipelineId,
 }
 
-#[derive(Resource)]
-struct ErosionBindGroups {
-    erosion: BindGroup,
-    level_erosion: Option<BindGroup>,
-    downscale: Option<BindGroup>,
-    level_blit: Option<BindGroup>,
-    color: BindGroup,
-    blit: BindGroup,
-    blit_blur: BindGroup,
-}
-
-#[derive(Resource)]
-struct ErosionBuffers {
-    uniform: UniformBuffer<ErodeParams>,
-    level_uniform: UniformBuffer<ErodeParams>,
-    blit_display: UniformBuffer<BlitDisplayParams>,
-    downscale_params: UniformBuffer<PyramidResampleParams>,
-    height: StorageBuffer<Vec<u32>>,
-    macc: StorageBuffer<Vec<u32>>,
-    flow: StorageBuffer<Vec<u32>>,
-    deposition: StorageBuffer<Vec<i32>>,
-    erosion: StorageBuffer<Vec<u32>>,
-    mx: StorageBuffer<Vec<i32>>,
-    my: StorageBuffer<Vec<i32>>,
-    height_work: Option<StorageBuffer<Vec<u32>>>,
-    macc_work: Option<StorageBuffer<Vec<u32>>>,
-    flow_work: Option<StorageBuffer<Vec<u32>>>,
-    deposition_work: Option<StorageBuffer<Vec<i32>>>,
-    erosion_work: Option<StorageBuffer<Vec<u32>>>,
-    mx_work: Option<StorageBuffer<Vec<i32>>>,
-    my_work: Option<StorageBuffer<Vec<i32>>>,
-    active_pyramid_level: u32,
-    work_texels: usize,
+impl ErosionPipeline {
+    /// Pipelines the cascade needs before it can start.
+    fn required(&self) -> [CachedComputePipelineId; 8] {
+        [
+            self.pipeline_init,
+            self.pipeline_init_color,
+            self.pipeline_erode,
+            self.pipeline_write_back,
+            self.pipeline_blit,
+            self.pipeline_blit_level,
+            self.pipeline_upscale_height,
+            self.pipeline_upscale_rivers,
+        ]
+    }
 }
 
 fn init_erosion_pipeline(
@@ -521,14 +671,14 @@ fn init_erosion_pipeline(
     asset_server: Res<AssetServer>,
     pipeline_cache: Res<PipelineCache>,
 ) {
-    // Layout for erosion (group 0)
+    // Layout for erosion (group 0); the params uniform uses a dynamic offset per dispatch.
     let layout_erosion = BindGroupLayoutDescriptor::new(
         "ErosionGroup0",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
                 storage_buffer::<u32>(false), // height (atomic<u32> in shader, fixed-point)
-                uniform_buffer::<ErodeParams>(false),
+                uniform_buffer::<ErodeParams>(true),
                 storage_buffer::<u32>(false), // macc (atomic<u32> in shader)
                 storage_buffer::<u32>(false), // flow (atomic<u32> in shader)
                 storage_buffer::<i32>(false), // deposition (atomic<i32> in shader)
@@ -576,13 +726,36 @@ fn init_erosion_pipeline(
         ),
     );
 
-    let layout_resample = BindGroupLayoutDescriptor::new(
-        "PyramidResampleLayout",
+    // Level transition: height + deposition (Update_Upscaled_Fields + Smooth_Flows).
+    let layout_upscale_height = BindGroupLayoutDescriptor::new(
+        "PyramidUpscaleHeight",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                storage_buffer_read_only::<u32>(false),
-                storage_buffer::<u32>(false),
+                storage_buffer_read_only::<u32>(false), // src height
+                storage_buffer_read_only::<i32>(false), // src deposition
+                storage_buffer_read_only::<u32>(false), // source terrain height
+                storage_buffer::<u32>(false),           // dst height
+                storage_buffer::<i32>(false),           // dst deposition
+                uniform_buffer::<PyramidResampleParams>(false),
+            ),
+        ),
+    );
+
+    // Level transition: river momentum fields, and clearing of per-level analysis buffers.
+    let layout_upscale_rivers = BindGroupLayoutDescriptor::new(
+        "PyramidUpscaleRivers",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                storage_buffer_read_only::<u32>(false), // src macc
+                storage_buffer_read_only::<i32>(false), // src mx
+                storage_buffer_read_only::<i32>(false), // src my
+                storage_buffer::<u32>(false),           // dst macc
+                storage_buffer::<i32>(false),           // dst mx
+                storage_buffer::<i32>(false),           // dst my
+                storage_buffer::<u32>(false),           // dst flow
+                storage_buffer::<u32>(false),           // dst erosion
                 uniform_buffer::<PyramidResampleParams>(false),
             ),
         ),
@@ -601,78 +774,66 @@ fn init_erosion_pipeline(
     );
 
     let shader = asset_server.load(EROSION_SHADER);
-    let pyramid_shader = asset_server.load(PYRAMID_RESAMPLE_SHADER);
-    let pipeline_init = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        layout: vec![layout_erosion.clone()],
-        shader: shader.clone(),
-        entry_point: Some(Cow::from("init_fbm")),
-        ..default()
-    });
-    let pipeline_init_color = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        layout: vec![layout_erosion.clone(), layout_color.clone()],
-        shader: shader.clone(),
-        entry_point: Some(Cow::from("init_color_bands")),
-        ..default()
-    });
-    let pipeline_erode = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        layout: vec![layout_erosion.clone(), layout_color.clone()],
-        shader: shader.clone(),
-        entry_point: Some(Cow::from("erode")),
-        ..default()
-    });
-    let pipeline_write_back = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        layout: vec![layout_erosion.clone()],
-        shader: shader.clone(),
-        entry_point: Some(Cow::from("write_back")),
-        ..default()
-    });
-    let pipeline_blit = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        layout: vec![layout_erosion.clone(), layout_blit.clone()],
-        shader: shader.clone(),
-        entry_point: Some(Cow::from("blit_to_texture")),
-        ..default()
-    });
-    let pipeline_blit_level = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        layout: vec![
+    let compute =
+        |layout: Vec<BindGroupLayoutDescriptor>, shader: &Handle<Shader>, entry: &'static str| {
+            pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                layout,
+                shader: shader.clone(),
+                entry_point: Some(Cow::from(entry)),
+                ..default()
+            })
+        };
+    let pipeline_init = compute(vec![layout_erosion.clone()], &shader, "init_fbm");
+    let pipeline_init_color = compute(
+        vec![layout_erosion.clone(), layout_color.clone()],
+        &shader,
+        "init_color_bands",
+    );
+    let pipeline_erode = compute(
+        vec![layout_erosion.clone(), layout_color.clone()],
+        &shader,
+        "erode",
+    );
+    let pipeline_write_back = compute(vec![layout_erosion.clone()], &shader, "write_back");
+    let pipeline_blit = compute(
+        vec![layout_erosion.clone(), layout_blit.clone()],
+        &shader,
+        "blit_to_texture",
+    );
+    let pipeline_blit_level = compute(
+        vec![
             layout_erosion.clone(),
             layout_blit.clone(),
             layout_blit_level.clone(),
         ],
-        shader: shader.clone(),
-        entry_point: Some(Cow::from("blit_level_to_display")),
-        ..default()
-    });
-    let pipeline_clear_level = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        layout: vec![layout_erosion.clone()],
-        shader: shader.clone(),
-        entry_point: Some(Cow::from("clear_level_buffers")),
-        ..default()
-    });
-    let pipeline_pyramid_downscale =
-        pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            layout: vec![layout_resample.clone()],
-            shader: pyramid_shader,
-            entry_point: Some(Cow::from("pyramid_downscale")),
-            ..default()
-        });
-    let pipeline_ao = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        layout: vec![layout_erosion.clone(), layout_blit.clone()],
-        shader: shader.clone(),
-        entry_point: Some(Cow::from("compute_ao")),
-        ..default()
-    });
-    let pipeline_blur_h = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        layout: vec![layout_erosion.clone(), layout_blit_blur.clone()],
-        shader: shader.clone(),
-        entry_point: Some(Cow::from("blur_ao_horizontal")),
-        ..default()
-    });
-    let pipeline_blur_v = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        layout: vec![layout_erosion.clone(), layout_blit_blur.clone()],
-        shader,
-        entry_point: Some(Cow::from("blur_ao_vertical")),
-        ..default()
-    });
+        &shader,
+        "blit_level_to_display",
+    );
+    let pipeline_upscale_height = compute(
+        vec![layout_upscale_height.clone()],
+        &asset_server.load(PYRAMID_RESAMPLE_SHADER),
+        "pyramid_upscale_height",
+    );
+    let pipeline_upscale_rivers = compute(
+        vec![layout_upscale_rivers.clone()],
+        &asset_server.load(PYRAMID_RIVERS_SHADER),
+        "pyramid_upscale_rivers",
+    );
+    let pipeline_ao = compute(
+        vec![layout_erosion.clone(), layout_blit.clone()],
+        &shader,
+        "compute_ao",
+    );
+    let pipeline_blur_h = compute(
+        vec![layout_erosion.clone(), layout_blit_blur.clone()],
+        &shader,
+        "blur_ao_horizontal",
+    );
+    let pipeline_blur_v = compute(
+        vec![layout_erosion.clone(), layout_blit_blur.clone()],
+        &shader,
+        "blur_ao_vertical",
+    );
 
     commands.insert_resource(ErosionPipeline {
         layout_erosion,
@@ -680,104 +841,111 @@ fn init_erosion_pipeline(
         layout_blit,
         layout_blit_blur,
         layout_blit_level,
-        layout_resample,
+        layout_upscale_height,
+        layout_upscale_rivers,
         pipeline_init,
         pipeline_init_color,
         pipeline_erode,
         pipeline_write_back,
         pipeline_blit,
         pipeline_blit_level,
-        pipeline_clear_level,
-        pipeline_pyramid_downscale,
+        pipeline_upscale_height,
+        pipeline_upscale_rivers,
         pipeline_ao,
         pipeline_blur_h,
         pipeline_blur_v,
     });
 }
 
-fn create_work_buffers(
-    work_texels: usize,
-    render_device: &RenderDevice,
-    queue: &RenderQueue,
-) -> (
-    StorageBuffer<Vec<u32>>,
-    StorageBuffer<Vec<u32>>,
-    StorageBuffer<Vec<u32>>,
-    StorageBuffer<Vec<i32>>,
-    StorageBuffer<Vec<u32>>,
-    StorageBuffer<Vec<i32>>,
-    StorageBuffer<Vec<i32>>,
-) {
-    let mut height_work = StorageBuffer::from(vec![0u32; work_texels]);
-    height_work.write_buffer(render_device, queue);
-    let mut macc_work = StorageBuffer::from(vec![0u32; work_texels]);
-    macc_work.write_buffer(render_device, queue);
-    let mut flow_work = StorageBuffer::from(vec![0u32; work_texels]);
-    flow_work.write_buffer(render_device, queue);
-    let mut deposition_work = StorageBuffer::from(vec![0i32; work_texels]);
-    deposition_work.write_buffer(render_device, queue);
-    let mut erosion_work = StorageBuffer::from(vec![0u32; work_texels]);
-    erosion_work.write_buffer(render_device, queue);
-    let mut mx_work = StorageBuffer::from(vec![0i32; work_texels]);
-    mx_work.write_buffer(render_device, queue);
-    let mut my_work = StorageBuffer::from(vec![0i32; work_texels]);
-    my_work.write_buffer(render_device, queue);
-    (
-        height_work,
-        macc_work,
-        flow_work,
-        deposition_work,
-        erosion_work,
-        mx_work,
-        my_work,
-    )
+/// One full-capacity set of simulation fields; pyramid levels index it at their own width.
+struct FieldSet {
+    height: StorageBuffer<Vec<u32>>,
+    macc: StorageBuffer<Vec<u32>>,
+    flow: StorageBuffer<Vec<u32>>,
+    deposition: StorageBuffer<Vec<i32>>,
+    erosion: StorageBuffer<Vec<u32>>,
+    mx: StorageBuffer<Vec<i32>>,
+    my: StorageBuffer<Vec<i32>>,
 }
 
-fn build_pyramid_bind_groups(
-    pipeline: &ErosionPipeline,
-    pipeline_cache: &PipelineCache,
-    render_device: &RenderDevice,
-    height: &StorageBuffer<Vec<u32>>,
-    height_work: &StorageBuffer<Vec<u32>>,
-    level_uniform: &UniformBuffer<ErodeParams>,
-    macc_work: &StorageBuffer<Vec<u32>>,
-    flow_work: &StorageBuffer<Vec<u32>>,
-    deposition_work: &StorageBuffer<Vec<i32>>,
-    erosion_work: &StorageBuffer<Vec<u32>>,
-    mx_work: &StorageBuffer<Vec<i32>>,
-    my_work: &StorageBuffer<Vec<i32>>,
-    downscale_params: &UniformBuffer<PyramidResampleParams>,
-    blit_display: &UniformBuffer<BlitDisplayParams>,
-) -> (BindGroup, BindGroup, BindGroup) {
-    let erosion_layout = pipeline_cache.get_bind_group_layout(&pipeline.layout_erosion);
-    let resample_layout = pipeline_cache.get_bind_group_layout(&pipeline.layout_resample);
-    let blit_level_layout = pipeline_cache.get_bind_group_layout(&pipeline.layout_blit_level);
+impl FieldSet {
+    fn new(texels: usize, device: &RenderDevice, queue: &RenderQueue) -> Self {
+        let mut set = Self {
+            height: StorageBuffer::from(vec![0u32; texels]),
+            macc: StorageBuffer::from(vec![0u32; texels]),
+            flow: StorageBuffer::from(vec![0u32; texels]),
+            deposition: StorageBuffer::from(vec![0i32; texels]),
+            erosion: StorageBuffer::from(vec![0u32; texels]),
+            mx: StorageBuffer::from(vec![0i32; texels]),
+            my: StorageBuffer::from(vec![0i32; texels]),
+        };
+        set.height.write_buffer(device, queue);
+        set.macc.write_buffer(device, queue);
+        set.flow.write_buffer(device, queue);
+        set.deposition.write_buffer(device, queue);
+        set.erosion.write_buffer(device, queue);
+        set.mx.write_buffer(device, queue);
+        set.my.write_buffer(device, queue);
+        set
+    }
+}
 
-    let level_erosion = render_device.create_bind_group(
-        None,
-        &erosion_layout,
-        &BindGroupEntries::sequential((
-            height_work,
-            level_uniform,
-            macc_work,
-            flow_work,
-            deposition_work,
-            erosion_work,
-            mx_work,
-            my_work,
-        )),
-    );
-    let downscale = render_device.create_bind_group(
-        None,
-        &resample_layout,
-        &BindGroupEntries::sequential((height, height_work, downscale_params)),
-    );
-    let level_blit = render_device.create_bind_group(
-        None,
-        &blit_level_layout,
-        &BindGroupEntries::sequential((blit_display,)),
-    );
-    (level_erosion, downscale, level_blit)
+/// Indices into [`ErosionBindGroups::erosion`].
+const SET_SOURCE: usize = 2;
+
+#[derive(Resource)]
+struct ErosionBuffers {
+    texels: usize,
+    /// Work sets 0/1 (ping-pong between levels) and the source terrain (index [`SET_SOURCE`]).
+    sets: [FieldSet; 3],
+    params: DynamicUniformBuffer<ErodeParams>,
+    resample_params: UniformBuffer<PyramidResampleParams>,
+    blit_display: UniformBuffer<BlitDisplayParams>,
+}
+
+#[derive(Resource)]
+struct ErosionBindGroups {
+    /// Indexed by work set / [`SET_SOURCE`].
+    erosion: [BindGroup; 3],
+    /// Indexed by destination work set (source is the other one).
+    upscale_height: [BindGroup; 2],
+    upscale_rivers: [BindGroup; 2],
+    level_blit: BindGroup,
+    color: BindGroup,
+    blit: BindGroup,
+    blit_blur: BindGroup,
+}
+
+fn prepare_erosion_buffers(
+    mut commands: Commands,
+    params: Res<ErodeParams>,
+    render_device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    existing: Option<Res<ErosionBuffers>>,
+) {
+    let texels = (params.map_size.x * params.map_size.y) as usize;
+    if existing.is_some_and(|b| b.texels == texels) {
+        return;
+    }
+    let mut blit_display = UniformBuffer::from(BlitDisplayParams {
+        display_size: params.map_size,
+        _pad: UVec2::ZERO,
+    });
+    blit_display.write_buffer(&render_device, &queue);
+    commands.insert_resource(ErosionBuffers {
+        texels,
+        sets: std::array::from_fn(|_| FieldSet::new(texels, &render_device, &queue)),
+        params: DynamicUniformBuffer::default(),
+        resample_params: UniformBuffer::from(PyramidResampleParams {
+            src_size: UVec2::ONE,
+            dst_size: UVec2::ONE,
+            orig_size: UVec2::ONE,
+            first_level: 1,
+            dst_voxel_size: 1.0,
+            detail_smoothing: 0.0,
+        }),
+        blit_display,
+    });
 }
 
 fn prepare_erosion_bind_groups(
@@ -786,68 +954,111 @@ fn prepare_erosion_bind_groups(
     pipeline_cache: Res<PipelineCache>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     images: Res<ErosionImages>,
-    params: Res<ErodeParams>,
+    buffers: Option<Res<ErosionBuffers>>,
     render_device: Res<RenderDevice>,
-    queue: Res<RenderQueue>,
-    mut existing: Option<ResMut<ErosionBuffers>>,
 ) {
-    let view_height = gpu_images.get(&images.height).unwrap();
-    let view_color = gpu_images.get(&images.color).unwrap();
-    let view_normal = gpu_images.get(&images.normal).unwrap();
-    let view_analysis = gpu_images.get(&images.analysis).unwrap();
-    let view_ao = gpu_images.get(&images.ao).unwrap();
-    let view_ao_temp = gpu_images.get(&images.ao_temp).unwrap();
-
-    let texels = (params.map_size.x * params.map_size.y) as usize;
-    let level_size = active_pyramid_level_size(&params);
-    let work_texels = (level_size.x * level_size.y) as usize;
-    let use_pyramid = !is_finest_pyramid_level(&params);
-
-    let needs_recreation = if let Some(ref buffers) = existing {
-        buffers.macc.buffer().is_none()
-            || buffers.mx.buffer().is_none()
-            || buffers.my.buffer().is_none()
-            || buffers.flow.buffer().is_none()
-            || buffers.deposition.buffer().is_none()
-            || buffers.erosion.buffer().is_none()
-            || buffers.macc.get().len() != texels
-            || buffers.flow.get().len() != texels
-            || buffers.deposition.get().len() != texels
-            || buffers.erosion.get().len() != texels
-            || buffers.active_pyramid_level != params.active_pyramid_level
-            || (use_pyramid && buffers.work_texels != work_texels)
-            || (use_pyramid && buffers.height_work.is_none())
-    } else {
-        false
+    let Some(buffers) = buffers else { return };
+    if buffers.params.buffer().is_none() {
+        return;
+    }
+    let (
+        Some(view_height),
+        Some(view_color),
+        Some(view_normal),
+        Some(view_analysis),
+        Some(view_ao),
+        Some(view_ao_temp),
+    ) = (
+        gpu_images.get(&images.height),
+        gpu_images.get(&images.color),
+        gpu_images.get(&images.normal),
+        gpu_images.get(&images.analysis),
+        gpu_images.get(&images.ao),
+        gpu_images.get(&images.ao_temp),
+    )
+    else {
+        return;
     };
 
-    if needs_recreation {
-        existing = None;
-    }
-
-    let blit = |device: &RenderDevice| {
-        device.create_bind_group(
+    let layout = |desc: &BindGroupLayoutDescriptor| pipeline_cache.get_bind_group_layout(desc);
+    let erosion = |set: &FieldSet| {
+        render_device.create_bind_group(
             None,
-            &pipeline_cache.get_bind_group_layout(&pipeline.layout_blit),
+            &layout(&pipeline.layout_erosion),
+            &BindGroupEntries::sequential((
+                &set.height,
+                &buffers.params,
+                &set.macc,
+                &set.flow,
+                &set.deposition,
+                &set.erosion,
+                &set.mx,
+                &set.my,
+            )),
+        )
+    };
+    let source = &buffers.sets[SET_SOURCE];
+    let upscale_height = |dst: usize| {
+        let (src, dst) = (&buffers.sets[1 - dst], &buffers.sets[dst]);
+        render_device.create_bind_group(
+            None,
+            &layout(&pipeline.layout_upscale_height),
+            &BindGroupEntries::sequential((
+                &src.height,
+                &src.deposition,
+                &source.height,
+                &dst.height,
+                &dst.deposition,
+                &buffers.resample_params,
+            )),
+        )
+    };
+    let upscale_rivers = |dst: usize| {
+        let (src, dst) = (&buffers.sets[1 - dst], &buffers.sets[dst]);
+        render_device.create_bind_group(
+            None,
+            &layout(&pipeline.layout_upscale_rivers),
+            &BindGroupEntries::sequential((
+                &src.macc,
+                &src.mx,
+                &src.my,
+                &dst.macc,
+                &dst.mx,
+                &dst.my,
+                &dst.flow,
+                &dst.erosion,
+                &buffers.resample_params,
+            )),
+        )
+    };
+
+    commands.insert_resource(ErosionBindGroups {
+        erosion: std::array::from_fn(|i| erosion(&buffers.sets[i])),
+        upscale_height: [upscale_height(0), upscale_height(1)],
+        upscale_rivers: [upscale_rivers(0), upscale_rivers(1)],
+        level_blit: render_device.create_bind_group(
+            None,
+            &layout(&pipeline.layout_blit_level),
+            &BindGroupEntries::sequential((&buffers.blit_display,)),
+        ),
+        color: render_device.create_bind_group(
+            None,
+            &layout(&pipeline.layout_color),
+            &BindGroupEntries::sequential((&view_color.texture_view,)),
+        ),
+        blit: render_device.create_bind_group(
+            None,
+            &layout(&pipeline.layout_blit),
             &BindGroupEntries::sequential((
                 &view_height.texture_view,
                 &view_normal.texture_view,
                 &view_analysis.texture_view,
                 &view_ao.texture_view,
             )),
-        )
-    };
-    let color = |device: &RenderDevice| {
-        device.create_bind_group(
+        ),
+        blit_blur: render_device.create_bind_group(
             None,
-            &pipeline_cache.get_bind_group_layout(&pipeline.layout_color),
-            &BindGroupEntries::sequential((&view_color.texture_view,)),
-        )
-    };
-    let blit_blur = |device: &RenderDevice| {
-        device.create_bind_group(
-            None,
-            &pipeline_cache.get_bind_group_layout(&pipeline.layout_blit_blur),
+            &layout(&pipeline.layout_blit_blur),
             &BindGroupEntries::sequential((
                 &view_height.texture_view,
                 &view_normal.texture_view,
@@ -855,525 +1066,473 @@ fn prepare_erosion_bind_groups(
                 &view_ao.texture_view,
                 &view_ao_temp.texture_view,
             )),
-        )
-    };
+        ),
+    });
+}
 
-    match existing {
-        Some(mut buffers) => {
-            *buffers.uniform.get_mut() = params.clone();
-            buffers.uniform.write_buffer(&render_device, &queue);
-            *buffers.level_uniform.get_mut() = level_erode_params(&params, 0);
-            buffers.level_uniform.write_buffer(&render_device, &queue);
-
-            let erosion = render_device.create_bind_group(
-                None,
-                &pipeline_cache.get_bind_group_layout(&pipeline.layout_erosion),
-                &BindGroupEntries::sequential((
-                    &buffers.height,
-                    &buffers.uniform,
-                    &buffers.macc,
-                    &buffers.flow,
-                    &buffers.deposition,
-                    &buffers.erosion,
-                    &buffers.mx,
-                    &buffers.my,
-                )),
-            );
-
-            let (level_erosion, downscale, level_blit) =
-                if use_pyramid {
-                    let height_work = buffers.height_work.as_ref().unwrap();
-                    let macc_work = buffers.macc_work.as_ref().unwrap();
-                    let flow_work = buffers.flow_work.as_ref().unwrap();
-                    let deposition_work = buffers.deposition_work.as_ref().unwrap();
-                    let erosion_work = buffers.erosion_work.as_ref().unwrap();
-                    let mx_work = buffers.mx_work.as_ref().unwrap();
-                    let my_work = buffers.my_work.as_ref().unwrap();
-                    let groups = build_pyramid_bind_groups(
-                        &pipeline,
-                        &pipeline_cache,
-                        &render_device,
-                        &buffers.height,
-                        height_work,
-                        &buffers.level_uniform,
-                        macc_work,
-                        flow_work,
-                        deposition_work,
-                        erosion_work,
-                        mx_work,
-                        my_work,
-                        &buffers.downscale_params,
-                        &buffers.blit_display,
-                    );
-                    (
-                        Some(groups.0),
-                        Some(groups.1),
-                        Some(groups.2),
-                    )
-                } else {
-                    (None, None, None)
-                };
-
-            commands.insert_resource(ErosionBindGroups {
-                erosion,
-                level_erosion,
-                downscale,
-                level_blit,
-                color: color(&render_device),
-                blit: blit(&render_device),
-                blit_blur: blit_blur(&render_device),
-            });
-        }
-        None => {
-            let mut uniform = UniformBuffer::from(params.clone());
-            uniform.write_buffer(&render_device, &queue);
-            let mut level_uniform = UniformBuffer::from(level_erode_params(&params, 0));
-            level_uniform.write_buffer(&render_device, &queue);
-
-            let level_size = active_pyramid_level_size(&params);
-            let mut downscale_params = UniformBuffer::from(PyramidResampleParams {
-                src_size: params.map_size,
-                dst_size: level_size,
-                _pad: UVec2::ZERO,
-            });
-            downscale_params.write_buffer(&render_device, &queue);
-
-            let mut blit_display = UniformBuffer::from(BlitDisplayParams {
-                display_size: params.map_size,
-                _pad: UVec2::ZERO,
-            });
-            blit_display.write_buffer(&render_device, &queue);
-
-            let mut height = StorageBuffer::from(vec![0u32; texels]);
-            height.write_buffer(&render_device, &queue);
-            let mut macc = StorageBuffer::from(vec![0u32; texels]);
-            macc.write_buffer(&render_device, &queue);
-            let mut flow = StorageBuffer::from(vec![0u32; texels]);
-            flow.write_buffer(&render_device, &queue);
-            let mut deposition = StorageBuffer::from(vec![0i32; texels]);
-            deposition.write_buffer(&render_device, &queue);
-            let mut erosion_buf = StorageBuffer::from(vec![0u32; texels]);
-            erosion_buf.write_buffer(&render_device, &queue);
-            let mut mx = StorageBuffer::from(vec![0i32; texels]);
-            mx.write_buffer(&render_device, &queue);
-            let mut my = StorageBuffer::from(vec![0i32; texels]);
-            my.write_buffer(&render_device, &queue);
-
-            let work_buffers = if use_pyramid {
-                Some(create_work_buffers(work_texels, &render_device, &queue))
-            } else {
-                None
-            };
-
-            let erosion_bg = render_device.create_bind_group(
-                None,
-                &pipeline_cache.get_bind_group_layout(&pipeline.layout_erosion),
-                &BindGroupEntries::sequential((
-                    &height,
-                    &uniform,
-                    &macc,
-                    &flow,
-                    &deposition,
-                    &erosion_buf,
-                    &mx,
-                    &my,
-                )),
-            );
-
-            let (level_erosion, downscale, level_blit) = if let Some((
-                ref height_work,
-                ref macc_work,
-                ref flow_work,
-                ref deposition_work,
-                ref erosion_work,
-                ref mx_work,
-                ref my_work,
-            )) = work_buffers
-            {
-                let groups = build_pyramid_bind_groups(
-                    &pipeline,
-                    &pipeline_cache,
-                    &render_device,
-                    &height,
-                    height_work,
-                    &level_uniform,
-                    macc_work,
-                    flow_work,
-                    deposition_work,
-                    erosion_work,
-                    mx_work,
-                    my_work,
-                    &downscale_params,
-                    &blit_display,
-                );
-                (Some(groups.0), Some(groups.1), Some(groups.2))
-            } else {
-                (None, None, None)
-            };
-
-            let (height_work, macc_work, flow_work, deposition_work, erosion_work, mx_work, my_work) =
-                if let Some(work) = work_buffers {
-                    work
-                } else {
-                    (
-                        StorageBuffer::from(vec![0u32; 0]),
-                        StorageBuffer::from(vec![0u32; 0]),
-                        StorageBuffer::from(vec![0u32; 0]),
-                        StorageBuffer::from(vec![0i32; 0]),
-                        StorageBuffer::from(vec![0u32; 0]),
-                        StorageBuffer::from(vec![0i32; 0]),
-                        StorageBuffer::from(vec![0i32; 0]),
-                    )
-                };
-
-            commands.insert_resource(ErosionBuffers {
-                uniform,
-                level_uniform,
-                blit_display,
-                downscale_params,
-                height,
-                macc,
-                flow,
-                deposition,
-                erosion: erosion_buf,
-                mx,
-                my,
-                height_work: use_pyramid.then_some(height_work),
-                macc_work: use_pyramid.then_some(macc_work),
-                flow_work: use_pyramid.then_some(flow_work),
-                deposition_work: use_pyramid.then_some(deposition_work),
-                erosion_work: use_pyramid.then_some(erosion_work),
-                mx_work: use_pyramid.then_some(mx_work),
-                my_work: use_pyramid.then_some(my_work),
-                active_pyramid_level: params.active_pyramid_level,
-                work_texels,
-            });
-            commands.insert_resource(ErosionBindGroups {
-                erosion: erosion_bg,
-                level_erosion,
-                downscale,
-                level_blit,
-                color: color(&render_device),
-                blit: blit(&render_device),
-                blit_blur: blit_blur(&render_device),
-            });
-        }
-    }
+/// A GPU command for this frame, with its dynamic offset into [`ErosionBuffers::params`].
+#[derive(Clone, Copy, Debug)]
+enum FrameCmd {
+    Init {
+        offset: u32,
+        size: UVec2,
+    },
+    Seed {
+        dst: usize,
+        size: UVec2,
+    },
+    Erode {
+        set: usize,
+        offset: u32,
+        particles: u32,
+    },
+    WriteBack {
+        set: usize,
+        offset: u32,
+        size: UVec2,
+    },
+    Display {
+        set: usize,
+        offset: u32,
+        finest: bool,
+    },
 }
 
 #[derive(Resource, Default)]
 struct ErosionState {
-    phase: ErosionPhase,
+    ready: bool,
     last_reset_gen: u32,
-    allow_erode_this_frame: bool,
     last_step_seen: u64,
-    opencl_iteration: u32,
-    erode_since_writeback: u32,
+    cascade: Cascade,
+    steps: Vec<CascadeStep>,
+    frame: Vec<FrameCmd>,
 }
 
-fn writeback_interval(_params: &ErodeParams) -> u32 {
-    // ~200 erosion dispatches per writeBack at geological age 0 regardless of rivers.
-    ERODE_ITERS_PER_WRITEBACK
-}
-
-/// `Detail_Bias = iteration % 2`: 0 = ridge-biased, 1 = flow-biased.
-/// See `ref/KTT_SMOOTH_FLUVIAL_EROSION.md`.
-fn detail_bias(iteration: u32) -> u32 {
-    iteration % 2
-}
-
-/// Whether `Erosion` does work for this iteration (`ref/compute_erosion.cl`).
-///
-/// ```c
-/// if (!Compute_Ridge_Erosion && !Detail_Bias) return;
-/// ```
-///
-/// When ridge erosion is off, even iterations are no-ops; the host may skip
-/// dispatch but must still advance `opencl_iteration` so batch timing matches the reference impl.
-fn erosion_pass_active(params: &ErodeParams, iteration: u32) -> bool {
-    params.compute_ridge_erosion != 0 || detail_bias(iteration) != 0
-}
-
-#[derive(Default)]
-enum ErosionPhase {
-    #[default]
-    Loading,
-    Init,
-    Erode,
-}
-
-fn update_erosion_state(
+/// Turns the cascade's next steps into this frame's command list and per-dispatch uniforms.
+fn plan_erosion_frame(
     pipeline: Res<ErosionPipeline>,
     cache: Res<PipelineCache>,
     reset: Res<ResetSim>,
     sim: Res<SimControl>,
+    params: Res<ErodeParams>,
+    progress: Res<PyramidProgress>,
+    mut buffers: ResMut<ErosionBuffers>,
     mut state: ResMut<ErosionState>,
+    render_device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
 ) {
+    let state = &mut *state;
+    state.frame.clear();
+    state.steps.clear();
+
+    if !state.ready {
+        for id in pipeline.required() {
+            match cache.get_compute_pipeline_state(id) {
+                CachedPipelineState::Ok(_) => {}
+                CachedPipelineState::Err(ShaderCacheError::ShaderNotLoaded(_)) => return,
+                CachedPipelineState::Err(err) => panic!("Initializing erosion pipelines:\n{err}"),
+                _ => return,
+            }
+        }
+        state.ready = true;
+        state.cascade.restart(params.pyramid_levels());
+    }
     if reset.generation != state.last_reset_gen {
         state.last_reset_gen = reset.generation;
-        state.opencl_iteration = 0;
-        state.erode_since_writeback = 0;
-        state.phase = ErosionPhase::Loading;
+        state.cascade.restart(params.pyramid_levels());
     }
-    if sim.paused {
-        if sim.step_counter > state.last_step_seen {
-            state.allow_erode_this_frame = true;
-            state.last_step_seen = sim.step_counter;
-        } else {
-            state.allow_erode_this_frame = false;
-        }
+
+    let budget = if sim.paused {
+        let stepped = sim.step_counter > state.last_step_seen;
+        state.last_step_seen = sim.step_counter;
+        u32::from(stepped)
     } else {
-        state.allow_erode_this_frame = true;
+        sim.iterations_per_frame.max(1)
+    };
+    state.cascade.advance(
+        budget,
+        params.compute_ridge_erosion != 0,
+        sim.continue_after_cascade,
+        &mut state.steps,
+    );
+
+    let buffers = &mut *buffers;
+    buffers.params.clear();
+    let base_level = PyramidLevel {
+        size: params.map_size,
+        voxel_size: 1.0,
+        iterations: ERODE_ITERS_PER_WRITEBACK,
+        trail_weight: 1.0,
+    };
+    let levels = &state.cascade.levels;
+    let level_at = |i: usize| levels.get(i).copied().unwrap_or(base_level);
+    for step in &state.steps {
+        let cmd = match *step {
+            CascadeStep::Init => FrameCmd::Init {
+                offset: buffers
+                    .params
+                    .push(&level_erode_params(&params, &base_level, 0)),
+                size: params.map_size,
+            },
+            CascadeStep::Seed { src, dst, level } => {
+                let first = level == 0;
+                let dst_level = level_at(level);
+                let src_size = if first {
+                    dst_level.size
+                } else {
+                    level_at(level - 1).size
+                };
+                *buffers.resample_params.get_mut() = PyramidResampleParams {
+                    src_size,
+                    dst_size: dst_level.size,
+                    orig_size: params.map_size,
+                    first_level: u32::from(first),
+                    dst_voxel_size: dst_level.voxel_size,
+                    detail_smoothing: params.source_detail_smoothing,
+                };
+                debug_assert!(first || src == 1 - dst);
+                info!(
+                    "Erosion pyramid level {}/{}: {}×{}, {} iterations",
+                    level + 1,
+                    levels.len(),
+                    dst_level.size.x,
+                    dst_level.size.y,
+                    dst_level.iterations
+                );
+                FrameCmd::Seed {
+                    dst,
+                    size: dst_level.size,
+                }
+            }
+            CascadeStep::Erode {
+                set,
+                level,
+                iteration,
+            } => {
+                let lp = level_erode_params(&params, &level_at(level), iteration);
+                FrameCmd::Erode {
+                    set,
+                    particles: lp.num_particles,
+                    offset: buffers.params.push(&lp),
+                }
+            }
+            CascadeStep::WriteBack {
+                set,
+                level,
+                iteration,
+            } => {
+                let lp = level_erode_params(&params, &level_at(level), iteration);
+                FrameCmd::WriteBack {
+                    set,
+                    size: lp.map_size,
+                    offset: buffers.params.push(&lp),
+                }
+            }
+        };
+        state.frame.push(cmd);
     }
-    match state.phase {
-        ErosionPhase::Loading => match cache.get_compute_pipeline_state(pipeline.pipeline_init) {
-            CachedPipelineState::Ok(_) => {
-                state.phase = ErosionPhase::Init;
-            }
-            CachedPipelineState::Err(ShaderCacheError::ShaderNotLoaded(_)) => {}
-            CachedPipelineState::Err(err) => {
-                panic!("Initializing assets/{EROSION_SHADER}:\n{err}")
-            }
-            _ => {}
-        },
-        ErosionPhase::Init => {
-            let color_ready = matches!(
-                cache.get_compute_pipeline_state(pipeline.pipeline_init_color),
-                CachedPipelineState::Ok(_)
-            );
-            let erode_ready = matches!(
-                cache.get_compute_pipeline_state(pipeline.pipeline_erode),
-                CachedPipelineState::Ok(_)
-            );
-            if color_ready && erode_ready {
-                state.phase = ErosionPhase::Erode;
-            }
-        }
-        ErosionPhase::Erode => {}
+    if !state.frame.is_empty() {
+        let level = level_at(state.cascade.level);
+        state.frame.push(FrameCmd::Display {
+            set: state.cascade.current,
+            offset: buffers.params.push(&level_erode_params(&params, &level, 0)),
+            finest: level.size == params.map_size,
+        });
+    } else if buffers.params.is_empty() {
+        // Keep a valid binding around for bind group creation.
+        buffers.params.push(&params);
+    }
+    buffers.params.write_buffer(&render_device, &queue);
+    buffers.resample_params.write_buffer(&render_device, &queue);
+
+    let cascade = &state.cascade;
+    if let Some(level) = cascade.current_level() {
+        *progress.0.lock().unwrap() = PyramidProgressData {
+            level: cascade.level,
+            level_count: cascade.levels.len(),
+            size: level.size,
+            batch_iter: cascade.batch_iter,
+            batch_len: level.iterations,
+            finished: cascade.finished,
+        };
     }
 }
 
 fn dispatch_grid(size: UVec2) -> (u32, u32) {
-    ((size.x + 7) / 8, (size.y + 7) / 8)
-}
-
-fn seed_pyramid_level(
-    render_context: &mut RenderContext,
-    cache: &PipelineCache,
-    pipes: &ErosionPipeline,
-    groups: &ErosionBindGroups,
-    params: &ErodeParams,
-) {
-    if is_finest_pyramid_level(params) {
-        return;
-    }
-    let level_size = active_pyramid_level_size(params);
-    let (gx, gy) = dispatch_grid(level_size);
-    if let (Some(p_down), Some(downscale)) = (
-        cache.get_compute_pipeline(pipes.pipeline_pyramid_downscale),
-        groups.downscale.as_ref(),
-    ) {
-        let mut pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor::default());
-        pass.set_pipeline(p_down);
-        pass.set_bind_group(0, downscale, &[]);
-        pass.dispatch_workgroups(gx, gy, 1);
-    }
-    if let (Some(p_clear), Some(level_erosion)) = (
-        cache.get_compute_pipeline(pipes.pipeline_clear_level),
-        groups.level_erosion.as_ref(),
-    ) {
-        let mut pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor::default());
-        pass.set_pipeline(p_clear);
-        pass.set_bind_group(0, level_erosion, &[]);
-        pass.dispatch_workgroups(gx, gy, 1);
-    }
-}
-
-fn run_display_and_ao(
-    render_context: &mut RenderContext,
-    cache: &PipelineCache,
-    pipes: &ErosionPipeline,
-    groups: &ErosionBindGroups,
-    params: &ErodeParams,
-) {
-    let (gx, gy) = dispatch_grid(params.map_size);
-    if is_finest_pyramid_level(params) {
-        {
-            let mut pass = render_context
-                .command_encoder()
-                .begin_compute_pass(&ComputePassDescriptor::default());
-            let p_blit = cache.get_compute_pipeline(pipes.pipeline_blit).unwrap();
-            pass.set_pipeline(p_blit);
-            pass.set_bind_group(0, &groups.erosion, &[]);
-            pass.set_bind_group(1, &groups.blit, &[]);
-            pass.dispatch_workgroups(gx, gy, 1);
-        }
-        if let Some(p_ao) = cache.get_compute_pipeline(pipes.pipeline_ao) {
-            let mut pass = render_context
-                .command_encoder()
-                .begin_compute_pass(&ComputePassDescriptor::default());
-            pass.set_pipeline(p_ao);
-            pass.set_bind_group(0, &groups.erosion, &[]);
-            pass.set_bind_group(1, &groups.blit, &[]);
-            pass.dispatch_workgroups(gx, gy, 1);
-        }
-        if let Some(p_blur_h) = cache.get_compute_pipeline(pipes.pipeline_blur_h) {
-            let mut pass = render_context
-                .command_encoder()
-                .begin_compute_pass(&ComputePassDescriptor::default());
-            pass.set_pipeline(p_blur_h);
-            pass.set_bind_group(0, &groups.erosion, &[]);
-            pass.set_bind_group(1, &groups.blit_blur, &[]);
-            pass.dispatch_workgroups(gx, gy, 1);
-        }
-        if let Some(p_blur_v) = cache.get_compute_pipeline(pipes.pipeline_blur_v) {
-            let mut pass = render_context
-                .command_encoder()
-                .begin_compute_pass(&ComputePassDescriptor::default());
-            pass.set_pipeline(p_blur_v);
-            pass.set_bind_group(0, &groups.erosion, &[]);
-            pass.set_bind_group(1, &groups.blit_blur, &[]);
-            pass.dispatch_workgroups(gx, gy, 1);
-        }
-    } else if let (Some(p_blit_level), Some(level_erosion), Some(level_blit)) = (
-        cache.get_compute_pipeline(pipes.pipeline_blit_level),
-        groups.level_erosion.as_ref(),
-        groups.level_blit.as_ref(),
-    ) {
-        let mut pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor::default());
-        pass.set_pipeline(p_blit_level);
-        pass.set_bind_group(0, level_erosion, &[]);
-        pass.set_bind_group(1, &groups.blit, &[]);
-        pass.set_bind_group(2, level_blit, &[]);
-        pass.dispatch_workgroups(gx, gy, 1);
-    }
+    (size.x.div_ceil(8), size.y.div_ceil(8))
 }
 
 fn erosion_compute(
     mut render_context: RenderContext,
     cache: Res<PipelineCache>,
     pipes: Res<ErosionPipeline>,
-    groups: Res<ErosionBindGroups>,
+    groups: Option<Res<ErosionBindGroups>>,
     params: Res<ErodeParams>,
-    mut buffers: ResMut<ErosionBuffers>,
-    mut state: ResMut<ErosionState>,
-    render_device: Res<RenderDevice>,
-    queue: Res<RenderQueue>,
+    state: Res<ErosionState>,
 ) {
-    match state.phase {
-        ErosionPhase::Loading => {}
-        ErosionPhase::Init => {
-            let (gx, gy) = dispatch_grid(params.map_size);
-            {
-                let mut pass = render_context
-                    .command_encoder()
-                    .begin_compute_pass(&ComputePassDescriptor::default());
-                let p_init = cache.get_compute_pipeline(pipes.pipeline_init).unwrap();
-                pass.set_pipeline(p_init);
-                pass.set_bind_group(0, &groups.erosion, &[]);
-                pass.dispatch_workgroups(gx, gy, 1);
-            }
-            if let Some(p_color_ok) = match cache
-                .get_compute_pipeline_state(pipes.pipeline_init_color)
-            {
-                CachedPipelineState::Ok(_) => cache.get_compute_pipeline(pipes.pipeline_init_color),
-                _ => None,
-            } {
-                let mut pass = render_context
-                    .command_encoder()
-                    .begin_compute_pass(&ComputePassDescriptor::default());
-                pass.set_pipeline(p_color_ok);
-                pass.set_bind_group(0, &groups.erosion, &[]);
-                pass.set_bind_group(1, &groups.color, &[]);
-                pass.dispatch_workgroups(gx, gy, 1);
-            }
-            seed_pyramid_level(&mut render_context, &cache, &pipes, &groups, &params);
-            run_display_and_ao(&mut render_context, &cache, &pipes, &groups, &params);
-        }
-        ErosionPhase::Erode => {
-            let finest = is_finest_pyramid_level(&params);
-            let level_size = active_pyramid_level_size(&params);
-            let level_particles = (level_size.x * level_size.y) as u32;
-            let erosion_bg = if finest {
-                &groups.erosion
-            } else {
-                groups.level_erosion.as_ref().unwrap()
-            };
+    let Some(groups) = groups else { return };
+    if state.frame.is_empty() {
+        return;
+    }
+    let get = |id| cache.get_compute_pipeline(id);
+    let mut pass = render_context
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor {
+            label: Some("erosion"),
+            ..default()
+        });
 
-            if state.allow_erode_this_frame {
-                let iter = state.opencl_iteration;
-                if erosion_pass_active(&params, iter) {
-                    if let Some(p_erode) = cache.get_compute_pipeline(pipes.pipeline_erode) {
-                        let workgroups = (level_particles + 255) / 256;
-                        if finest {
-                            *buffers.uniform.get_mut() = ErodeParams {
-                                iteration: iter,
-                                ..params.clone()
-                            };
-                            buffers.uniform.write_buffer(&render_device, &queue);
-                        } else {
-                            *buffers.level_uniform.get_mut() = level_erode_params(&params, iter);
-                            buffers.level_uniform.write_buffer(&render_device, &queue);
-                        }
-
-                        let mut pass = render_context
-                            .command_encoder()
-                            .begin_compute_pass(&ComputePassDescriptor::default());
-                        pass.set_pipeline(p_erode);
-                        pass.set_bind_group(0, erosion_bg, &[]);
-                        pass.set_bind_group(1, &groups.color, &[]);
-                        pass.dispatch_workgroups(workgroups, 1, 1);
-                    } else {
-                        error!("Erode pipeline not ready!");
-                    }
+    for cmd in &state.frame {
+        match *cmd {
+            FrameCmd::Init { offset, size } => {
+                let (gx, gy) = dispatch_grid(size);
+                let source = &groups.erosion[SET_SOURCE];
+                if let Some(p) = get(pipes.pipeline_init) {
+                    pass.set_pipeline(p);
+                    pass.set_bind_group(0, source, &[offset]);
+                    pass.dispatch_workgroups(gx, gy, 1);
                 }
-                state.opencl_iteration += 1;
-                state.erode_since_writeback += 1;
-            }
-
-            let do_writeback = state.erode_since_writeback >= writeback_interval(&params);
-            if do_writeback {
-                state.erode_since_writeback = 0;
-                if let Some(p_wb) = cache.get_compute_pipeline(pipes.pipeline_write_back) {
-                    if finest {
-                        *buffers.uniform.get_mut() = ErodeParams {
-                            iteration: state.opencl_iteration,
-                            ..params.clone()
-                        };
-                        buffers.uniform.write_buffer(&render_device, &queue);
-                    } else {
-                        *buffers.level_uniform.get_mut() =
-                            level_erode_params(&params, state.opencl_iteration);
-                        buffers.level_uniform.write_buffer(&render_device, &queue);
-                    }
-
-                    let (wgx, wgy) = dispatch_grid(level_size);
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    pass.set_pipeline(p_wb);
-                    pass.set_bind_group(0, erosion_bg, &[]);
-                    pass.dispatch_workgroups(wgx, wgy, 1);
+                if let Some(p) = get(pipes.pipeline_init_color) {
+                    pass.set_pipeline(p);
+                    pass.set_bind_group(0, source, &[offset]);
+                    pass.set_bind_group(1, &groups.color, &[]);
+                    pass.dispatch_workgroups(gx, gy, 1);
                 }
             }
-
-            if state.allow_erode_this_frame {
-                run_display_and_ao(&mut render_context, &cache, &pipes, &groups, &params);
+            FrameCmd::Seed { dst, size } => {
+                let (gx, gy) = dispatch_grid(size);
+                if let Some(p) = get(pipes.pipeline_upscale_height) {
+                    pass.set_pipeline(p);
+                    pass.set_bind_group(0, &groups.upscale_height[dst], &[]);
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
+                if let Some(p) = get(pipes.pipeline_upscale_rivers) {
+                    pass.set_pipeline(p);
+                    pass.set_bind_group(0, &groups.upscale_rivers[dst], &[]);
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
+            }
+            FrameCmd::Erode {
+                set,
+                offset,
+                particles,
+            } => {
+                if let Some(p) = get(pipes.pipeline_erode) {
+                    pass.set_pipeline(p);
+                    pass.set_bind_group(0, &groups.erosion[set], &[offset]);
+                    pass.set_bind_group(1, &groups.color, &[]);
+                    pass.dispatch_workgroups(particles.div_ceil(256), 1, 1);
+                }
+            }
+            FrameCmd::WriteBack { set, offset, size } => {
+                if let Some(p) = get(pipes.pipeline_write_back) {
+                    let (gx, gy) = dispatch_grid(size);
+                    pass.set_pipeline(p);
+                    pass.set_bind_group(0, &groups.erosion[set], &[offset]);
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
+            }
+            FrameCmd::Display {
+                set,
+                offset,
+                finest,
+            } => {
+                let (gx, gy) = dispatch_grid(params.map_size);
+                let erosion = &groups.erosion[set];
+                if !finest {
+                    if let Some(p) = get(pipes.pipeline_blit_level) {
+                        pass.set_pipeline(p);
+                        pass.set_bind_group(0, erosion, &[offset]);
+                        pass.set_bind_group(1, &groups.blit, &[]);
+                        pass.set_bind_group(2, &groups.level_blit, &[]);
+                        pass.dispatch_workgroups(gx, gy, 1);
+                    }
+                    continue;
+                }
+                for (id, group1) in [
+                    (pipes.pipeline_blit, &groups.blit),
+                    (pipes.pipeline_ao, &groups.blit),
+                    (pipes.pipeline_blur_h, &groups.blit_blur),
+                    (pipes.pipeline_blur_v, &groups.blit_blur),
+                ] {
+                    if let Some(p) = get(id) {
+                        pass.set_pipeline(p);
+                        pass.set_bind_group(0, erosion, &[offset]);
+                        pass.set_bind_group(1, group1, &[]);
+                        pass.dispatch_workgroups(gx, gy, 1);
+                    }
+                }
             }
         }
     }
+}
 
-    let _keep = (
-        &buffers.uniform,
-        &buffers.level_uniform,
-        &buffers.macc,
-        &buffers.mx,
-        &buffers.my,
-    );
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_levels_match_ktt() {
+        // Feature_Size 8, voxel 1 → Iterations = log2(8) + 1 = 4 → coarsest 512/16, erode 64..512.
+        let levels = pyramid_levels(UVec2::splat(512), 8.0, 1.0, 0.0);
+        let sizes: Vec<u32> = levels.iter().map(|l| l.size.x).collect();
+        assert_eq!(sizes, vec![64, 128, 256, 512]);
+        assert_eq!(levels.last().unwrap().voxel_size, 1.0);
+        assert_eq!(levels[0].voxel_size, 8.0);
+        assert!(
+            levels
+                .iter()
+                .all(|l| l.iterations == 200 && l.trail_weight == 1.0)
+        );
+    }
+
+    #[test]
+    fn fractional_level_count_fades_first_pass() {
+        // Feature_Size 12 → Iterations = log2(12) + 1 ≈ 4.585 → 5 passes, first weighted frac².
+        let levels = pyramid_levels(UVec2::splat(512), 12.0, 1.0, 0.0);
+        assert_eq!(levels.len(), 5);
+        assert_eq!(levels[0].size, UVec2::splat(32));
+        let frac = 12f32.log2() + 1.0 - 4.0;
+        assert!((levels[0].trail_weight - frac * frac).abs() < 1e-5);
+        assert!(levels[1..].iter().all(|l| l.trail_weight == 1.0));
+    }
+
+    #[test]
+    fn geological_age_scales_coarse_batches() {
+        let levels = pyramid_levels(UVec2::splat(512), 8.0, 1.0, 10.0);
+        let iters: Vec<u32> = levels.iter().map(|l| l.iterations).collect();
+        assert_eq!(iters, vec![1600, 800, 400, 200]);
+    }
+
+    #[test]
+    fn level_count_is_capped_on_small_maps() {
+        let levels = pyramid_levels(UVec2::splat(16), 1024.0, 1.0, 0.0);
+        assert_eq!(levels.len(), 3);
+        assert_eq!(levels[0].size, UVec2::splat(PYRAMID_MIN_SIZE));
+        assert_eq!(levels.last().unwrap().size, UVec2::splat(16));
+        assert_eq!(levels[0].trail_weight, 1.0);
+    }
+
+    #[test]
+    fn non_power_of_two_sizes_round_up() {
+        let levels = pyramid_levels(UVec2::new(500, 300), 8.0, 1.0, 0.0);
+        assert_eq!(levels[0].size, UVec2::new(63, 38));
+        assert_eq!(levels.last().unwrap().size, UVec2::new(500, 300));
+    }
+
+    #[test]
+    fn single_level_when_feature_size_is_tiny() {
+        let levels = pyramid_levels(UVec2::splat(256), 0.5, 1.0, 0.0);
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].size, UVec2::splat(256));
+    }
+
+    fn run_to_end(cascade: &mut Cascade, budget: u32, ridge: bool) -> Vec<CascadeStep> {
+        let mut all = Vec::new();
+        for _ in 0..100_000 {
+            if cascade.finished {
+                break;
+            }
+            cascade.advance(budget, ridge, false, &mut all);
+        }
+        assert!(cascade.finished);
+        all
+    }
+
+    #[test]
+    fn cascade_runs_every_level_then_stops() {
+        let mut cascade = Cascade::default();
+        cascade.restart(pyramid_levels(UVec2::splat(512), 8.0, 1.0, 0.0));
+        let steps = run_to_end(&mut cascade, 7, true);
+
+        assert_eq!(steps[0], CascadeStep::Init);
+        assert_eq!(
+            steps[1],
+            CascadeStep::Seed {
+                src: 1,
+                dst: 0,
+                level: 0
+            }
+        );
+        let erodes = steps
+            .iter()
+            .filter(|s| matches!(s, CascadeStep::Erode { .. }))
+            .count();
+        assert_eq!(erodes, 4 * 200);
+        let writebacks: Vec<_> = steps
+            .iter()
+            .filter_map(|s| match s {
+                CascadeStep::WriteBack {
+                    level, iteration, ..
+                } => Some((*level, *iteration)),
+                _ => None,
+            })
+            .collect();
+        // One writeBack per level, after the last (flow-biased) pass of its batch.
+        assert_eq!(writebacks, vec![(0, 199), (1, 199), (2, 199), (3, 199)]);
+        let seeds: Vec<_> = steps
+            .iter()
+            .filter_map(|s| match s {
+                CascadeStep::Seed { src, dst, level } => Some((*src, *dst, *level)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seeds, vec![(1, 0, 0), (0, 1, 1), (1, 0, 2), (0, 1, 3)]);
+        assert_eq!(cascade.current, 1);
+
+        // Each level's dispatches restart at iteration 0 and target the level's work set.
+        let level1: Vec<_> = steps
+            .iter()
+            .filter_map(|s| match s {
+                CascadeStep::Erode {
+                    set,
+                    level: 1,
+                    iteration,
+                } => Some((*set, *iteration)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(level1.first(), Some(&(1, 0)));
+        assert_eq!(level1.last(), Some(&(1, 199)));
+        assert_eq!(level1.len(), 200);
+
+        let mut more = Vec::new();
+        cascade.advance(10, true, false, &mut more);
+        assert!(more.is_empty());
+    }
+
+    #[test]
+    fn ridge_off_skips_even_iterations() {
+        let mut cascade = Cascade::default();
+        cascade.restart(pyramid_levels(UVec2::splat(64), 1.0, 1.0, 0.0));
+        let steps = run_to_end(&mut cascade, 16, false);
+        assert!(steps.iter().all(|s| match s {
+            CascadeStep::Erode { iteration, .. } => iteration % 2 == 1,
+            _ => true,
+        }));
+        let erodes = steps
+            .iter()
+            .filter(|s| matches!(s, CascadeStep::Erode { .. }))
+            .count();
+        assert_eq!(erodes, 100);
+    }
+
+    #[test]
+    fn continue_after_cascade_keeps_batching_finest_level() {
+        let mut cascade = Cascade::default();
+        cascade.restart(pyramid_levels(UVec2::splat(64), 1.0, 1.0, 0.0));
+        let mut steps = Vec::new();
+        for _ in 0..100 {
+            cascade.advance(10, true, true, &mut steps);
+        }
+        assert!(!cascade.finished);
+        let writebacks: Vec<u32> = steps
+            .iter()
+            .filter_map(|s| match s {
+                CascadeStep::WriteBack { iteration, .. } => Some(*iteration),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(writebacks, vec![199, 399, 599, 799, 999]);
+    }
 }

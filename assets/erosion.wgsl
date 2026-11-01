@@ -57,8 +57,11 @@ struct ErodeParams {
     uplift: f32,
     noise_frequency: f32,
     noise_scale: f32,
-    active_pyramid_level: u32,
-    pyramid_level_count: u32,
+    feature_size: f32,
+    source_detail_smoothing: f32,
+    geological_age: f32,
+    voxel_size: f32,       // level voxel size in base voxels (kernel dx before / Detail_Scale)
+    trail_weight: f32,     // Trail_Density multiplier for this pyramid level
 }
 
 @group(0) @binding(1) var<uniform> params: ErodeParams;
@@ -313,7 +316,7 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     let res_x = i32(params.map_size.x);
     let res_y = i32(params.map_size.y);
     let total_pixels = u32(res_x * res_y);
-    let dx = 1.0;
+    let dx = params.voxel_size;
     let detail_scale = max(params.detail_scale, 0.001);
     let dx_scaled = dx / detail_scale;
     let iteration = params.iteration;
@@ -327,7 +330,8 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     var num_trails = f32(total_pixels)
         * min(pow(dx_scaled, detail_bias), 1.0)
         * params.erosion_amount
-        * TRAIL_DENSITY_SCALE;
+        * TRAIL_DENSITY_SCALE
+        * params.trail_weight;
     if (params.compute_ridge_erosion != 0u && detail_bias < 0.5) {
         num_trails *= params.ridge_erosion_amount;
     }
@@ -574,12 +578,12 @@ fn write_back(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px = i32(gid.x);
     let py = i32(gid.y);
     let idx = u32(py * res_x + px);
-    let dx = 1.0 / max(params.detail_scale, 0.001);
+    let dx = params.voxel_size / max(params.detail_scale, 0.001);
     let iteration = params.iteration;
     let do_rivers = params.do_rivers != 0u;
     let use_momentum = do_rivers && params.momentum_coherence > 0.0;
 
-    var uplift = params.uplift * params.erosion_amount * TRAIL_DENSITY_SCALE;
+    var uplift = params.uplift * params.erosion_amount * TRAIL_DENSITY_SCALE * params.trail_weight;
     let h_old_bits = atomicLoad(&height[idx]);
     let h_old = f32(h_old_bits) / HEIGHT_SCALE;
 
@@ -728,20 +732,6 @@ fn display_to_coarse_pos(gid: vec2<u32>) -> vec2<f32> {
     return (vec2<f32>(f32(gid.x), f32(gid.y)) + 0.5)
         * vec2<f32>(params.map_size.xy)
         / vec2<f32>(blit_display.display_size.xy);
-}
-
-@compute @workgroup_size(8, 8, 1)
-fn clear_level_buffers(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) {
-        return;
-    }
-    let idx = gid.y * params.map_size.x + gid.x;
-    atomicStore(&flow_buffer[idx], 0u);
-    atomicStore(&deposition[idx], 0i);
-    atomicStore(&erosion_buffer[idx], 0u);
-    atomicStore(&macc[idx], 0u);
-    atomicStore(&mx[idx], 0i);
-    atomicStore(&my[idx], 0i);
 }
 
 @compute @workgroup_size(8, 8, 1)
