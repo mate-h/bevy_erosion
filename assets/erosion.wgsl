@@ -706,21 +706,11 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
             );
         }
 
-        // Re-read the cell: concurrent trails modify it during this step (ref reads height[sampleidx])
-        let cell_h = load_height(cell);
-        dh = max(dh, hmin - cell_h);
-        dh = min(dh, hmax - cell_h);
-        dh *= 1.0 - masks[idx].y;
+        // Clamp to the neighbourhood, scale by outflow, keep above bedrock, and write, all against
+        // the cell's current value (see `update_cell_height`).
+        dh = update_cell_height(idx, dh, hmin, hmax, 1.0 - masks[idx].y, bedrock);
 
         let dep_delta = max(dh, -dep_val);
-        if (dh >= 0.0) {
-            atomicAdd(&height[idx], u32(dh * HEIGHT_SCALE));
-        } else {
-            atomicSub(&height[idx], u32(-dh * HEIGHT_SCALE));
-        }
-        if (params.use_bedrock != 0u) {
-            atomicMax(&height[idx], u32(max(bedrock, 0.0) * HEIGHT_SCALE));
-        }
         atomicAdd(&deposition[idx], i32(dep_delta * DEPOSITION_SCALE));
         layers[idx].y *= pow(0.1, abs(dh) * dx_inv);
         if (dh < 0.0) {
@@ -733,6 +723,32 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (params.use_hydro_conditioning != 0u && iteration % 5u == 0u) {
         hydro_condition(p, dx_scaled);
     }
+}
+
+// KTT's `dh = clamp(dh, hmin - height, hmax - height); dh *= 1 - Outflow;
+// height = max(Bedrock, height + dh)` as one compare-exchange, returning the applied change.
+// KTT does a plain read-modify-write, so concurrent trails on a cell lose updates but the height
+// stays inside [hmin, hmax]. Separate atomicAdd/atomicSub calls would instead stack every
+// concurrent cut sized against the same reading; where many trails converge (strong momentum
+// coherence) that drove river cells below zero and wrapped the u32 height.
+fn update_cell_height(idx: u32, dh_in: f32, hmin: f32, hmax: f32, scale: f32, bedrock: f32) -> f32 {
+    var old_bits = atomicLoad(&height[idx]);
+    loop {
+        let old_h = f32(old_bits) / HEIGHT_SCALE;
+        var dh = clamp(old_h + dh_in, hmin, max(hmin, hmax)) - old_h;
+        dh *= scale;
+        var new_h = old_h + dh;
+        if (params.use_bedrock != 0u) {
+            new_h = max(new_h, bedrock);
+        }
+        let new_bits = u32(max(new_h, 0.0) * HEIGHT_SCALE);
+        let res = atomicCompareExchangeWeak(&height[idx], old_bits, new_bits);
+        if (res.exchanged) {
+            return (f32(new_bits) - f32(old_bits)) / HEIGHT_SCALE;
+        }
+        old_bits = res.old_value;
+    }
+    return 0.0;
 }
 
 // "Respect Outflows": a trail that ends in a pit searches a spiral for an equal-or-lower cell and
