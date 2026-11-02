@@ -1579,8 +1579,8 @@ fn trail_sediment_reaches_the_lake() {
     );
 }
 
-/// KTT trails on a plane with a spring-fed stream: the cut (analysis B) inside the stream
-/// against the plane around it, and the stream's wet cells.
+/// KTT trails on a plane with a spring-fed stream: their river momentum (the Rivers view)
+/// inside the stream against the plane around it, and the stream's wet cells.
 fn trail_cut_along_stream(steer: bool) -> (f32, f32) {
     let plane = |x: u32, _y: u32| 0.03 + 0.001 * (N - 1 - x) as f32;
     let mut h = Harness::new(WaterSolver::Swe, plane);
@@ -1604,7 +1604,7 @@ fn trail_cut_along_stream(steer: bool) -> (f32, f32) {
         .continue_after_cascade = true;
     h.run(6.0);
     let q = h.read_discharge();
-    let handle = h.app.world().resource::<ErosionImages>().analysis.clone();
+    let handle = h.app.world().resource::<ErosionImages>().height.clone();
     let analysis = h.read(handle);
     let (mut inside, mut n_in, mut outside, mut n_out) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     for y in N / 2 - 40..N / 2 + 40 {
@@ -2103,5 +2103,132 @@ fn validate_cyclic_steps() {
                 band,
             ],
         );
+    }
+}
+
+/// Height less its 9 × 9 box mean: the small-scale relief erosion carves.
+fn detail(h: &[f32]) -> Vec<f32> {
+    let r = 4i32;
+    let mut out = vec![0.0; h.len()];
+    for y in 0..N as i32 {
+        for x in 0..N as i32 {
+            let mut sum = 0.0;
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    let (sx, sy) = ((x + dx).clamp(0, N as i32 - 1), (y + dy).clamp(0, N as i32 - 1));
+                    sum += h[idx(sx as u32, sy as u32)];
+                }
+            }
+            out[idx(x as u32, y as u32)] = h[idx(x as u32, y as u32)] - sum / 81.0;
+        }
+    }
+    out
+}
+
+/// Lambert hillshade of `h` (height units) lit from the north-west.
+fn hillshade(h: &[f32]) -> Vec<f32> {
+    let light = Vec3::new(-1.0, -1.0, 1.5).normalize();
+    (0..N * N)
+        .map(|i| {
+            let (x, y) = (i % N, i / N);
+            let at = |x: u32, y: u32| h[idx(x.min(N - 1), y.min(N - 1))] * CELLS_PER_HEIGHT;
+            let gx = at(x + 1, y) - at(x.saturating_sub(1), y);
+            let gy = at(x, y + 1) - at(x, y.saturating_sub(1));
+            Vec3::new(-gx, -gy, 2.0).normalize().dot(light).max(0.0)
+        })
+        .collect()
+}
+
+/// KTT rivers against plain KTT erosion on the default terrain. Channels are the cells with the
+/// top 10 % of river momentum at the default River Scale. Reports, per setting, the RMS of the
+/// small-scale relief on the hillslopes (the rest) and in the channels, and how far each sits
+/// below the rivers-off terrain. Set `TEST_IMAGE_DIR` for a hillshade of each run.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn validate_ktt_rivers() {
+    let mut f = data_file(
+        "ktt_rivers",
+        "rivers,river_scale,hill_detail_rms,channel_detail_rms,hill_lowering,channel_lowering",
+    );
+    let dir = std::env::var("TEST_IMAGE_DIR").ok();
+    let scales: Vec<f32> = std::env::var("TEST_RIVER_SCALES")
+        .ok()
+        .map(|v| v.split(',').filter_map(|s| s.parse().ok()).collect())
+        .unwrap_or_else(|| vec![0.25, 0.1, 0.03]);
+    let mut h = Harness::natural(WaterSolver::Swe);
+    let mut run = |h: &mut Harness, rivers: bool, scale: f32| {
+        {
+            let mut params = h.app.world_mut().resource_mut::<ErodeParams>();
+            params.do_rivers = u32::from(rivers);
+            params.river_scale = scale;
+            if let Some(t) = std::env::var("TEST_RIVER_THRESHOLD").ok().and_then(|v| v.parse().ok()) {
+                params.river_threshold = t;
+            }
+            if let Some(d) = std::env::var("TEST_TRAIL_DAMPING").ok().and_then(|v| v.parse().ok()) {
+                params.trail_damping = d;
+            }
+        }
+        let mut reset = h.app.world_mut().resource_mut::<ResetSim>();
+        reset.generation = reset.generation.wrapping_add(1);
+        h.settle_cascade();
+        let heights = h.read_heights();
+        let handle = h.app.world().resource::<ErosionImages>().height.clone();
+        let momentum: Vec<f32> = h.read(handle).iter().map(|t| t[2] / 0.02).collect();
+        h.pause(false);
+        (heights, momentum)
+    };
+    let (off, _) = run(&mut h, false, 0.25);
+    let (_, momentum) = run(&mut h, true, 0.25);
+    let mut sorted = momentum.clone();
+    sorted.sort_by(f32::total_cmp);
+    let cut = sorted[sorted.len() * 9 / 10];
+    let m = 8;
+    let inner = |i: usize| {
+        let (x, y) = (i as u32 % N, i as u32 / N);
+        x >= m && y >= m && x < N - m && y < N - m
+    };
+    let channel: Vec<bool> = momentum.iter().map(|&v| v > cut).collect();
+    println!(
+        "momentum percentiles 50/75/90/99: {} {} {} {}",
+        sorted[sorted.len() / 2],
+        sorted[sorted.len() * 3 / 4],
+        cut,
+        sorted[sorted.len() * 99 / 100]
+    );
+    if let Some(dir) = &dir {
+        let log: Vec<f32> = momentum.iter().map(|v| (1.0 + v.max(0.0)).ln()).collect();
+        let top = log.iter().cloned().fold(0.0, f32::max);
+        write_bmp(&format!("{dir}/ktt_momentum.bmp"), &log, N as usize, N as usize, 0.0, top, 2);
+    }
+    let stats = |heights: &[f32]| {
+        let d = detail(heights);
+        let (mut hill, mut chan, mut hill_low, mut chan_low, mut nh, mut nc) =
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        for i in (0..heights.len()).filter(|&i| inner(i)) {
+            let low = (off[i] - heights[i]) * CELLS_PER_HEIGHT;
+            if channel[i] {
+                chan += d[i] * d[i];
+                chan_low += low;
+                nc += 1.0;
+            } else {
+                hill += d[i] * d[i];
+                hill_low += low;
+                nh += 1.0;
+            }
+        }
+        let k = CELLS_PER_HEIGHT;
+        ((hill / nh).sqrt() * k, (chan / nc).sqrt() * k, hill_low / nh, chan_low / nc)
+    };
+    let mut report = |name: &str, rivers: bool, scale: f32, heights: &[f32]| {
+        let (a, b, c, d) = stats(heights);
+        row(&mut f, &[f32::from(u8::from(rivers)), scale, a, b, c, d]);
+        if let Some(dir) = &dir {
+            write_bmp(&format!("{dir}/ktt_{name}.bmp"), &hillshade(heights), N as usize, N as usize, 0.0, 1.0, 2);
+        }
+    };
+    report("off", false, 0.0, &off);
+    for scale in scales {
+        let (heights, _) = run(&mut h, true, scale);
+        report(&format!("rivers_{scale}"), true, scale, &heights);
     }
 }

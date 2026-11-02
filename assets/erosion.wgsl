@@ -98,6 +98,13 @@ struct ErodeParams {
     water_handoff: u32,
     // Bevy-only: shifts the source terrain noise.
     noise_seed: u32,
+    // Bevy-only: river momentum below this counts as hillslope, so the river terms act only in
+    // the channels.
+    river_threshold: f32,
+    // Bevy-only: steepest-descent trails with rivers (see the friction below), 0 to 1.
+    trail_damping: f32,
+    // Bevy-only: this writeBack's share of the level's iterations.
+    writeback_fraction: f32,
 }
 
 @group(0) @binding(1) var<uniform> params: ErodeParams;
@@ -436,6 +443,12 @@ fn river_momentum(p: vec2<i32>) -> f32 {
     return river_momentum_at_idx(u32(p.y * i32(params.map_size.x) + p.x));
 }
 
+/// River momentum above `River_Threshold`: what the river terms see. Every trail adds momentum,
+/// so without a threshold the hillslopes count as rivers too.
+fn channel_momentum(m: f32) -> f32 {
+    return max(m - params.river_threshold, 0.0);
+}
+
 fn bilinear_sample_river_momentum(pos: vec2<f32>) -> f32 {
     let w = bilinear_grid_weights(pos);
     let size_x = i32(params.map_size.x);
@@ -696,7 +709,7 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
         var scarring_coefficient = 1.0;
 
         if (do_rivers) {
-            let river_mom = river_momentum_at_idx(idx);
+            let river_mom = channel_momentum(river_momentum_at_idx(idx));
             havg *= 0.25;
 
             // Prevents rivers from accumulating on local maxima
@@ -728,11 +741,15 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
                 add_mx(idx, particle_water);
             }
 
-            if (dep_val == 0.0) {
-                v *= pow(1.0 - params.rock_friction * friction_coefficient, dx_scaled);
-            } else {
-                v *= pow(1.0 - params.friction * friction_coefficient, dx_scaled);
+            // Same friction rule as without rivers (none at Friction 1, see below), so the river
+            // terms vanish with River Scale and only reduce friction in the channels. Trail
+            // Damping brings KTT's friction back at Friction 1: trails lose their momentum away
+            // from the rivers and run straight downhill, which carves a dense dendritic network.
+            var friction = select(params.friction, params.rock_friction, dep_val == 0.0);
+            if (params.rock_friction == 1.0 && params.friction == 1.0) {
+                friction = params.trail_damping;
             }
+            v *= pow(1.0 - friction * friction_coefficient, dx_scaled);
             v += -river_volume * mgrad;
             v -= normalize(vec3<f32>(grad.x, grad.y, dx_scaled)).xy * dx_scaled;
         } else {
@@ -921,8 +938,10 @@ fn write_back(@builtin(global_invocation_id) gid: vec3<u32>) {
     let do_rivers = params.do_rivers != 0u;
     let use_my = do_rivers && params.momentum_coherence > 0.0;
 
+    // KTT runs one writeBack per level; ours run every few iterations, each its share of one.
+    let share = params.writeback_fraction;
     var uplift = params.uplift * params.erosion_amount * TRAIL_DENSITY_SCALE * params.trail_weight
-        * masks[idx].w;
+        * masks[idx].w * share;
     let h_old = load_height(vec2<i32>(px, py));
 
     var river_scarring = 0.0;
@@ -930,7 +949,7 @@ fn write_back(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (do_rivers) {
         river_scarring = params.river_scale * RIVER_SCARRING_SCALE
             * min(1.0, pow(dx, params.river_character));
-        river_mom = river_momentum_at_idx(idx) * (1.0 - masks[idx].y);
+        river_mom = channel_momentum(river_momentum_at_idx(idx)) * (1.0 - masks[idx].y);
         var river_uplift_negation = river_mom * params.uplift_river_carving * river_scarring * dx;
         river_uplift_negation = river_uplift_negation / (1.0 + river_uplift_negation);
         uplift *= 1.0 - river_uplift_negation;
@@ -941,7 +960,7 @@ fn write_back(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dep = f32(atomicLoad(&deposition[idx])) / DEPOSITION_SCALE;
     if (dep > params.compaction_threshold * params.detail_scale) {
         let dep_sub = dep - params.compaction_threshold;
-        let dep_compacted = dep_sub * pow(1.0 - params.sediment_compaction, 0.25 * dx)
+        let dep_compacted = dep_sub * pow(1.0 - params.sediment_compaction, 0.25 * dx * share)
             + params.compaction_threshold;
         atomicStore(&deposition[idx], i32(dep_compacted * DEPOSITION_SCALE));
     }
@@ -949,7 +968,7 @@ fn write_back(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (do_rivers) {
         let momentum_extinction = pow(
             params.meander_longevity,
-            pow(dx, 1.0 - params.river_character) * f32(iteration % 2u),
+            pow(dx, 1.0 - params.river_character) * f32(iteration % 2u) * share,
         );
 
         // River channeling, optionally clamped to the neighbourhood minimum so rivers don't dig pits
@@ -962,7 +981,8 @@ fn write_back(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
         }
-        h_new -= river_mom * dx * river_scarring * params.river_channeling * params.river_channeling * 0.0025;
+        h_new -= river_mom * dx * river_scarring * params.river_channeling * params.river_channeling * 0.0025
+            * share;
         if (params.clamp_river_channeling != 0u) {
             h_new = max(h_new, hmin);
         }
@@ -977,7 +997,8 @@ fn write_back(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (params.use_bedrock != 0u) {
         h_new = max(h_new, layers[idx].x);
     }
-    atomicStore(&height[idx], u32(max(h_new, 0.0) * HEIGHT_SCALE));
+    // Rounded: truncating would drift the height down a unit per writeBack.
+    atomicStore(&height[idx], u32(round(max(h_new, 0.0) * HEIGHT_SCALE)));
 }
 
 @group(1) @binding(0) var display_out: texture_storage_2d<rgba16float, write>;
@@ -997,9 +1018,12 @@ fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = u32(py * size_x + px);
     let h = f32(atomicLoad(&height[idx])) / HEIGHT_SCALE;
 
-    // Height in R (and B); the Age view in G.
-    let c = h;
-    textureStore(display_out, out_px, vec4<f32>(c, age_display(layers[idx].y), c, 1.0));
+    // Height in R, the Age view in G, river momentum (the Rivers view) in B.
+    var rivers = 0.0;
+    if (params.do_rivers != 0u) {
+        rivers = river_momentum(vec2<i32>(px, py)) * 0.02;
+    }
+    textureStore(display_out, out_px, vec4<f32>(h, age_display(layers[idx].y), rivers, 1.0));
 
     // compute normals from central differences of height field
     let xm1 = max(px - 1, 0);
@@ -1021,11 +1045,7 @@ fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Pack flow, deposition (sediment), and erosion into single analysis texture
     let flow_mag = f32(atomicLoad(&flow_buffer[idx])) / 10000.0;
     let sediment = max(0.0, f32(atomicLoad(&deposition[idx])) / DEPOSITION_SCALE);
-    var erosion = f32(atomicLoad(&erosion_buffer[idx])) / 100000.0;
-    if (params.do_rivers != 0u) {
-        // When rivers are on, show river momentum `|__m|` in the erosion channel.
-        erosion = river_momentum(vec2<i32>(px, py)) * 0.02;
-    }
+    let erosion = f32(atomicLoad(&erosion_buffer[idx])) / 100000.0;
     
     // Compute curvature using Laplacian of height field (5-point stencil)
     // Positive curvature = convex (peaks/ridges), negative = concave (valleys)
@@ -1092,7 +1112,11 @@ fn blit_level_to_display(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let h = bilinear_sample_height(pos);
     let age = age_display(bilinear_sample_age(pos));
-    textureStore(display_out, vec2<i32>(px, py), vec4<f32>(h, age, h, 1.0));
+    var rivers = 0.0;
+    if (params.do_rivers != 0u) {
+        rivers = bilinear_sample_river_momentum(pos) * 0.02;
+    }
+    textureStore(display_out, vec2<i32>(px, py), vec4<f32>(h, age, rivers, 1.0));
 
     let h_l = bilinear_sample_height(pos - vec2(dpos.x, 0.0));
     let h_r = bilinear_sample_height(pos + vec2(dpos.x, 0.0));
@@ -1106,10 +1130,7 @@ fn blit_level_to_display(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let flow_mag = bilinear_sample_flow(pos);
     let sediment = bilinear_sample_deposition(pos);
-    var erosion = bilinear_sample_erosion(pos);
-    if (params.do_rivers != 0u) {
-        erosion = bilinear_sample_river_momentum(pos) * 0.02;
-    }
+    let erosion = bilinear_sample_erosion(pos);
     let curvature_raw = h_l + h_r + h_d + h_u - 4.0 * h;
     let curvature = curvature_raw * 50.0 + 0.5;
     textureStore(

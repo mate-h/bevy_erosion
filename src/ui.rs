@@ -115,6 +115,8 @@ enum ErosionSliderFieldKind {
     MeanderLongevity,
     MomentumCoherence,
     UpliftRiverCarving,
+    RiverThreshold,
+    TrailDamping,
     NoiseFrequency,
     NoiseScale,
     NoiseSeed,
@@ -193,6 +195,8 @@ impl ErosionSliderFieldKind {
             Self::VelocityRandomnessRefinement => params.velocity_randomness_refinement = value,
             Self::UpliftAmount => params.uplift = value,
             Self::RiverScale => params.river_scale = value,
+            Self::RiverThreshold => params.river_threshold = value,
+            Self::TrailDamping => params.trail_damping = value,
             Self::RiverCharacter => params.river_character = value,
             Self::RiverVolume => params.river_volume = value,
             Self::RiverFrictionReduction => params.river_friction_reduction = value,
@@ -245,20 +249,37 @@ impl ErosionSliderFieldKind {
         }
     }
 
+    /// Every slider that shapes the erosion reruns the cascade; the rest (brush, water, beds,
+    /// views and pacing) apply live.
     fn resets_sim(&self) -> bool {
-        matches!(
+        !matches!(
             self,
-            Self::NoiseFrequency
-                | Self::NoiseScale
-                | Self::NoiseSeed
-                | Self::ReferenceDetailScale
-                | Self::FeatureSize
-                | Self::SourceDetailSmoothing
-                | Self::GeologicalAge
-                | Self::MaskFrequency
-                | Self::OutflowSeaLevel
-                | Self::OutflowBorder
-                | Self::BedrockDepth
+            Self::IterationsPerFrame
+                | Self::AgeStrength
+                | Self::BrushRadius
+                | Self::BrushStrength
+                | Self::WaterErosion
+                | Self::WaterEvaporation
+                | Self::WaterRainfall
+                | Self::WaterManning
+                | Self::WaterGravity
+                | Self::BedMaxDepth
+                | Self::BedShoreSlope
+                | Self::BedProfile
+                | Self::BedStrength
+                | Self::BedBankWidth
+                | Self::BedRiverDepth
+                | Self::BedRiverWidth
+                | Self::BedChannelDischarge
+                | Self::WaterRainWater
+                | Self::BedLoadGrain
+                | Self::BedLoadK
+                | Self::BedLoadCriticalShields
+                | Self::BedLoadSlopeEffect
+                | Self::BedLoadHelical
+                | Self::BedLoadMorphFactor
+                | Self::BedLoadRefineSteps
+                | Self::BedLoadRockHardness
         )
     }
 
@@ -382,6 +403,10 @@ impl ToggleKind {
         matches!(
             self,
             Self::Rivers
+                | Self::RidgeErosion
+                | Self::ClampRiverChanneling
+                | Self::HydroConditioning
+                | Self::AccumulateOutflow
                 | Self::SoftnessMask
                 | Self::ErosionMask
                 | Self::UpliftMap
@@ -855,6 +880,10 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         @toggle_row("Do Rivers", ToggleKind::Rivers)
                         --
                         @slider_row("River Scale", 0.0, 1.0, params.river_scale, ErosionSliderFieldKind::RiverScale)
+                        --
+                        @slider_row("River Threshold", 0.0, 200.0, params.river_threshold, ErosionSliderFieldKind::RiverThreshold)
+                        --
+                        @slider_row("Trail Damping", 0.0, 1.0, params.trail_damping, ErosionSliderFieldKind::TrailDamping)
                         --
                         @slider_row("River Character", 0.0, 2.0, params.river_character, ErosionSliderFieldKind::RiverCharacter)
                         --

@@ -47,6 +47,10 @@ const WATER_MORPHO_SHADER: &str = "water_morpho.wgsl";
 const WATER_SPLAT_SHADER: &str = "water_splat.wgsl";
 /// Erode dispatches per `writeBack` at geological age 0 (`Compute_Erosion.iterations`).
 const ERODE_ITERS_PER_WRITEBACK: u32 = 200;
+/// Erode dispatches between our `writeBack`s. KTT runs one per level, after every batch of
+/// [`ERODE_ITERS_PER_WRITEBACK`]; we split it so uplift and river channeling show and feed back
+/// while a level runs, each `writeBack` scaled by its share of the level.
+const WRITEBACK_INTERVAL: u32 = 20;
 const TERRAIN_SHADER: &str = "terrain_extended.wesl";
 /// Smallest grid the cascade will seed from (caps the level count on small maps).
 const PYRAMID_MIN_SIZE: u32 = 4;
@@ -193,6 +197,8 @@ pub enum CascadeStep {
         set: usize,
         level: usize,
         iteration: u32,
+        /// Erode dispatches since the previous `writeBack`.
+        iterations: u32,
     },
 }
 
@@ -264,12 +270,21 @@ impl Cascade {
                 budget -= 1;
             }
             if self.batch_iter < level.iterations {
+                if self.batch_iter % WRITEBACK_INTERVAL == 0 {
+                    out.push(CascadeStep::WriteBack {
+                        set: self.current,
+                        level: self.level,
+                        iteration,
+                        iterations: WRITEBACK_INTERVAL,
+                    });
+                }
                 continue;
             }
             out.push(CascadeStep::WriteBack {
                 set: self.current,
                 level: self.level,
-                iteration: iteration,
+                iteration,
+                iterations: (level.iterations - 1) % WRITEBACK_INTERVAL + 1,
             });
             self.batch_iter = 0;
             if self.level + 1 < self.levels.len() {
@@ -411,6 +426,8 @@ pub enum PreviewMode {
     /// Lambert-shaded terrain colour with flat water tint: no PBR or water optics, for timing the
     /// simulations.
     Simple,
+    /// KTT river momentum, with Do Rivers on.
+    Rivers,
 }
 
 /// Parameters for ambient occlusion computation
@@ -617,6 +634,16 @@ pub struct ErodeParams {
     pub water_handoff: u32,
     /// Bevy-only: shifts the source terrain noise, so each seed is a different landscape.
     pub noise_seed: u32,
+    /// Bevy-only: river momentum below this is hillslope, so River Scale and the other river
+    /// terms only act in the channels.
+    pub river_threshold: f32,
+    /// Bevy-only: steepest-descent trails in Do Rivers, 0 to 1. At Friction 1 the trails keep
+    /// their momentum (as without rivers); this damps it everywhere but in the rivers, so trails
+    /// run straight downhill and carve a dense dendritic network.
+    pub trail_damping: f32,
+    /// Bevy-only: this `writeBack`'s share of the level's erosion iterations (uplift, compaction,
+    /// river channeling and momentum decay are scaled by it).
+    pub writeback_fraction: f32,
 }
 
 impl Default for ErodeParams {
@@ -704,6 +731,9 @@ impl Default for ErodeParams {
             rain_water: 0.0,
             water_handoff: 0,
             noise_seed: 0,
+            river_threshold: 0.0,
+            trail_damping: 0.3,
+            writeback_fraction: 1.0,
         }
     }
 }
@@ -2355,8 +2385,13 @@ fn plan_erosion_frame(
                 set,
                 level,
                 iteration,
+                iterations,
             } => {
-                let lp = level_erode_params(params, &level_at(level), iteration);
+                let level = level_at(level);
+                let lp = ErodeParams {
+                    writeback_fraction: iterations as f32 / level.iterations as f32,
+                    ..level_erode_params(params, &level, iteration)
+                };
                 FrameCmd::WriteBack {
                     set,
                     size: lp.map_size,
@@ -3041,8 +3076,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // One writeBack per level, after the last (flow-biased) pass of its batch.
-        assert_eq!(writebacks, vec![(0, 199), (1, 199), (2, 199), (3, 199)]);
+        // Ten writeBacks per level, each after a flow-biased (odd) pass.
+        let expected: Vec<_> = (0..4)
+            .flat_map(|level| (1..=10).map(move |k| (level, k * WRITEBACK_INTERVAL - 1)))
+            .collect();
+        assert_eq!(writebacks, expected);
         let seeds: Vec<_> = steps
             .iter()
             .filter_map(|s| match s {
@@ -3133,6 +3171,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(writebacks, vec![199, 399, 599, 799, 999]);
+        let expected: Vec<u32> = (1..=50).map(|k| k * WRITEBACK_INTERVAL - 1).collect();
+        assert_eq!(writebacks, expected);
     }
 }

@@ -327,6 +327,7 @@ fn print_controls() {
     println!("  7 - Curvature map preview");
     println!("  8 - Age map preview");
     println!("  9 - Simple shading (no atmosphere or water optics; see --simple)");
+    println!("  0 - River momentum (Do Rivers)");
     println!("  B - toggle the brush (left drag paints, Shift + drag erases, right drag orbits)");
     println!("  V - cycle brush: rain / terrain / water body");
     println!("  T - cycle terrain tool: raise / lower / flatten / smooth");
@@ -578,6 +579,8 @@ fn handle_preview_mode_input(
         Some(PreviewMode::Age)
     } else if keys.just_pressed(KeyCode::Digit9) {
         Some(PreviewMode::Simple)
+    } else if keys.just_pressed(KeyCode::Digit0) {
+        Some(PreviewMode::Rivers)
     } else {
         None
     };
@@ -599,6 +602,7 @@ fn handle_preview_mode_input(
                     PreviewMode::Curvature => 6,
                     PreviewMode::Age => 7,
                     PreviewMode::Simple => 8,
+                    PreviewMode::Rivers => 9,
                 };
             }
 
