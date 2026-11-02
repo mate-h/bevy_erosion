@@ -642,7 +642,18 @@ The open item from Phase 1.5: rain trails leave water along their path.
 - After this the rain brush carves and wets in one stroke, and the water brush only adds water.
 - Verify: the water added equals the splatted total, with no frame-rate dependence.
 
-### 6c. Water steers KTT rivers
+### 6c. Water steers KTT rivers (done)
+
+`morpho_steer` (`water_morpho.wgsl`, once per water frame while Do Rivers is on and
+`WaterControl::steer_rivers`): wherever the water's averaged discharge, in KTT units
+(÷ `KTT_DISCHARGE_SCALE`), exceeds KTT's river momentum, the momentum is raised to it (the
+vector with momentum coherence, the scalar otherwise). The water frames only run once the
+cascade is on the finest level, so this covers both a restart and Continue After Cascade.
+`water_steers_ktt_rivers`, a spring-fed stream on a plane with KTT trails running: the trails cut
+6.7 times as much per cell inside the stream as on the plane around it. Without steering they
+cut nothing on a uniform plane (they drop their load as fast as they take it until river
+momentum builds up).
+
 
 - When the cascade restarts or continues at the finest level, seed the river momentum
   (`mx`/`my`) from the solver's discharge and velocity, so new trails follow the rivers that

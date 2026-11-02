@@ -6,6 +6,8 @@
 // velocities in cells per second, so the Shields number and the bed load are in grid units.
 //   * morpho_discharge (per frame): time-averaged unit discharge q = h·u and depth, and KTT's
 //     river momentum scaled to the same units.
+//   * morpho_steer (per frame, KTT rivers on): KTT's river momentum is raised to the water's
+//     discharge where the water carries more, so new trails follow the rivers that exist.
 //   * morpho_helical (per frame): helical flow intensity I_s, advected along the flow and relaxed
 //     toward h·κ (κ = streamline curvature).
 //   * morpho_flux (per step): bed load on the +x and +y faces of every cell (Shields, Meyer-Peter
@@ -67,7 +69,7 @@ struct MorphoParams {
 // w = KTT river discharge in the same units.
 @group(0) @binding(3) var<storage, read_write> discharge: array<vec4<f32>>;
 // KTT river momentum of the finest work set, x and y per cell (f32 bits; see `erosion.wgsl`).
-@group(0) @binding(4) var<storage, read> m: array<u32>;
+@group(0) @binding(4) var<storage, read_write> m: array<u32>;
 // Bed load through the +x (x) and +y (y) faces of each cell (cells² per second).
 @group(0) @binding(5) var<storage, read_write> bed_load: array<vec2<f32>>;
 // Four floats per cell: helical intensity in two slots (ping-pong), the bed change not yet
@@ -131,6 +133,25 @@ fn morpho_discharge(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     d.w = params.ktt_scale * max(river, 0.0);
     discharge[i] = d;
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn morpho_steer(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = vec2<i32>(gid.xy);
+    if (!inside(p)) { return; }
+    let target_m = discharge[widx(p)].xy / max(params.ktt_scale, 1e-9);
+    let g = gidx(p);
+    let river = vec2<f32>(bitcast<f32>(m[2u * g]), bitcast<f32>(m[2u * g + 1u]));
+    if (params.ktt_vector != 0u) {
+        // Momentum coherence: trails turn along the vector.
+        if (length(target_m) > length(river)) {
+            m[2u * g] = bitcast<u32>(target_m.x);
+            m[2u * g + 1u] = bitcast<u32>(target_m.y);
+        }
+    } else {
+        // Scalar water accumulation in x only.
+        m[2u * g] = bitcast<u32>(max(river.x, length(target_m)));
+    }
 }
 
 fn sample_helical(pos: vec2<f32>, slot: u32) -> f32 {

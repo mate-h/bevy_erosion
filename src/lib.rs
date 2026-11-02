@@ -782,6 +782,9 @@ pub struct WaterControl {
     pub bed_load: BedLoad,
     /// Bump to fast-forward the beds by [`BedLoad::refine_steps`] steps.
     pub refine_generation: u32,
+    /// With KTT's Do Rivers on, raise its river momentum to the water's discharge, so trails on
+    /// the finest level follow the rivers the water has made.
+    pub steer_rivers: bool,
 }
 
 /// Bed load and Exner (`water_morpho.wgsl`): on water deeper than a thin sheet, the flow moves
@@ -920,6 +923,7 @@ impl Default for WaterControl {
             shape_generation: 0,
             bed_load: BedLoad::default(),
             refine_generation: 0,
+            steer_rivers: true,
         }
     }
 }
@@ -1177,8 +1181,8 @@ struct ErosionPipeline {
     /// `water_bed.wgsl`: init, tau, prior, smooth, write, dilate, grade.
     pipelines_water_bed: [CachedComputePipelineId; 7],
     layout_water_morpho: BindGroupLayoutDescriptor,
-    /// `water_morpho.wgsl`: discharge, helical, flux, exner.
-    pipelines_water_morpho: [CachedComputePipelineId; 4],
+    /// `water_morpho.wgsl`: discharge, helical, flux, exner, steer.
+    pipelines_water_morpho: [CachedComputePipelineId; 5],
     layout_water_splat: BindGroupLayoutDescriptor,
     /// `water_splat.wgsl`: splat, record.
     pipelines_water_splat: [CachedComputePipelineId; 2],
@@ -1382,7 +1386,7 @@ fn init_erosion_pipeline(
                 storage_buffer_read_only::<f32>(false), // water depth
                 storage_buffer_read_only::<Vec2>(false), // velocity
                 storage_buffer::<Vec4>(false), // discharge
-                storage_buffer_read_only::<f32>(false), // work set river momentum
+                storage_buffer::<f32>(false), // work set river momentum
                 storage_buffer::<Vec2>(false), // face bed load
                 storage_buffer::<f32>(false), // helical intensity and pending bed change
                 uniform_buffer::<MorphoParams>(false),
@@ -1533,6 +1537,7 @@ fn init_erosion_pipeline(
         "morpho_helical",
         "morpho_flux",
         "morpho_exner",
+        "morpho_steer",
     ]
     .map(|entry| {
         compute(
@@ -2102,6 +2107,8 @@ enum FrameCmd {
         swe: bool,
         import: bool,
         bed_load: bool,
+        /// Raise KTT's river momentum to the water's discharge (`morpho_steer`).
+        steer: bool,
     },
     /// Rebuild the beds under the current water (`water_bed.wgsl`); `offsets` per SOR parity.
     /// With `swe`, the new depth is handed to bevy_fft's solver afterwards.
@@ -2468,6 +2475,7 @@ fn plan_erosion_frame(
                 swe,
                 import: swe && !state.last_swe && !clear,
                 bed_load: mor_fac > 0.0,
+                steer: water.steer_rivers && params.do_rivers != 0,
             });
             state.last_swe = swe;
             if steps > 0 {
@@ -2662,9 +2670,10 @@ fn erosion_compute(
                 swe,
                 import,
                 bed_load,
+                steer,
             } => {
                 let (gx, gy) = dispatch_grid(params.map_size);
-                let [p_discharge, p_helical, p_bed_flux, p_exner] =
+                let [p_discharge, p_helical, p_bed_flux, p_exner, p_steer] =
                     pipes.pipelines_water_morpho.map(get);
                 let [p_splat, p_record] = pipes.pipelines_water_splat.map(get);
                 if let Some(p) = p_splat {
@@ -2740,6 +2749,10 @@ fn erosion_compute(
                 if steps > 0 && let (Some(d), Some(h)) = (p_discharge, p_helical) {
                     pass.set_bind_group(0, &groups.water_morpho[set], &[]);
                     for p in [d, h] {
+                        pass.set_pipeline(p);
+                        pass.dispatch_workgroups(gx, gy, 1);
+                    }
+                    if steer && let Some(p) = p_steer {
                         pass.set_pipeline(p);
                         pass.dispatch_workgroups(gx, gy, 1);
                     }

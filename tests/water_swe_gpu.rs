@@ -1473,11 +1473,6 @@ fn rain(h: &mut Harness, center: Vec2, seconds: f32, fps: f32) {
     h.set_fps(FPS);
 }
 
-/// Water and sediment in the water texture: total depth and total suspended load.
-fn water_totals(water: &[Water], sediment: &[f32]) -> (f32, f32) {
-    (water.iter().map(|w| w.depth).sum(), sediment.iter().sum())
-}
-
 /// The rain brush leaves water along its trails, the same amount at any frame rate.
 #[test]
 #[ignore = "needs a graphics adapter"]
@@ -1570,5 +1565,66 @@ fn trail_sediment_reaches_the_lake() {
     assert!(
         after_clear - before_clear > 0.5 * suspended2,
         "Clear Water lost the suspended load"
+    );
+}
+
+/// KTT trails on a plane with a spring-fed stream: the cut (analysis B) inside the stream
+/// against the plane around it, and the stream's wet cells.
+fn trail_cut_along_stream(steer: bool) -> (f32, f32) {
+    let plane = |x: u32, _y: u32| 0.03 + 0.001 * (N - 1 - x) as f32;
+    let mut h = Harness::new(WaterSolver::Swe, plane);
+    h.water().steer_rivers = steer;
+    h.water().springs.push(Spring {
+        center: Vec2::new(24.0, N as f32 / 2.0),
+        radius: 4.0,
+        rate: 0.05,
+    });
+    h.run(6.0);
+    {
+        let mut params = h.app.world_mut().resource_mut::<ErodeParams>();
+        params.erosion_amount = 0.1;
+        params.erosion_strength = 0.5;
+        params.do_rivers = 1;
+        params.momentum_coherence = 0.5;
+    }
+    h.app
+        .world_mut()
+        .resource_mut::<SimControl>()
+        .continue_after_cascade = true;
+    h.run(6.0);
+    let q = h.read_discharge();
+    let handle = h.app.world().resource::<ErosionImages>().analysis.clone();
+    let analysis = h.read(handle);
+    let (mut inside, mut n_in, mut outside, mut n_out) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for y in N / 2 - 40..N / 2 + 40 {
+        for x in 48..N - 24 {
+            let i = idx(x, y);
+            if q[i].truncate().truncate().length() > 0.02 {
+                inside += analysis[i][2];
+                n_in += 1.0;
+            } else {
+                outside += analysis[i][2];
+                n_out += 1.0;
+            }
+        }
+    }
+    (inside / n_in.max(1.0) / (outside / n_out.max(1.0)).max(1e-9), n_in)
+}
+
+/// With KTT's rivers on, the water's discharge steers the trails: they cut along the stream
+/// rather than across the whole plane. (On a uniform plane without river momentum, trails drop
+/// their load as fast as they pick it up and cut nothing anywhere.)
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn water_steers_ktt_rivers() {
+    let (with, wet) = trail_cut_along_stream(true);
+    let (without, _) = trail_cut_along_stream(false);
+    println!(
+        "trail cut in the stream ({wet} cells) against the plane around it: {with:.2}× steered, {without:.2}× not"
+    );
+    assert!(wet > 50.0, "no stream formed");
+    assert!(
+        with > 2.0 && with > 1.5 * without,
+        "the water did not steer the trails"
     );
 }
