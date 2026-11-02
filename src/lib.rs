@@ -39,7 +39,7 @@ const PYRAMID_MASKS_SHADER: &str = "pyramid_masks.wgsl";
 const WATER_SHADER: &str = "water.wgsl";
 /// Erode dispatches per `writeBack` at geological age 0 (`Compute_Erosion.iterations`).
 const ERODE_ITERS_PER_WRITEBACK: u32 = 200;
-const TERRAIN_SHADER: &str = "terrain_extended.wgsl";
+const TERRAIN_SHADER: &str = "terrain_extended.wesl";
 /// Smallest grid the cascade will seed from (caps the level count on small maps).
 const PYRAMID_MIN_SIZE: u32 = 4;
 
@@ -305,6 +305,7 @@ impl PyramidProgress {
 
 /// Resource containing handles to all erosion-related images
 #[derive(Resource, Clone, ExtractResource)]
+#[extract_app(RenderApp)]
 pub struct ErosionImages {
     pub height: Handle<Image>,
     pub color: Handle<Image>,
@@ -455,6 +456,7 @@ impl MaterialExtension for TerrainExtension {
 
 /// Erosion parameters — fields store reference UI parm values from `ref/houdini22/node_tree.json`.
 #[derive(Resource, Clone, ExtractResource, ShaderType)]
+#[extract_app(RenderApp)]
 #[repr(C)]
 pub struct ErodeParams {
     pub map_size: UVec2,
@@ -676,6 +678,7 @@ impl ErodeParams {
 /// Rain brush input for this frame: while `active`, extra erode dispatches start their trails in
 /// a disc on the finest level, carving the current terrain without restarting the cascade.
 #[derive(Resource, Clone, ExtractResource, Default, Debug)]
+#[extract_app(RenderApp)]
 pub struct BrushStroke {
     pub active: bool,
     /// Disc center in map texels.
@@ -693,6 +696,7 @@ pub struct BrushStroke {
 /// sediment, still water drops it, and wet cells act as KTT outflow so trails drain into them.
 /// The optional ocean (`ErodeParams::outflow_sea_level`) is a sink for this water.
 #[derive(Resource, Clone, ExtractResource, Debug)]
+#[extract_app(RenderApp)]
 pub struct WaterControl {
     /// Add (rate > 0) or remove (rate < 0) water in a disc this frame.
     pub stroke_active: bool,
@@ -747,12 +751,14 @@ pub struct WaterParams {
 
 /// Resource to trigger simulation reset
 #[derive(Resource, Clone, ExtractResource, Default)]
+#[extract_app(RenderApp)]
 pub struct ResetSim {
     pub generation: u32,
 }
 
 /// Resource to control simulation state
 #[derive(Resource, Clone, ExtractResource)]
+#[extract_app(RenderApp)]
 pub struct SimControl {
     pub paused: bool,
     pub step_counter: u64,

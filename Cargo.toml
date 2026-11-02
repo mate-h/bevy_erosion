@@ -22,4 +22,4 @@ default = ["ui"]
 ui = ["bevy/bevy_feathers"]
 
 [dependencies]
-bevy = "0.19"
+bevy = "0.20"
