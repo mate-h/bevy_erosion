@@ -10,13 +10,20 @@
 //!   Alt + click places a [`Spring`] that keeps pouring at the brush's rate, so rivers keep
 //!   flowing; Alt + Shift + click removes the springs under the brush.
 //!
+//! * [`BrushMode::River`]: a click places a river ([`crate::river`]). It routes itself down the
+//!   eroded terrain from the click, gets a carved bed with steps, pools and point bars, and a
+//!   spring at its source; Shift + click removes the rivers starting under the brush.
+//!
 //! Shift + drag erases (removes water, or undoes terrain edits). Put [`TerrainSurface`] on the
 //! displaced terrain mesh so clicks can be ray-cast against it; the ray hits the displayed
 //! surface, so a click on a lake lands on the water rather than its bed.
 
 use crate::{
     BrushStroke, ErodeParams, ErosionConfig, ErosionImages, MAX_SPRINGS, ResetSim, Spring,
-    WaterControl, camera::OrbitController, camera::OrbitInputBlocked,
+    WaterControl,
+    camera::OrbitController,
+    camera::OrbitInputBlocked,
+    river::{self, RiverBed, RiverSettings, Rivers},
 };
 use bevy::{
     prelude::*,
@@ -28,7 +35,8 @@ pub struct WaterBrushPlugin;
 
 impl Plugin for WaterBrushPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<WaterBrush>()
+        app.add_plugins(river::RiverPlugin)
+            .init_resource::<WaterBrush>()
             .init_resource::<HeightCache>()
             .init_resource::<BrushHit>()
             .add_systems(
@@ -38,6 +46,7 @@ impl Plugin for WaterBrushPlugin {
                     swap_orbit_button,
                     pick_terrain,
                     paint_water,
+                    paint_rivers,
                     draw_brush,
                 )
                     .chain(),
@@ -68,15 +77,18 @@ pub enum BrushMode {
     Terrain(TerrainTool),
     /// Pour water that pools into lakes and runs off as rivers.
     WaterBody,
+    /// Click to place a river that routes itself downhill, with a carved bed.
+    River,
 }
 
 impl BrushMode {
-    /// Rain → Terrain → Water Body → Rain.
+    /// Rain → Terrain → Water Body → River → Rain.
     pub fn next(self) -> Self {
         match self {
             Self::Rain => Self::Terrain(TerrainTool::Raise),
             Self::Terrain(_) => Self::WaterBody,
-            Self::WaterBody => Self::Rain,
+            Self::WaterBody => Self::River,
+            Self::River => Self::Rain,
         }
     }
 
@@ -88,6 +100,7 @@ impl BrushMode {
             Self::Terrain(TerrainTool::Flatten) => "Terrain: Flatten",
             Self::Terrain(TerrainTool::Smooth) => "Terrain: Smooth",
             Self::WaterBody => "Water Body",
+            Self::River => "River",
         }
     }
 }
@@ -127,6 +140,13 @@ pub struct WaterBrush {
     pub clear_water: bool,
     /// Set to undo all terrain edits on the next frame.
     pub clear_terrain: bool,
+    /// Set to remove every river on the next frame.
+    pub clear_rivers: bool,
+    /// What the river brush places.
+    pub river: RiverSettings,
+    /// Place a river from this texel as a click would, once the brush has the heights (the brush
+    /// must be on).
+    pub place_river_at: Option<Vec2>,
     /// Flatten target captured when the stroke started.
     flatten_target: Option<f32>,
 }
@@ -155,6 +175,9 @@ impl Default for WaterBrush {
             strength: 0.35,
             clear_water: false,
             clear_terrain: false,
+            clear_rivers: false,
+            river: RiverSettings::default(),
+            place_river_at: None,
             flatten_target: None,
         }
     }
@@ -184,6 +207,19 @@ struct HeightCache {
     water: Vec<f32>,
     /// Ocean level (0 = no ocean).
     sea_level: f32,
+    /// Height readbacks received since the brush was turned on. The first few can come back
+    /// before the texture's data has been copied, all zero.
+    readbacks: u32,
+}
+
+/// Height readbacks to wait for before routing rivers on the cache.
+const SETTLED_READBACKS: u32 = 3;
+
+impl HeightCache {
+    /// Whether the heights are in and real.
+    fn settled(&self) -> bool {
+        self.readbacks >= SETTLED_READBACKS && self.heights.len() == (self.size.x * self.size.y) as usize
+    }
 }
 
 impl HeightCache {
@@ -222,7 +258,7 @@ impl HeightCache {
 struct HeightReadback;
 
 /// Red channel of an Rgba16Float readback, rows possibly padded.
-fn read_red_channel(data: &[u8], size: UVec2, out: &mut Vec<f32>) {
+pub(crate) fn read_red_channel(data: &[u8], size: UVec2, out: &mut Vec<f32>) {
     let stride = data.len() / size.y as usize;
     out.resize((size.x * size.y) as usize, 0.0);
     for y in 0..size.y as usize {
@@ -242,6 +278,94 @@ fn f16_to_f32(bits: u16) -> f32 {
         0 => sign * mant * 2f32.powi(-24),
         31 => f32::NAN,
         _ => sign * (1.0 + mant / 1024.0) * 2f32.powi(exp - 15),
+    }
+}
+
+/// River brush: a click places a river from there, Shift + click removes the rivers that start
+/// under the brush. Removing a river reruns the cascade, since its bed is cut into the terrain;
+/// the others are carved again once it finishes.
+#[allow(clippy::too_many_arguments)]
+fn paint_rivers(
+    mut brush: ResMut<WaterBrush>,
+    mut rivers: ResMut<Rivers>,
+    mut bed: ResMut<RiverBed>,
+    mut water: ResMut<WaterControl>,
+    mut reset: ResMut<ResetSim>,
+    hit: Res<BrushHit>,
+    cache: Res<HeightCache>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    blocked: Res<OrbitInputBlocked>,
+) {
+    let size = cache.size;
+    let mut removed = std::mem::take(&mut brush.clear_rivers) && !rivers.list.is_empty();
+    if removed {
+        for r in &rivers.list {
+            water.springs.retain(|s| s.center != r.source);
+        }
+        rivers.list.clear();
+    }
+    let click = brush.enabled
+        && brush.mode == BrushMode::River
+        && !blocked.0
+        && hit.world.is_some()
+        && buttons.just_pressed(MouseButton::Left)
+        && !keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]);
+    if click && keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]) {
+        let (texel, radius) = (hit.texel, brush.radius);
+        let before = rivers.list.len();
+        rivers.list.retain(|r| {
+            let keep = r.source.distance(texel) > radius;
+            if !keep {
+                water.springs.retain(|s| s.center != r.source);
+            }
+            keep
+        });
+        removed |= rivers.list.len() != before;
+    } else if let Some(at) = (click.then_some(hit.texel))
+        .or(brush.place_river_at)
+        .filter(|_| cache.settled())
+    {
+        brush.place_river_at = None;
+        let seed = rivers.next_seed();
+        let placed = river::place(
+            &cache.heights,
+            &cache.water,
+            &rivers.list,
+            size,
+            at,
+            cache.sea_level,
+            &brush.river,
+            &(&water.bed).into(),
+            seed,
+        );
+        match placed {
+            Some(r) => {
+                info!(
+                    "River: {} texels from {} to {}",
+                    r.path.len(),
+                    r.source,
+                    r.path.last().unwrap()
+                );
+                if water.springs.len() >= MAX_SPRINGS {
+                    water.springs.remove(0);
+                }
+                let spring = river::spring_for(&r, &water.bed);
+                water.springs.push(spring);
+                rivers.list.push(r);
+                river::rebuild(&rivers, &water.bed, &brush.river, size, &mut bed);
+            }
+            None => info!(
+                "River: nowhere to flow from {at} (height {}, sea level {})",
+                cache.sample(at),
+                cache.sea_level
+            ),
+        }
+    }
+    if removed {
+        // The removed beds are cut into the terrain: rerun the cascade, and the rest are carved
+        // again once it finishes.
+        reset.generation = reset.generation.wrapping_add(1);
     }
 }
 
@@ -272,6 +396,7 @@ fn sync_height_readback(
             .observe(
                 move |ev: On<ReadbackComplete>, mut cache: ResMut<HeightCache>| {
                     read_red_channel(&ev.data, size, &mut cache.heights);
+                    cache.readbacks = cache.readbacks.saturating_add(1);
                 },
             );
         commands
@@ -285,6 +410,7 @@ fn sync_height_readback(
         for entity in &existing {
             commands.entity(entity).despawn();
         }
+        cache.readbacks = 0;
     }
 }
 
@@ -532,6 +658,8 @@ fn draw_brush(
     config: Res<ErosionConfig>,
     keys: Res<ButtonInput<KeyCode>>,
     terrain: Query<(&TerrainSurface, &GlobalTransform)>,
+    rivers: Res<Rivers>,
+    mut preview: Local<(Option<UVec2>, Vec<Vec2>)>,
     mut gizmos: Gizmos,
 ) {
     let Ok((surface, tf)) = terrain.single() else {
@@ -568,9 +696,35 @@ fn draw_brush(
             BrushMode::Rain => Color::srgb(0.75, 0.9, 1.0),
             BrushMode::Terrain(_) => Color::srgb(0.95, 0.8, 0.4),
             BrushMode::WaterBody => Color::srgb(0.3, 0.7, 1.0),
+            BrushMode::River => Color::srgb(0.35, 0.85, 0.95),
         }
     };
     ring(hit.texel, brush.radius, color);
+    // River brush: where a river from the cursor would run, routed again when it moves a texel.
+    if brush.mode == BrushMode::River && cache.settled() {
+        let cell = hit.texel.floor().as_uvec2();
+        if preview.0 != Some(cell) || rivers.is_changed() {
+            preview.0 = Some(cell);
+            let place = river::place(
+                &cache.heights,
+                &cache.water,
+                &rivers.list,
+                cache.size,
+                hit.texel,
+                cache.sea_level,
+                &brush.river,
+                &(&water.bed).into(),
+                0,
+            );
+            preview.1 = place.map(|r| r.path).unwrap_or_default();
+        }
+        let points = preview.1.iter().map(|&texel| {
+            let xz = (texel / map - 0.5) * surface.size;
+            let y = cache.surface(texel) * surface.height_scale + 0.3;
+            tf.transform_point(Vec3::new(xz.x, y, xz.y))
+        });
+        gizmos.linestrip(points, Color::srgb(0.35, 0.85, 0.95));
+    }
 }
 
 #[cfg(test)]

@@ -9,7 +9,9 @@ use bevy::{
         FeathersPlugins,
         constants::{fonts, icons},
         controls::{
-            ButtonVariant, FeathersButton, FeathersCheckbox, FeathersScrollbar, FeathersSlider,
+            ButtonVariant, FeathersButton, FeathersCheckbox, FeathersNumberInput,
+            FeathersScrollbar, HardLimit, NumberInputPrecision, NumberInputStep, NumberInputValue,
+            SoftLimit,
         },
         dark_theme::create_dark_theme,
         display::icon,
@@ -20,17 +22,18 @@ use bevy::{
     input_focus::tab_navigation::TabGroup,
     prelude::*,
     scene::SceneList,
-    text::FontWeight,
+    text::{FontWeight, LineHeight},
     ui::Checked,
     ui_widgets::{
-        Activate, Button, Checkbox, ControlOrientation, ScrollArea, SliderPrecision, SliderStep,
-        SliderValue, ValueChange, checkbox_self_update, slider_self_update,
+        Activate, Button, Checkbox, ControlOrientation, ScrollArea, ValueChange,
+        checkbox_self_update,
     },
 };
 
 use crate::camera::OrbitInputBlocked;
 use crate::{
     ErodeParams, MAX_BANK_WIDTH, MAX_SPRINGS, PyramidProgress, ResetSim, SimControl, WaterControl,
+    WaterSolver,
     brush::{BrushMode, TerrainTool, WaterBrush},
 };
 
@@ -114,8 +117,11 @@ enum ErosionSliderFieldKind {
     MeanderLongevity,
     MomentumCoherence,
     UpliftRiverCarving,
+    RiverThreshold,
+    TrailDamping,
     NoiseFrequency,
     NoiseScale,
+    NoiseSeed,
     FeatureSize,
     SourceDetailSmoothing,
     GeologicalAge,
@@ -133,11 +139,29 @@ enum ErosionSliderFieldKind {
     WaterErosion,
     WaterEvaporation,
     WaterRainfall,
+    WaterManning,
+    WaterGravity,
     BedMaxDepth,
     BedShoreSlope,
     BedProfile,
     BedStrength,
     BedBankWidth,
+    BedRiverDepth,
+    BedRiverWidth,
+    BedChannelDischarge,
+    WaterRainWater,
+    BedLoadGrain,
+    BedLoadK,
+    BedLoadCriticalShields,
+    BedLoadSlopeEffect,
+    BedLoadHelical,
+    BedLoadMorphFactor,
+    BedLoadRefineSteps,
+    BedLoadRockHardness,
+    RiverBrushDischarge,
+    RiverBrushArmour,
+    RiverBrushDetail,
+    RiverBrushBreach,
 }
 
 impl ErosionSliderFieldKind {
@@ -177,6 +201,8 @@ impl ErosionSliderFieldKind {
             Self::VelocityRandomnessRefinement => params.velocity_randomness_refinement = value,
             Self::UpliftAmount => params.uplift = value,
             Self::RiverScale => params.river_scale = value,
+            Self::RiverThreshold => params.river_threshold = value,
+            Self::TrailDamping => params.trail_damping = value,
             Self::RiverCharacter => params.river_character = value,
             Self::RiverVolume => params.river_volume = value,
             Self::RiverFrictionReduction => params.river_friction_reduction = value,
@@ -186,6 +212,7 @@ impl ErosionSliderFieldKind {
             Self::UpliftRiverCarving => params.uplift_river_carving = value,
             Self::NoiseFrequency => params.noise_frequency = value,
             Self::NoiseScale => params.noise_scale = value,
+            Self::NoiseSeed => params.noise_seed = value as u32,
             Self::FeatureSize => params.feature_size = value,
             Self::SourceDetailSmoothing => params.source_detail_smoothing = value,
             Self::GeologicalAge => params.geological_age = value,
@@ -199,33 +226,73 @@ impl ErosionSliderFieldKind {
             Self::GranularityStrength => params.granularity_strength = value,
             Self::AgeStrength => params.age_strength = value,
             Self::BrushRadius => brush.radius = value,
+            Self::RiverBrushDischarge => brush.river.discharge = value,
+            Self::RiverBrushArmour => brush.river.armour = value,
+            Self::RiverBrushDetail => brush.river.bed_detail = value,
+            Self::RiverBrushBreach => brush.river.breach_depth = value / 100.0,
             Self::BrushStrength => brush.strength = value,
             Self::WaterErosion => water.sediment_capacity = value,
             // Shown in % per second.
             Self::WaterEvaporation => water.evaporation = value / 100.0,
             // Shown in ‰ of the map height per second.
             Self::WaterRainfall => water.rainfall = value / 1000.0,
+            Self::WaterManning => water.manning_n = value,
+            Self::WaterGravity => water.gravity = value,
             Self::BedMaxDepth => water.bed.max_depth = value,
             Self::BedShoreSlope => water.bed.shore_slope = value,
             Self::BedProfile => water.bed.profile = value,
             Self::BedStrength => water.bed.strength = value,
             Self::BedBankWidth => water.bed.bank_width = value,
+            Self::BedRiverDepth => water.bed.river_depth = value,
+            Self::BedRiverWidth => water.bed.river_width = value,
+            Self::BedChannelDischarge => water.bed.channel_discharge = value,
+            // Shown per thousand trail steps.
+            Self::WaterRainWater => water.rain_water = value / 1000.0,
+            Self::BedLoadGrain => water.bed_load.grain = value,
+            Self::BedLoadK => water.bed_load.k = value,
+            Self::BedLoadCriticalShields => water.bed_load.critical_shields = value,
+            Self::BedLoadSlopeEffect => water.bed_load.slope_effect = value,
+            Self::BedLoadHelical => water.bed_load.helical_strength = value,
+            Self::BedLoadMorphFactor => water.bed_load.morph_factor = value,
+            Self::BedLoadRefineSteps => water.bed_load.refine_steps = value as u32,
+            Self::BedLoadRockHardness => water.bed_load.rock_hardness = value,
         }
     }
 
+    /// Every slider that shapes the erosion reruns the cascade; the rest (brush, water, beds,
+    /// views and pacing) apply live.
     fn resets_sim(&self) -> bool {
-        matches!(
+        !matches!(
             self,
-            Self::NoiseFrequency
-                | Self::NoiseScale
-                | Self::ReferenceDetailScale
-                | Self::FeatureSize
-                | Self::SourceDetailSmoothing
-                | Self::GeologicalAge
-                | Self::MaskFrequency
-                | Self::OutflowSeaLevel
-                | Self::OutflowBorder
-                | Self::BedrockDepth
+            Self::IterationsPerFrame
+                | Self::AgeStrength
+                | Self::BrushRadius
+                | Self::BrushStrength
+                | Self::WaterErosion
+                | Self::WaterEvaporation
+                | Self::WaterRainfall
+                | Self::WaterManning
+                | Self::WaterGravity
+                | Self::BedMaxDepth
+                | Self::BedShoreSlope
+                | Self::BedProfile
+                | Self::BedStrength
+                | Self::BedBankWidth
+                | Self::BedRiverDepth
+                | Self::BedRiverWidth
+                | Self::BedChannelDischarge
+                | Self::WaterRainWater
+                | Self::BedLoadGrain
+                | Self::BedLoadK
+                | Self::BedLoadCriticalShields
+                | Self::BedLoadSlopeEffect
+                | Self::BedLoadHelical
+                | Self::BedLoadMorphFactor
+                | Self::BedLoadRefineSteps
+                | Self::BedLoadRockHardness
+                // New rivers take the discharge; armour re-sends the existing beds.
+                | Self::RiverBrushDischarge
+                | Self::RiverBrushArmour
         )
     }
 
@@ -233,9 +300,12 @@ impl ErosionSliderFieldKind {
         matches!(
             self,
             Self::RidgeErosionSteps
+                | Self::NoiseSeed
                 | Self::IterationsPerFrame
                 | Self::BrushRadius
                 | Self::BedBankWidth
+                | Self::WaterGravity
+                | Self::BedLoadRefineSteps
         )
     }
 }
@@ -266,10 +336,19 @@ enum ToggleKind {
     BedrockMapIsHeight,
     AdditiveSediment,
     NormalizeAge,
+    MomentumFlow,
+    SecondOrderDepth,
+    LiveBedLoad,
 }
 
 impl ToggleKind {
-    fn get(self, params: &ErodeParams, sim: &SimControl, brush: &WaterBrush) -> bool {
+    fn get(
+        self,
+        params: &ErodeParams,
+        sim: &SimControl,
+        brush: &WaterBrush,
+        water: &WaterControl,
+    ) -> bool {
         match self {
             Self::Paused => sim.paused,
             Self::ContinueAfterCascade => sim.continue_after_cascade,
@@ -288,10 +367,20 @@ impl ToggleKind {
             Self::BedrockMapIsHeight => params.bedrock_mode != 0,
             Self::AdditiveSediment => params.additive_sediment != 0,
             Self::NormalizeAge => params.normalize_age != 0,
+            Self::MomentumFlow => water.solver == WaterSolver::Swe,
+            Self::SecondOrderDepth => water.second_order_depth,
+            Self::LiveBedLoad => water.bed_load.live,
         }
     }
 
-    fn set(self, params: &mut ErodeParams, sim: &mut SimControl, brush: &mut WaterBrush, on: bool) {
+    fn set(
+        self,
+        params: &mut ErodeParams,
+        sim: &mut SimControl,
+        brush: &mut WaterBrush,
+        water: &mut WaterControl,
+        on: bool,
+    ) {
         let v = u32::from(on);
         match self {
             Self::Paused => sim.paused = on,
@@ -311,6 +400,15 @@ impl ToggleKind {
             Self::BedrockMapIsHeight => params.bedrock_mode = v,
             Self::AdditiveSediment => params.additive_sediment = v,
             Self::NormalizeAge => params.normalize_age = v,
+            Self::MomentumFlow => {
+                water.solver = if on {
+                    WaterSolver::Swe
+                } else {
+                    WaterSolver::Pipes
+                }
+            }
+            Self::SecondOrderDepth => water.second_order_depth = on,
+            Self::LiveBedLoad => water.bed_load.live = on,
         }
     }
 
@@ -318,6 +416,10 @@ impl ToggleKind {
         matches!(
             self,
             Self::Rivers
+                | Self::RidgeErosion
+                | Self::ClampRiverChanneling
+                | Self::HydroConditioning
+                | Self::AccumulateOutflow
                 | Self::SoftnessMask
                 | Self::ErosionMask
                 | Self::UpliftMap
@@ -387,14 +489,20 @@ fn sync_toggles(
     params: Res<ErodeParams>,
     sim: Res<SimControl>,
     brush: Res<WaterBrush>,
+    water: Res<WaterControl>,
     toggles: Query<(Entity, &Toggle, Has<Checked>)>,
     added: Query<(), Added<Toggle>>,
 ) {
-    if !(params.is_changed() || sim.is_changed() || brush.is_changed() || !added.is_empty()) {
+    if !(params.is_changed()
+        || sim.is_changed()
+        || brush.is_changed()
+        || water.is_changed()
+        || !added.is_empty())
+    {
         return;
     }
     for (entity, toggle, checked) in &toggles {
-        let on = toggle.kind.get(&params, &sim, &brush);
+        let on = toggle.kind.get(&params, &sim, &brush, &water);
         if on && !checked {
             commands.entity(entity).insert(Checked);
         } else if !on && checked {
@@ -440,6 +548,7 @@ fn update_brush_ui(
             BrushMode::Rain => "Drag: rain erodes under the brush",
             BrushMode::Terrain(_) => "Drag: edit · Shift+drag: undo edits",
             BrushMode::WaterBody => "Drag: pour · Shift: remove · Alt+click: spring",
+            BrushMode::River => "Click: river from here · Shift+click: remove",
         }
     };
     for mut text in &mut hints {
@@ -560,6 +669,8 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                             @brush_mode_button("Terrain", BrushMode::Terrain(TerrainTool::Raise))
                             --
                             @brush_mode_button("Water", BrushMode::WaterBody)
+                            --
+                            @brush_mode_button("River", BrushMode::River)
                         })
                         --
                         Node {
@@ -587,12 +698,43 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         @slider_row("Strength", 0.01, 5.0, brush.strength, ErosionSliderFieldKind::BrushStrength)
                     })
                     --
+                    @section("River Brush", true, bsn_list! {
+                        @note_text("Click the terrain: a river routes itself downhill from there, with a carved bed and a spring.")
+                        --
+                        @slider_row("Discharge", 0.1, 8.0, brush.river.discharge, ErosionSliderFieldKind::RiverBrushDischarge)
+                        --
+                        @slider_row("Armour", 0.0, 1.0, brush.river.armour, ErosionSliderFieldKind::RiverBrushArmour)
+                        --
+                        @slider_row("Bed Detail", 0.0, 2.0, brush.river.bed_detail, ErosionSliderFieldKind::RiverBrushDetail)
+                        --
+                        @slider_row("Breach Depth (cells)", 0.0, 10.0, brush.river.breach_depth * 100.0, ErosionSliderFieldKind::RiverBrushBreach)
+                        --
+                        @button_row(bsn_list! {
+                            @FeathersButton {
+                                @caption: bsn! { Text("Clear Rivers") ThemedText },
+                            }
+                            on(|_: On<Activate>, mut brush: ResMut<WaterBrush>| {
+                                brush.clear_rivers = true;
+                            })
+                        })
+                    })
+                    --
                     @section("Water", true, bsn_list! {
                         @slider_row("Erosion", 0.0, 0.01, water.sediment_capacity, ErosionSliderFieldKind::WaterErosion)
                         --
                         @slider_row("Evaporation %/s", 0.0, 10.0, water.evaporation * 100.0, ErosionSliderFieldKind::WaterEvaporation)
                         --
                         @slider_row("Rainfall ‰/s", 0.0, 1.0, water.rainfall * 1000.0, ErosionSliderFieldKind::WaterRainfall)
+                        --
+                        @slider_row("Rain Water (per 1000 trail steps)", 0.0, 2.0, water.rain_water * 1000.0, ErosionSliderFieldKind::WaterRainWater)
+                        --
+                        @toggle_row("Momentum Flow (SWE)", ToggleKind::MomentumFlow)
+                        --
+                        @toggle_row("Second-Order Depth Flux", ToggleKind::SecondOrderDepth)
+                        --
+                        @slider_row("Bed Friction (Manning n)", 0.002, 0.1, water.manning_n, ErosionSliderFieldKind::WaterManning)
+                        --
+                        @slider_row("Gravity (cells/s²)", 250.0, 8000.0, water.gravity, ErosionSliderFieldKind::WaterGravity)
                         --
                         @note_text("Springs: 0")
                         SpringCountText
@@ -615,7 +757,7 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                     })
                     --
                     @section("Lake & River Beds", true, bsn_list! {
-                        @note_text("Rebuilds beds under the current water.")
+                        @note_text("Cuts channels sized by their discharge, and lake bowls, under the current water.")
                         --
                         @FeathersButton {
                             @caption: bsn! { Text("Shape Beds (G)") ThemedText },
@@ -624,6 +766,12 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         on(|_: On<Activate>, mut water: ResMut<WaterControl>| {
                             water.shape_generation = water.shape_generation.wrapping_add(1);
                         })
+                        --
+                        @slider_row("River Depth", 0.0, 0.03, water.bed.river_depth, ErosionSliderFieldKind::BedRiverDepth)
+                        --
+                        @slider_row("River Width", 1.0, 16.0, water.bed.river_width, ErosionSliderFieldKind::BedRiverWidth)
+                        --
+                        @slider_row("Channel Discharge", 0.0, 0.2, water.bed.channel_discharge, ErosionSliderFieldKind::BedChannelDischarge)
                         --
                         @slider_row("Max Depth", 0.0, 0.1, water.bed.max_depth, ErosionSliderFieldKind::BedMaxDepth)
                         --
@@ -636,10 +784,41 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         @slider_row("Bank Width", 1.0, MAX_BANK_WIDTH, water.bed.bank_width, ErosionSliderFieldKind::BedBankWidth)
                     })
                     --
+                    @section("Bed Load", true, bsn_list! {
+                        @note_text("Flowing water moves its bed: bars, pools, steps and deltas.")
+                        --
+                        @toggle_row("Live Bed Load", ToggleKind::LiveBedLoad)
+                        --
+                        @FeathersButton {
+                            @caption: bsn! { Text("Refine Beds (M)") ThemedText },
+                        }
+                        on(|_: On<Activate>, mut water: ResMut<WaterControl>| {
+                            water.refine_generation = water.refine_generation.wrapping_add(1);
+                        })
+                        --
+                        @slider_row("Grain", 0.02, 2.0, water.bed_load.grain, ErosionSliderFieldKind::BedLoadGrain)
+                        --
+                        @slider_row("Bed Load K", 0.0, 20.0, water.bed_load.k, ErosionSliderFieldKind::BedLoadK)
+                        --
+                        @slider_row("Critical Shields", 0.0, 0.2, water.bed_load.critical_shields, ErosionSliderFieldKind::BedLoadCriticalShields)
+                        --
+                        @slider_row("Rock Hardness", 0.0, 20.0, water.bed_load.rock_hardness, ErosionSliderFieldKind::BedLoadRockHardness)
+                        --
+                        @slider_row("Slope Effect", 0.1, 5.0, water.bed_load.slope_effect, ErosionSliderFieldKind::BedLoadSlopeEffect)
+                        --
+                        @slider_row("Helical Strength", 0.0, 60.0, water.bed_load.helical_strength, ErosionSliderFieldKind::BedLoadHelical)
+                        --
+                        @slider_row("Morph. Factor", 1.0, 100.0, water.bed_load.morph_factor, ErosionSliderFieldKind::BedLoadMorphFactor)
+                        --
+                        @slider_row("Refine Steps", 50.0, 4000.0, water.bed_load.refine_steps as f32, ErosionSliderFieldKind::BedLoadRefineSteps)
+                    })
+                    --
                     @section("Terrain Source", false, bsn_list! {
                         @slider_row("Noise Freq", 0.001, 0.05, params.noise_frequency, ErosionSliderFieldKind::NoiseFrequency)
                         --
                         @slider_row("Noise Scale", 0.5, 5.0, params.noise_scale, ErosionSliderFieldKind::NoiseScale)
+                        --
+                        @slider_row("Seed", 0.0, 100.0, params.noise_seed as f32, ErosionSliderFieldKind::NoiseSeed)
                         --
                         @FeathersButton {
                             @caption: bsn! { Text("Reset Terrain Edits (X)") ThemedText },
@@ -663,7 +842,7 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         @note_text(format!("Pyramid Levels: {}", params.pyramid_levels().len()))
                         PyramidLevelCountText
                         --
-                        @slider_row("Feature Size", 0.5, 64.0, params.feature_size, ErosionSliderFieldKind::FeatureSize)
+                        @slider_row("Feature Size", 0.5, 128.0, params.feature_size, ErosionSliderFieldKind::FeatureSize)
                         --
                         @slider_row("Detail Smoothing", 0.0, 4.0, params.source_detail_smoothing, ErosionSliderFieldKind::SourceDetailSmoothing)
                         --
@@ -738,6 +917,10 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         @toggle_row("Do Rivers", ToggleKind::Rivers)
                         --
                         @slider_row("River Scale", 0.0, 1.0, params.river_scale, ErosionSliderFieldKind::RiverScale)
+                        --
+                        @slider_row("River Threshold", 0.0, 200.0, params.river_threshold, ErosionSliderFieldKind::RiverThreshold)
+                        --
+                        @slider_row("Trail Damping", 0.0, 1.0, params.trail_damping, ErosionSliderFieldKind::TrailDamping)
                         --
                         @slider_row("River Character", 0.0, 2.0, params.river_character, ErosionSliderFieldKind::RiverCharacter)
                         --
@@ -949,8 +1132,8 @@ fn toggle_row(label: &str, kind: ToggleKind) -> impl Scene {
         }
         Toggle { kind: {kind} }
         on(checkbox_self_update)
-        on(move |change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut brush: ResMut<WaterBrush>, mut reset: ResMut<ResetSim>| {
-            kind.set(&mut params, &mut sim, &mut brush, change.value);
+        on(move |change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut brush: ResMut<WaterBrush>, mut water: ResMut<WaterControl>, mut reset: ResMut<ResetSim>| {
+            kind.set(&mut params, &mut sim, &mut brush, &mut water, change.value);
             if kind.resets_sim() {
                 reset.generation = reset.generation.wrapping_add(1);
             }
@@ -1044,6 +1227,9 @@ fn slider_row(
 ) -> impl Scene {
     let label = label.to_string();
     let (step, precision) = slider_step(min, max, field.is_int());
+    // Shown at the field's precision, so 0.2 does not read 0.19999999.
+    let scale = 10f32.powi(precision);
+    let value = (value * scale).round() / scale;
     bsn! {
         Node {
             display: Display::Flex,
@@ -1069,17 +1255,19 @@ fn slider_row(
                 min_width: px(60.0),
             }
             Children [
-                @FeathersSlider {
-                    @min: min,
-                    @max: max,
-                }
-                SliderValue(value)
-                SliderStep(step)
-                SliderPrecision(precision)
+                // Drag to scrub through the range, or click to type a value (Enter or clicking
+                // away applies it).
+                @FeathersNumberInput
+                NumberInputValue::F32(value)
+                SoftLimit::f32(min..=max)
+                HardLimit::f32(min..=max)
+                NumberInputStep({step as f64})
+                NumberInputPrecision(precision)
                 ErosionSliderField
-                on(slider_self_update)
-                on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut brush: ResMut<WaterBrush>, mut water: ResMut<WaterControl>, mut reset: ResMut<ResetSim>| {
-                    field.apply(&mut params, &mut sim, &mut brush, &mut water, change.value);
+                on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut brush: ResMut<WaterBrush>, mut water: ResMut<WaterControl>, mut reset: ResMut<ResetSim>, mut commands: Commands| {
+                    let value = if field.is_int() { change.value.round() } else { change.value };
+                    commands.entity(change.source).insert(NumberInputValue::F32(value));
+                    field.apply(&mut params, &mut sim, &mut brush, &mut water, value);
                     if field.resets_sim() {
                         reset.generation = reset.generation.wrapping_add(1);
                     }
@@ -1100,13 +1288,17 @@ fn shrink_slider_value_font(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
 ) {
-    for (_slider, children) in &q {
-        if let Some(&text_container) = children.first() {
-            commands.entity(text_container).insert(InheritableFont {
-                font: asset_server.load(fonts::MONO),
-                font_size: FontSize::Px(SLIDER_VALUE_FONT_SIZE),
-                weight: FontWeight::NORMAL,
-            });
+    for (_input, children) in &q {
+        // The number input's text field, sized to the row.
+        if let Some(&text) = children.first() {
+            commands.entity(text).insert((
+                InheritableFont {
+                    font: asset_server.load(fonts::MONO),
+                    font_size: FontSize::Px(SLIDER_VALUE_FONT_SIZE),
+                    weight: FontWeight::NORMAL,
+                },
+                LineHeight::Px(SLIDER_HEIGHT),
+            ));
         }
     }
 }

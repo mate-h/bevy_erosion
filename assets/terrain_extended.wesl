@@ -98,6 +98,8 @@ const MODE_HEIGHT: u32 = 4u;
 const MODE_VIEW_NORMALS: u32 = 5u;
 const MODE_CURVATURE: u32 = 6u;
 const MODE_AGE: u32 = 7u;
+const MODE_SIMPLE: u32 = 8u;
+const MODE_RIVERS: u32 = 9u;
 
 // Convert HSV to RGB (hue, saturation, value all in [0, 1])
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
@@ -192,6 +194,11 @@ fn get_preview_color(mode: u32, uv: vec2<f32>, world_normal: vec3<f32>) -> vec4<
             let curvature = analysis.a; // Alpha channel contains curvature
             let color = heat_map(curvature);
             return vec4<f32>(color, 1.0);
+        }
+        case MODE_RIVERS: {
+            // KTT river momentum (Do Rivers), scaled in the erosion blit
+            let rivers = textureSampleLevel(height_tex, height_sampler, uv, 0.0).z;
+            return vec4<f32>(heat_map(rivers), 1.0);
         }
         case MODE_AGE: {
             // KTT __Age (time since a trail last changed the cell), scaled in the erosion blit
@@ -354,7 +361,14 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     }
     else {
         // Simple Lambert shading for preview modes - apply AO as simple multiplier
-        out.color = apply_lambert_shading(base_color, in.world_normal);
+        var color = base_color;
+        if (preview_params.mode == MODE_SIMPLE) {
+            // Flat tint where there is water, so the simulations stay visible without optics.
+            let ground = textureSampleLevel(height_tex, height_sampler, in.uv, 0.0).x;
+            let wet = smoothstep(WET_DEPTH, 4.0 * FULL_DEPTH, water_depth_at(in.uv, ground));
+            color = vec4<f32>(mix(color.rgb, vec3<f32>(0.05, 0.2, 0.3), wet), color.a);
+        }
+        out.color = apply_lambert_shading(color, in.world_normal);
         out.color = vec4<f32>(out.color.rgb * ao_value, out.color.a);
     }
     
