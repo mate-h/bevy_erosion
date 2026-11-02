@@ -332,7 +332,7 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                 })
             ),
             slider_row("Brush Radius", 2.0, 128.0, WaterBrush::default().radius, ErosionSliderFieldKind::BrushRadius),
-            slider_row("Brush Strength", 0.01, 1.0, WaterBrush::default().strength, ErosionSliderFieldKind::BrushStrength),
+            slider_row("Brush Strength", 0.01, 5.0, WaterBrush::default().strength, ErosionSliderFieldKind::BrushStrength),
             (
                 @FeathersButton {
                     @caption: bsn! { (Text("Clear Sea (C)") ThemedText) },

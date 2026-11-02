@@ -39,11 +39,12 @@ impl Plugin for WaterBrushPlugin {
     }
 }
 
-/// Rain trails per brush texel per dispatch at strength 1 (KTT's map-wide density is 0.01 at the
-/// default Erosion_Amount).
-const RAIN_DENSITY: f32 = 0.1;
-/// Rain dispatches per frame while the button is held.
-const RAIN_PASSES: u32 = 8;
+/// Rain trail starts per brush texel per second at strength 1. The cascade's finest level starts
+/// about 2 per texel in total (200 dispatches at KTT's 1% density), so one second of rain at full
+/// strength erodes like one more finest-level batch under the brush.
+const RAIN_STARTS_PER_SECOND: f32 = 2.0;
+/// Rain dispatches per frame (one ridge-biased, one flow-biased, like the cascade alternates).
+const RAIN_PASSES: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BrushMode {
@@ -61,10 +62,25 @@ pub struct WaterBrush {
     pub mode: BrushMode,
     /// Brush radius in map texels.
     pub radius: f32,
-    /// Rain: trail density (× [`RAIN_DENSITY`]). Sea: water added per frame at the center (0..1).
+    /// Rain: rate (× [`RAIN_STARTS_PER_SECOND`]). Sea: water added per frame at the center (0..1).
     pub strength: f32,
     /// Set to clear all painted water on the next frame.
     pub clear_requested: bool,
+}
+
+impl WaterBrush {
+    /// Rain for one frame of `dt` seconds centered on `center` (map texels).
+    pub fn rain_stroke(&self, center: Vec2, dt: f32) -> BrushStroke {
+        let area = std::f32::consts::PI * self.radius * self.radius;
+        let starts = self.strength * RAIN_STARTS_PER_SECOND * area * dt;
+        BrushStroke {
+            active: true,
+            center,
+            radius: self.radius,
+            particles: (starts / RAIN_PASSES as f32).ceil() as u32,
+            passes: RAIN_PASSES,
+        }
+    }
 }
 
 impl Default for WaterBrush {
@@ -280,6 +296,7 @@ fn ray_hit(
 fn paint_water(
     mut brush: ResMut<WaterBrush>,
     mut stroke: ResMut<BrushStroke>,
+    time: Res<Time>,
     hit: Res<BrushHit>,
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -294,13 +311,10 @@ fn paint_water(
     let clear = std::mem::take(&mut brush.clear_requested);
     let painting = brush.enabled && !blocked.0 && buttons.pressed(MouseButton::Left);
     let rain = painting && hit.world.is_some() && brush.mode == BrushMode::Rain;
-    let area = std::f32::consts::PI * brush.radius * brush.radius;
-    *stroke = BrushStroke {
-        active: rain,
-        center: hit.texel,
-        radius: brush.radius,
-        particles: (brush.strength * RAIN_DENSITY * area).ceil() as u32,
-        passes: RAIN_PASSES,
+    *stroke = if rain {
+        brush.rain_stroke(hit.texel, time.delta_secs())
+    } else {
+        BrushStroke::default()
     };
     let sea = painting && hit.world.is_some() && brush.mode == BrushMode::Sea;
     if !clear && !sea {
