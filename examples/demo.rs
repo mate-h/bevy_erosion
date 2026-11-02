@@ -96,6 +96,7 @@ fn print_controls() {
     println!("  [ / ] - brush radius");
     println!("  Alt + click (water body) - place a spring, Alt + Shift + click removes springs");
     println!("  C - clear water and springs   X - reset terrain edits");
+    println!("  G - shape lake and river beds under the current water");
 }
 
 fn spawn_terrain(
@@ -234,7 +235,15 @@ fn handle_sim_input(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<SimControl>
     }
 }
 
-fn handle_brush_input(keys: Res<ButtonInput<KeyCode>>, mut brush: ResMut<WaterBrush>) {
+fn handle_brush_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut brush: ResMut<WaterBrush>,
+    mut water: ResMut<WaterControl>,
+) {
+    if keys.just_pressed(KeyCode::KeyG) {
+        water.shape_generation = water.shape_generation.wrapping_add(1);
+        println!("Shaping lake and river beds");
+    }
     if keys.just_pressed(KeyCode::KeyB) {
         brush.enabled = !brush.enabled;
         println!("Water brush: {}", if brush.enabled { "on" } else { "off" });

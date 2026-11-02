@@ -4,7 +4,7 @@ import bevy_pbr::render::{
     forward_io::{VertexOutput, FragmentOutput},
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing, alpha_discard},
-    mesh_view_bindings::view,
+    mesh_view_bindings::{view, globals},
 };
 
 // Extension bind group uses MATERIAL_BIND_GROUP with slots starting at 100
@@ -27,7 +27,7 @@ struct PreviewParams {
     mode: u32,  // 0=PBR, 1=Flow, 2=Sediment, 3=Erosion, 4=Height, 5=ViewSpaceNormals, 6=Curvature, 7=Age
 }
 @group(constants::MATERIAL_BIND_GROUP) @binding(107) var<uniform> preview_params: PreviewParams;
-// Water solver output: R = depth, G = speed, B = suspended sediment.
+// Water solver output: R = depth, GB = velocity (texels per solver step), A = suspended sediment.
 @group(constants::MATERIAL_BIND_GROUP) @binding(108) var water_tex: texture_2d<f32>;
 struct SeaParams {
     level: f32, // 0 = no ocean
@@ -205,6 +205,118 @@ fn get_preview_color(mode: u32, uv: vec2<f32>, world_normal: vec3<f32>) -> vec4<
     }
 }
 
+// --- Water surface shading -------------------------------------------------------------------
+
+// Wet thresholds, as in `water.wgsl`.
+const WET_DEPTH: f32 = 0.0005;
+const FULL_DEPTH: f32 = 0.004;
+// Per world unit of path length through the water: red goes first, blue last.
+const ABSORPTION: vec3<f32> = vec3<f32>(2.2, 0.7, 0.45);
+// In-scattered colour of deep clear water and of silty water.
+const DEEP_COLOR: vec3<f32> = vec3<f32>(0.015, 0.06, 0.08);
+const SILT_COLOR: vec3<f32> = vec3<f32>(0.22, 0.17, 0.10);
+// Ripples per UV unit, and how far (UV per second) a ripple drifts at solver speed 1.
+const RIPPLE_SCALE: f32 = 160.0;
+const RIPPLE_FLOW: f32 = 0.02;
+
+fn hash2(p: vec2<f32>) -> f32 {
+    let q = fract(p * vec2<f32>(123.34, 456.21));
+    let r = q + dot(q, q + 45.32);
+    return fract(r.x * r.y);
+}
+
+fn value_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = mix(hash2(i), hash2(i + vec2<f32>(1.0, 0.0)), u.x);
+    let b = mix(hash2(i + vec2<f32>(0.0, 1.0)), hash2(i + vec2<f32>(1.0, 1.0)), u.x);
+    return mix(a, b, u.y);
+}
+
+fn ripple_height(p: vec2<f32>) -> f32 {
+    return value_noise(p) * 0.65 + value_noise(p * 2.3 + 17.0) * 0.35;
+}
+
+// Gradient of the ripple field at `p` (ripple units).
+fn ripple_gradient(p: vec2<f32>) -> vec2<f32> {
+    let e = 0.15;
+    let c = ripple_height(p);
+    return vec2<f32>(ripple_height(p + vec2<f32>(e, 0.0)) - c, ripple_height(p + vec2<f32>(0.0, e)) - c) / e;
+}
+
+// Flow-map ripples: two copies advected along `flow` (UV per second), each restarting every
+// period and faded out as it restarts, so the pattern never stretches. `x` is the ripple value
+// (for foam), `yz` its gradient.
+fn flow_ripples(uv: vec2<f32>, flow: vec2<f32>, time: f32) -> vec3<f32> {
+    let period = 2.0;
+    var out = vec3<f32>(0.0);
+    for (var k = 0; k < 2; k = k + 1) {
+        let phase = fract(time / period + f32(k) * 0.5);
+        let w = 1.0 - abs(2.0 * phase - 1.0);
+        let p = (uv - flow * phase * period) * RIPPLE_SCALE + f32(k) * 31.7;
+        out += w * vec3<f32>(ripple_height(p), ripple_gradient(p));
+    }
+    return out;
+}
+
+struct WaterShade {
+    color: vec3<f32>,
+    normal: vec3<f32>,
+    roughness: f32,
+    wet: f32,
+}
+
+// Water over the bed colour `bed`: depth absorption along the view path, silt, ripple normals
+// following the solver velocity (ocean waves drift with time) and foam on rapids and shores.
+fn shade_water(uv: vec2<f32>, bed: vec3<f32>, n: vec3<f32>, v: vec3<f32>) -> WaterShade {
+    let ground = textureSampleLevel(height_tex, height_sampler, uv, 0.0).x;
+    let water = textureSampleLevel(water_tex, height_sampler, uv, 0.0);
+    let depth = water_depth_at(uv, ground);
+    var shade: WaterShade;
+    shade.wet = smoothstep(WET_DEPTH, FULL_DEPTH, depth);
+    shade.color = bed;
+    shade.normal = n;
+    shade.roughness = 1.0;
+    if (shade.wet <= 0.0) {
+        return shade;
+    }
+    let ocean = sea.level > 0.0 && sea.level - ground > water.x;
+    let vel = select(water.yz, vec2<f32>(0.0), ocean);
+    let speed = length(vel);
+    let time = globals.time;
+
+    var flow = vel * RIPPLE_FLOW;
+    var amp = 0.04 + 0.25 * smoothstep(0.05, 0.6, speed);
+    if (ocean) {
+        // Open water: waves drift with the wind instead of a current.
+        flow = vec2<f32>(0.004, 0.0025);
+        amp = 0.18;
+    }
+    let ripples = flow_ripples(uv, flow, time);
+    let tilt = ripples.yz * amp * shade.wet;
+    shade.normal = normalize(n + vec3<f32>(-tilt.x, 0.0, -tilt.y));
+
+    // Light crosses the water column down to the bed and back up toward the eye.
+    let column = depth * terrain_params.height_scale;
+    let path = column * (1.0 + 1.0 / max(abs(v.y), 0.15));
+    let transmit = exp(-ABSORPTION * path);
+    let silt = clamp(water.w * 400.0, 0.0, 0.8);
+    let scatter = mix(DEEP_COLOR, SILT_COLOR, silt);
+    var color = mix(bed * transmit + scatter * (1.0 - transmit), scatter, silt * (1.0 - transmit.b));
+
+    // Foam: white water on fast flow, and a thin broken line where the water meets the shore.
+    let shore = 1.0 - smoothstep(FULL_DEPTH, 3.0 * FULL_DEPTH, depth);
+    let rapids = smoothstep(0.35, 0.9, speed);
+    let breaking = select(0.0, 0.5, ocean) * shore;
+    let foam = clamp(max(rapids, max(shore * 0.6, breaking)) * smoothstep(0.75, 1.05, ripples.x), 0.0, 1.0);
+    color = mix(color, vec3<f32>(0.85, 0.88, 0.9), foam);
+
+    shade.color = mix(bed, color, shade.wet);
+    shade.roughness = mix(0.04, 0.5, foam);
+    return shade;
+}
+
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
     var out: FragmentOutput;
@@ -220,14 +332,13 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     
     // Apply base color and lighting
     if (preview_params.mode == MODE_PBR) {
-        // Water: tint by depth and make the surface glossy.
-        let ground = textureSampleLevel(height_tex, height_sampler, in.uv, 0.0).x;
-        let depth = water_depth_at(in.uv, ground);
-        let wet = smoothstep(0.0005, 0.004, depth);
-        let water_color = mix(vec3<f32>(0.10, 0.32, 0.36), vec3<f32>(0.02, 0.07, 0.14), smoothstep(0.0, 0.06, depth));
-        var color = base_color;
-        color = vec4<f32>(mix(color.rgb, water_color, wet), color.a);
-        pbr_input.material.perceptual_roughness = mix(pbr_input.material.perceptual_roughness, 0.06, wet);
+        // Water: absorption, ripples and foam over the bed; glossy, with a water-like F0 so the
+        // atmosphere environment map supplies the Fresnel sky reflection.
+        let water = shade_water(in.uv, base_color.rgb, pbr_input.N, pbr_input.V);
+        let color = vec4<f32>(water.color, base_color.a);
+        pbr_input.N = normalize(mix(pbr_input.N, water.normal, water.wet));
+        pbr_input.material.perceptual_roughness = mix(pbr_input.material.perceptual_roughness, water.roughness, water.wet);
+        pbr_input.material.reflectance = mix(pbr_input.material.reflectance, vec3<f32>(0.35), water.wet);
         // Full PBR lighting for default mode
         pbr_input.material.base_color = alpha_discard(pbr_input.material.flags, pbr_input.material.alpha_cutoff, color);
         // Apply AO to diffuse_occlusion

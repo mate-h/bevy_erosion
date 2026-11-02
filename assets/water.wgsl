@@ -59,7 +59,7 @@ struct WaterParams {
 @group(0) @binding(6) var<storage, read_write> masks: array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read> source_masks: array<vec4<f32>>;
 @group(0) @binding(8) var<uniform> params: WaterParams;
-// R = depth, G = speed, B = suspended sediment (for rendering).
+// R = depth, GB = velocity (texels per step), A = suspended sediment (for rendering).
 @group(1) @binding(0) var water_out: texture_storage_2d<rgba16float, write>;
 
 fn inside(p: vec2<i32>) -> bool {
@@ -174,7 +174,7 @@ fn water_depth(@builtin(global_invocation_id) gid: vec3<u32>) {
     m.y = max(source_masks[i].y, wet);
     masks[gi] = m;
 
-    textureStore(water_out, p, vec4<f32>(d, length(v), sediment[i], 1.0));
+    textureStore(water_out, p, vec4<f32>(d, v, sediment[i]));
 }
 
 // Sediment capacity C = K * tilt * speed (Mei et al.): dissolve below capacity, deposit above.

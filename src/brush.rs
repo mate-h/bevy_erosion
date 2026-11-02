@@ -11,11 +11,12 @@
 //!   flowing; Alt + Shift + click removes the springs under the brush.
 //!
 //! Shift + drag erases (removes water, or undoes terrain edits). Put [`TerrainSurface`] on the
-//! displaced terrain mesh so clicks can be ray-cast against it.
+//! displaced terrain mesh so clicks can be ray-cast against it; the ray hits the displayed
+//! surface, so a click on a lake lands on the water rather than its bed.
 
 use crate::{
-    BrushStroke, ErosionConfig, ErosionImages, MAX_SPRINGS, ResetSim, Spring, WaterControl,
-    camera::OrbitController, camera::OrbitInputBlocked,
+    BrushStroke, ErodeParams, ErosionConfig, ErosionImages, MAX_SPRINGS, ResetSim, Spring,
+    WaterControl, camera::OrbitController, camera::OrbitInputBlocked,
 };
 use bevy::{
     prelude::*,
@@ -175,16 +176,34 @@ pub struct BrushHit {
     pub texel: Vec2,
 }
 
-/// CPU copy of the displayed heights, read back while the brush is on.
+/// CPU copy of the displayed heights and water depths, read back while the brush is on.
 #[derive(Resource, Default)]
 struct HeightCache {
     size: UVec2,
     heights: Vec<f32>,
+    water: Vec<f32>,
+    /// Ocean level (0 = no ocean).
+    sea_level: f32,
 }
 
 impl HeightCache {
+    /// Terrain height under a texel.
     fn sample(&self, texel: Vec2) -> f32 {
-        if self.heights.is_empty() {
+        self.bilinear(&self.heights, texel)
+    }
+
+    /// Displayed surface: the terrain, or the water (lake, river or ocean) above it.
+    fn surface(&self, texel: Vec2) -> f32 {
+        let ground = self.sample(texel);
+        let mut depth = self.bilinear(&self.water, texel);
+        if self.sea_level > 0.0 {
+            depth = depth.max(self.sea_level - ground);
+        }
+        ground + depth.max(0.0)
+    }
+
+    fn bilinear(&self, field: &[f32], texel: Vec2) -> f32 {
+        if field.len() != (self.size.x * self.size.y) as usize || field.is_empty() {
             return 0.0;
         }
         let max = (self.size - 1).as_vec2();
@@ -192,7 +211,7 @@ impl HeightCache {
         let i = p.floor().as_uvec2();
         let j = (i + 1).min(self.size - 1);
         let f = p - p.floor();
-        let at = |x: u32, y: u32| self.heights[(y * self.size.x + x) as usize];
+        let at = |x: u32, y: u32| field[(y * self.size.x + x) as usize];
         let a = at(i.x, i.y).lerp(at(j.x, i.y), f.x);
         let b = at(i.x, j.y).lerp(at(j.x, j.y), f.x);
         a.lerp(b, f.y)
@@ -201,6 +220,19 @@ impl HeightCache {
 
 #[derive(Component)]
 struct HeightReadback;
+
+/// Red channel of an Rgba16Float readback, rows possibly padded.
+fn read_red_channel(data: &[u8], size: UVec2, out: &mut Vec<f32>) {
+    let stride = data.len() / size.y as usize;
+    out.resize((size.x * size.y) as usize, 0.0);
+    for y in 0..size.y as usize {
+        let row = &data[y * stride..];
+        for x in 0..size.x as usize {
+            let bits = u16::from_le_bytes([row[x * 8], row[x * 8 + 1]]);
+            out[y * size.x as usize + x] = f16_to_f32(bits);
+        }
+    }
+}
 
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
@@ -213,38 +245,46 @@ fn f16_to_f32(bits: u16) -> f32 {
     }
 }
 
-/// Keep a GPU readback of the height texture alive only while painting is enabled.
+/// Keep GPU readbacks of the height and water textures alive only while painting is enabled.
 fn sync_height_readback(
     mut commands: Commands,
     brush: Res<WaterBrush>,
     images: Option<Res<ErosionImages>>,
     config: Res<ErosionConfig>,
+    params: Option<Res<ErodeParams>>,
+    mut cache: ResMut<HeightCache>,
     existing: Query<Entity, With<HeightReadback>>,
 ) {
     let Some(images) = images else { return };
-    match (brush.enabled, existing.single()) {
-        (true, Err(_)) => {
-            let size = config.map_size;
-            commands
-                .spawn((Readback::texture(images.height.clone()), HeightReadback))
-                .observe(
-                    move |ev: On<ReadbackComplete>, mut cache: ResMut<HeightCache>| {
-                        // Rgba16Float rows, possibly padded: R holds the height.
-                        let stride = ev.data.len() / size.y as usize;
-                        cache.size = size;
-                        cache.heights.resize((size.x * size.y) as usize, 0.0);
-                        for y in 0..size.y as usize {
-                            let row = &ev.data[y * stride..];
-                            for x in 0..size.x as usize {
-                                let bits = u16::from_le_bytes([row[x * 8], row[x * 8 + 1]]);
-                                cache.heights[y * size.x as usize + x] = f16_to_f32(bits);
-                            }
-                        }
-                    },
-                );
+    if let Some(params) = params {
+        cache.sea_level = if params.use_outflow != 0 {
+            params.outflow_sea_level
+        } else {
+            0.0
+        };
+    }
+    let any = !existing.is_empty();
+    if brush.enabled && !any {
+        let size = config.map_size;
+        cache.size = size;
+        commands
+            .spawn((Readback::texture(images.height.clone()), HeightReadback))
+            .observe(
+                move |ev: On<ReadbackComplete>, mut cache: ResMut<HeightCache>| {
+                    read_red_channel(&ev.data, size, &mut cache.heights);
+                },
+            );
+        commands
+            .spawn((Readback::texture(images.water.clone()), HeightReadback))
+            .observe(
+                move |ev: On<ReadbackComplete>, mut cache: ResMut<HeightCache>| {
+                    read_red_channel(&ev.data, size, &mut cache.water);
+                },
+            );
+    } else if !brush.enabled && any {
+        for entity in &existing {
+            commands.entity(entity).despawn();
         }
-        (false, Ok(entity)) => commands.entity(entity).despawn(),
-        _ => {}
     }
 }
 
@@ -292,7 +332,7 @@ fn pick_terrain(
     let origin = to_local.transform_point3(ray.origin);
     let dir = to_local.transform_vector3(*ray.direction).normalize();
     let map = config.map_size.as_vec2();
-    if let Some(local) = ray_hit(origin, dir, surface, map, |t| cache.sample(t)) {
+    if let Some(local) = ray_hit(origin, dir, surface, map, |t| cache.surface(t)) {
         hit.world = Some(terrain_tf.transform_point(local));
         hit.texel = surface.texel_of(local, map);
     }
@@ -506,7 +546,7 @@ fn draw_brush(
             let a = i as f32 / 64.0 * std::f32::consts::TAU;
             let texel = center + Vec2::new(a.cos(), a.sin()) * radius;
             let xz = (texel / map - 0.5) * surface.size;
-            let y = cache.sample(texel) * surface.height_scale + 0.3;
+            let y = cache.surface(texel) * surface.height_scale + 0.3;
             tf.transform_point(Vec3::new(xz.x, y, xz.y))
         });
         gizmos.linestrip(points, color);

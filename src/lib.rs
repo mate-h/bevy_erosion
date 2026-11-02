@@ -37,6 +37,7 @@ const PYRAMID_RESAMPLE_SHADER: &str = "pyramid_resample.wgsl";
 const PYRAMID_RIVERS_SHADER: &str = "pyramid_rivers.wgsl";
 const PYRAMID_MASKS_SHADER: &str = "pyramid_masks.wgsl";
 const WATER_SHADER: &str = "water.wgsl";
+const WATER_BED_SHADER: &str = "water_bed.wgsl";
 /// Erode dispatches per `writeBack` at geological age 0 (`Compute_Erosion.iterations`).
 const ERODE_ITERS_PER_WRITEBACK: u32 = 200;
 const TERRAIN_SHADER: &str = "terrain_extended.wesl";
@@ -721,6 +722,70 @@ pub struct WaterControl {
     pub sediment_capacity: f32,
     /// Seconds since the last frame (set from [`Time`]); the solver catches up by this much.
     pub dt: f32,
+    /// Bed reconstruction settings (see [`BedShaping`]).
+    pub bed: BedShaping,
+    /// Bump to reshape the beds of the current lakes and rivers once.
+    pub shape_generation: u32,
+}
+
+/// Bed reconstruction (`water_bed.wgsl`): deepens the bed under the current wet domain into a
+/// smooth channel (rivers) or bowl (lakes) below the solver's water surface, and grades the
+/// banks next to it. Depths in height units, widths in texels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BedShaping {
+    /// Depth the bed levels off toward below the water surface.
+    pub max_depth: f32,
+    /// Depth gained per texel of distance from the shore (or of river half-width).
+    pub shore_slope: f32,
+    /// River cross-section exponent of (1 − n²)^profile: below 1 is boxy with steep banks, above
+    /// 1 narrows toward a V.
+    pub profile: f32,
+    /// Blend from the current terrain (0) to the reconstructed bed (1).
+    pub strength: f32,
+    /// Bank grading reach outside the water (texels, at most [`MAX_BANK_WIDTH`]).
+    pub bank_width: f32,
+    /// Bank height at the waterline above the surface.
+    pub bank_rise: f32,
+    /// Bank rise per texel away from the shore.
+    pub bank_slope: f32,
+}
+
+impl Default for BedShaping {
+    fn default() -> Self {
+        Self {
+            max_depth: 0.025,
+            shore_slope: 0.0015,
+            profile: 0.8,
+            strength: 1.0,
+            bank_width: 8.0,
+            bank_rise: 0.001,
+            bank_slope: 0.0015,
+        }
+    }
+}
+
+/// Widest bank grading (dilation steps of the shore distance).
+pub const MAX_BANK_WIDTH: f32 = 32.0;
+/// Red-black SOR sweeps for the bank distance τ and the depth smoothing.
+const BED_TAU_SWEEPS: u32 = 400;
+const BED_SMOOTH_SWEEPS: u32 = 200;
+const BED_OMEGA: f32 = 1.9;
+
+/// Uniform for `water_bed.wgsl` (one entry per red-black parity).
+#[derive(Clone, Copy, ShaderType)]
+struct BedParams {
+    size: UVec2,
+    pad_offset: UVec2,
+    grid_size: UVec2,
+    parity: u32,
+    omega: f32,
+    max_depth: f32,
+    shore_slope: f32,
+    profile: f32,
+    strength: f32,
+    bank_width: f32,
+    bank_rise: f32,
+    bank_slope: f32,
 }
 
 impl Default for WaterControl {
@@ -736,6 +801,8 @@ impl Default for WaterControl {
             evaporation: 0.01,
             sediment_capacity: 0.0005,
             dt: 0.0,
+            bed: BedShaping::default(),
+            shape_generation: 0,
         }
     }
 }
@@ -914,6 +981,7 @@ struct ErosionPipeline {
     layout_terrain_edit: BindGroupLayoutDescriptor,
     layout_water: BindGroupLayoutDescriptor,
     layout_water_out: BindGroupLayoutDescriptor,
+    layout_water_bed: BindGroupLayoutDescriptor,
     layout_blit: BindGroupLayoutDescriptor,
     layout_blit_blur: BindGroupLayoutDescriptor,
     layout_blit_level: BindGroupLayoutDescriptor,
@@ -934,6 +1002,8 @@ struct ErosionPipeline {
     pipeline_blur_v: CachedComputePipelineId,
     /// `water.wgsl`: clear, flux, depth, erode, advect, copy.
     pipelines_water: [CachedComputePipelineId; 6],
+    /// `water_bed.wgsl`: init, tau, prior, smooth, write, dilate, grade.
+    pipelines_water_bed: [CachedComputePipelineId; 7],
 }
 
 impl ErosionPipeline {
@@ -1108,6 +1178,24 @@ fn init_erosion_pipeline(
             ),
         ),
     );
+    // Bed reconstruction on the finest work set (`water_bed.wgsl`).
+    let layout_water_bed = BindGroupLayoutDescriptor::new(
+        "WaterBedGroup0",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                storage_buffer::<u32>(false), // work set height (atomic, fixed-point)
+                storage_buffer::<f32>(false), // water depth
+                storage_buffer_read_only::<Vec2>(false), // velocity
+                storage_buffer::<f32>(false), // bank distance tau
+                storage_buffer::<f32>(false), // bed depth
+                storage_buffer::<f32>(false), // depth prior
+                storage_buffer::<Vec2>(false), // shore (eta, distance) ping
+                storage_buffer::<Vec2>(false), // shore pong
+                uniform_buffer::<BedParams>(true),
+            ),
+        ),
+    );
     let layout_water_out = BindGroupLayoutDescriptor::new(
         "WaterGroup1",
         &BindGroupLayoutEntries::sequential(
@@ -1207,8 +1295,22 @@ fn init_erosion_pipeline(
         )
     });
 
+    let water_bed_shader = asset_server.load(WATER_BED_SHADER);
+    let pipelines_water_bed = [
+        "bed_init",
+        "bed_tau",
+        "bed_prior",
+        "bed_smooth",
+        "bed_write",
+        "bed_dilate",
+        "bed_grade",
+    ]
+    .map(|entry| compute(vec![layout_water_bed.clone()], &water_bed_shader, entry));
+
     commands.insert_resource(ErosionPipeline {
         layout_erosion,
+        layout_water_bed,
+        pipelines_water_bed,
         layout_color,
         layout_terrain_edit,
         layout_water,
@@ -1300,6 +1402,12 @@ struct WaterBuffers {
     sediment_tmp: StorageBuffer<Vec<f32>>,
     velocity: StorageBuffer<Vec<Vec2>>,
     params: UniformBuffer<WaterParams>,
+    /// Bed reconstruction scratch fields (`water_bed.wgsl`).
+    tau: StorageBuffer<Vec<f32>>,
+    bed_depth: StorageBuffer<Vec<f32>>,
+    prior: StorageBuffer<Vec<f32>>,
+    shore: [StorageBuffer<Vec<Vec2>>; 2],
+    bed_params: DynamicUniformBuffer<BedParams>,
 }
 
 impl WaterBuffers {
@@ -1323,6 +1431,11 @@ impl WaterBuffers {
                 source_count: 0,
                 sources: [Vec4::ZERO; MAX_WATER_SOURCES],
             }),
+            tau: StorageBuffer::from(vec![0f32; n]),
+            bed_depth: StorageBuffer::from(vec![0f32; n]),
+            prior: StorageBuffer::from(vec![0f32; n]),
+            shore: [0, 1].map(|_| StorageBuffer::from(vec![Vec2::ZERO; n])),
+            bed_params: DynamicUniformBuffer::default(),
         };
         b.depth.write_buffer(device, queue);
         b.flux.write_buffer(device, queue);
@@ -1330,6 +1443,12 @@ impl WaterBuffers {
         b.sediment_tmp.write_buffer(device, queue);
         b.velocity.write_buffer(device, queue);
         b.params.write_buffer(device, queue);
+        b.tau.write_buffer(device, queue);
+        b.bed_depth.write_buffer(device, queue);
+        b.prior.write_buffer(device, queue);
+        for shore in &mut b.shore {
+            shore.write_buffer(device, queue);
+        }
         b
     }
 }
@@ -1348,6 +1467,8 @@ struct ErosionBindGroups {
     /// Water solver, indexed by work set.
     water: [BindGroup; 2],
     water_out: BindGroup,
+    /// Bed reconstruction, indexed by work set.
+    water_bed: [BindGroup; 2],
     blit: BindGroup,
     blit_blur: BindGroup,
 }
@@ -1389,7 +1510,10 @@ fn prepare_erosion_bind_groups(
     render_device: Res<RenderDevice>,
 ) {
     let Some(buffers) = buffers else { return };
-    if buffers.params.buffer().is_none() || buffers.resample_params.buffer().is_none() {
+    if buffers.params.buffer().is_none()
+        || buffers.resample_params.buffer().is_none()
+        || buffers.water.bed_params.buffer().is_none()
+    {
         return;
     }
     let (
@@ -1526,6 +1650,24 @@ fn prepare_erosion_bind_groups(
                 )),
             )
         }),
+        water_bed: [0, 1].map(|set| {
+            let w = &buffers.water;
+            render_device.create_bind_group(
+                None,
+                &layout(&pipeline.layout_water_bed),
+                &BindGroupEntries::sequential((
+                    buffers.sets[set].height.binding().unwrap(),
+                    w.depth.binding().unwrap(),
+                    w.velocity.binding().unwrap(),
+                    w.tau.binding().unwrap(),
+                    w.bed_depth.binding().unwrap(),
+                    w.prior.binding().unwrap(),
+                    w.shore[0].binding().unwrap(),
+                    w.shore[1].binding().unwrap(),
+                    w.bed_params.binding().unwrap(),
+                )),
+            )
+        }),
         water_out: render_device.create_bind_group(
             None,
             &layout(&pipeline.layout_water_out),
@@ -1583,6 +1725,12 @@ enum FrameCmd {
         steps: u32,
         clear: bool,
     },
+    /// Rebuild the beds under the current water (`water_bed.wgsl`); `offsets` per SOR parity.
+    ShapeBeds {
+        set: usize,
+        offsets: [u32; 2],
+        dilate_steps: u32,
+    },
     Display {
         set: usize,
         offset: u32,
@@ -1611,6 +1759,7 @@ struct ErosionState {
     last_water_clear: u32,
     /// Frame time not yet simulated by the water solver (below one [`WATER_STEP`]).
     water_time: f32,
+    last_shape: u32,
     /// Cascade was finished last frame (AO refresh on the frame it finishes).
     was_finished: bool,
     /// Finest-level displays since AO was last computed (`None` before the first one).
@@ -1845,6 +1994,38 @@ fn plan_erosion_frame(
     } else {
         state.water_time = 0.0;
     }
+    // Bed reconstruction: one shot per request, once the finest level holds the terrain.
+    buffers.water.bed_params.clear();
+    let bed = &water.bed;
+    let bed_params = |parity| BedParams {
+        size: params.map_size,
+        pad_offset,
+        grid_size: finest_size,
+        parity,
+        omega: BED_OMEGA,
+        max_depth: bed.max_depth,
+        shore_slope: bed.shore_slope,
+        profile: bed.profile,
+        strength: bed.strength,
+        bank_width: bed.bank_width.clamp(1.0, MAX_BANK_WIDTH),
+        bank_rise: bed.bank_rise,
+        bank_slope: bed.bank_slope,
+    };
+    let offsets = [0, 1].map(|parity| buffers.water.bed_params.push(&bed_params(parity)));
+    if water.shape_generation != state.last_shape && finest_ready {
+        state.last_shape = water.shape_generation;
+        state.water_active = true;
+        state.frame.push(FrameCmd::ShapeBeds {
+            set: state.cascade.current,
+            offsets,
+            // Even, so the result ends up back in the first shore buffer.
+            dilate_steps: 2 * (bed.bank_width.clamp(1.0, MAX_BANK_WIDTH) / 2.0).ceil() as u32,
+        });
+    }
+    buffers
+        .water
+        .bed_params
+        .write_buffer(&render_device, &queue);
     if !state.frame.is_empty() {
         let level = level_at(state.cascade.level);
         let finest = level.size == finest_size;
@@ -2005,6 +2186,47 @@ fn erosion_compute(
                         pass.dispatch_workgroups(gx, gy, 1);
                     }
                 }
+            }
+            FrameCmd::ShapeBeds {
+                set,
+                offsets,
+                dilate_steps,
+            } => {
+                let (gx, gy) = dispatch_grid(params.map_size);
+                let pipes_bed = pipes.pipelines_water_bed.map(get);
+                let [
+                    Some(init),
+                    Some(tau),
+                    Some(prior),
+                    Some(smooth),
+                    Some(write),
+                    Some(dilate),
+                    Some(grade),
+                ] = pipes_bed
+                else {
+                    continue;
+                };
+                let group = &groups.water_bed[set];
+                let mut run = |p, parity: usize| {
+                    pass.set_pipeline(p);
+                    pass.set_bind_group(0, group, &[offsets[parity]]);
+                    pass.dispatch_workgroups(gx, gy, 1);
+                };
+                run(init, 0);
+                for _ in 0..BED_TAU_SWEEPS {
+                    run(tau, 0);
+                    run(tau, 1);
+                }
+                run(prior, 0);
+                for _ in 0..BED_SMOOTH_SWEEPS {
+                    run(smooth, 0);
+                    run(smooth, 1);
+                }
+                run(write, 0);
+                for k in 0..dilate_steps {
+                    run(dilate, (k % 2) as usize);
+                }
+                run(grade, 0);
             }
             FrameCmd::Display {
                 set,

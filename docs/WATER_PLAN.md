@@ -37,9 +37,8 @@ Verified headless and in the demo window:
 
 ### Known gaps
 
+- **KTT trails do not add water** (see Phase 1.5).
 - **Grid artifacts.** Pipe-model erosion still leaves faint grid-aligned grooves.
-- **No reconstructed bed.** Lake beds are whatever erosion and deposition produced; nothing
-  shapes a proper bed profile yet.
 
 ## Phase 1.5: make water persistent and frame-rate independent (done)
 
@@ -63,53 +62,65 @@ Not done: **KTT rain trails adding water along their path.** The erode pass alre
 storage buffers per stage, so it cannot write the water depth without repacking a binding. A
 rain trail splat buffer read by the water pass is the likely route.
 
-## Phase 2: bed reconstruction (terracraft port)
+## Phase 2: bed reconstruction (done)
 
-Goal: once a lake or river is established, shape its bed like a real channel instead of leaving
-eroded noise. This runs on the wet domain that the solver produces. There is no painted mask and
-no user level.
+"Shape Beds" (button, or G in the demo) deepens the bed under the current water into smooth
+channels and bowls, keeping the water surface where it is. It runs once per request on the wet
+domain the solver produced (depth > 0.002), as one frame of about 1,200 dispatches on the base
+map. The code is `assets/water_bed.wgsl`, with `BedShaping` in `src/lib.rs`.
 
-1. **Wet domain:** cells with depth above a threshold, split into connected bodies.
-   - Still water (low speed) is a lake; flowing water is a river.
-2. **Bank distance τ** (Poisson torsion), `∇²τ = −2` inside the domain with τ = 0 on the banks.
-   - Red-black SOR, ported from `solve_tau_sor`.
-   - Coarse to fine on the existing pyramid grids, so a few hundred dispatches converge.
-   - Gives the local half-width `b = sqrt(τ + |∇τ|²/4)` and the normalized cross-channel
-     coordinate.
-3. **Rivers: stream potential φ**, `∇²φ = 0`, from `solve_phi_sor`.
-   - Pinned to 1 at sources (springs or the highest wet cells) and 0 at outlets (lake, ocean or
-     border).
-   - The flow direction comes from ∇φ (`compute_flow_vectors`).
-4. **Water surface η:**
-   - lakes: the solver's own (flat) surface;
-   - rivers: η(φ) made monotonic, as in terracraft's `wse_lut` (binned low quantile, steady fall,
-     smoothed), so there are no pits or dams.
-5. **Depth prior:**
-   - parabolic cross-section from the normalized cross-channel coordinate, scaled by the
-     half-width (Max Depth and Profile Shape sliders, in map-relative units);
-   - lakes get a smooth bowl from τ.
-6. **Smoothing:** screened Poisson, ported from `solve_lake_bathy_sor`
-   (`∇²d = λ(d − d_prior)`, soft prior weight about 0.045), so there are no rings or corners.
-7. **Write the bed:** `bed = η − d` into the finest work set.
-   - Grade the banks just outside the domain with a quintic S5 ramp
-     (terracraft stage 5: `z_max = η_near + a + b·d_shore`).
-   - Remember the bed so that erosion does not re-roughen it (e.g. outflow = 1 on the bed).
+| Step | Kernel |
+|---|---|
+| Wet domain and shore seeds | `bed_init` |
+| Bank distance τ, `∇²τ = −2`, τ = 0 on the banks, red-black SOR (400 sweeps, ω = 1.9), from `solve_tau_sor` | `bed_tau` |
+| Depth prior: half-width `b = sqrt(τ + ¼|∇τ|²)`, cross-channel `n = |∇τ| / 2b`; rivers `(1 − n²)^profile`, lakes a bowl from `sqrt(2τ)`; blended by solver speed (still → lake) | `bed_prior` |
+| Screened Poisson smoothing `∇²d = λ(d − prior)`, prior weight 0.045 (200 sweeps), from `solve_lake_bathy_sor` | `bed_smooth` |
+| `bed = min(ground, η − d)` blended by Strength; depth = η − bed | `bed_write` |
+| Shore distance and nearest η, chamfer dilation | `bed_dilate` |
+| Bank grading, `z ≤ η + rise + slope·distance`, quintic S5 blend over Bank Width (terracraft stage 5) | `bed_grade` |
 
-Driver:
-- **When it runs:** on demand ("Shape Beds" button), or automatically after water settles.
-- **Pipeline:** a new pipeline group; it reuses the water buffers plus two scratch fields (τ, φ).
+The UI exposes Max Depth, Shore Slope, River Profile, Strength and Bank Width.
 
-## Phase 3: rendering
+Changes from the plan:
+- **No φ or η(φ).** terracraft rebuilds a monotonic water surface because it only has a
+  LiDAR DEM. Here the solver already provides a physical surface, so the bed is cut below it and
+  φ is not needed.
+- **Deepen-only, with a soft depth cap** (`max·(1 − e^(−d/max))`). A hard cap made lakes into
+  flat pans with a steep rim, and raising the bed under narrow streams made them shallower until
+  they drained.
+- **Single grid, no coarse-to-fine.** At 512² a fixed sweep count converges for lakes up to
+  about 100 texels across.
+- **On demand only,** with no automatic run after the water settles.
+- **The bed is not locked against later erosion.** Wet cells are already KTT outflow, but
+  `water_erode` still works on the shaped bed.
 
-- **Water surface:**
-  - Fresnel and a sky reflection from the atmosphere environment map;
-  - depth-based absorption, shore foam from water speed and depth gradient;
-  - flow-aligned normal ripples (using the solver velocity, or ∇φ on rivers).
-- **Ocean:** waves or a normal map, and shoreline blending with the lakes.
-- **Picking:** optionally against the water surface, so a click lands on the water rather than
-  the bed.
+Verified headlessly with one spring (20 s, then Shape Beds):
+- the water surface moves by 0.00017 on average, while the bed drops by 0.014;
+- a cross-section is a smooth symmetric bowl (depth 0 → 0.011 → 0.018 → 0.0198 → … → 0);
+- no NaNs, and dry cells are unchanged on flat ground.
 
-## Phase 4 (optional): morphodynamics refinement
+## Phase 3: rendering (done)
+
+In `assets/terrain_extended.wesl`, `shade_water`:
+- **Light through the water:** Beer–Lambert absorption along the view path (down and back up),
+  in-scattered deep-water colour, and silt tint from the suspended sediment.
+- **Ripples:** flow-map normals advected along the solver velocity, two phases so they never
+  stretch. The water texture now stores velocity: R depth, GB velocity, A sediment. The ocean
+  gets wind-drifting waves instead.
+- **Foam:** on fast flow, on thin water at the shore, and as breaking water on the ocean shore.
+- **Reflections:** low roughness and a water F0 (reflectance 0.35), so the atmosphere
+  environment map supplies the Fresnel sky reflection.
+
+Picking: the brush reads back the water texture too and ray-casts against the displayed surface
+(terrain plus lake, river or ocean). The ring follows the water, and Flatten still targets the
+terrain height.
+
+Checked in the demo (autopilot screenshots): a shallow lake shows its bed through teal water; a
+shaped lake reads deep blue with a soft shore.
+
+Not done: blending the ocean shoreline into the lakes beyond what the shared shading gives.
+
+## Phase 4 (optional, not started): morphodynamics refinement
 
 Port terracraft's local-inertial shallow water and Exner sediment transport for the final bed
 shape.
