@@ -41,7 +41,7 @@ const REFERENCE_DISCHARGE: f32 = 1.0;
 /// Local slope (cells per texel) where step-pools take over from riffle-pools, and where
 /// riffle-pools take over from a plain bed.
 const STEP_POOL_SLOPE: (f32, f32) = (0.02, 0.04);
-const RIFFLE_POOL_SLOPE: (f32, f32) = (0.005, 0.015);
+const RIFFLE_POOL_SLOPE: (f32, f32) = (0.001, 0.004);
 
 /// No river at this texel.
 pub const NO_RIVER: f32 = 1.0e6;
@@ -146,14 +146,18 @@ pub fn rebuild(rivers: &Rivers, bed: &BedShaping, settings: &RiverSettings, size
     out.generation = out.generation.wrapping_add(1);
 }
 
-/// The spring that feeds a river: its discharge over a disc about the channel's width.
+/// The channel is sized for bankfull flow, which comes about every year or two; the spring
+/// feeds this share of it, so the river runs inside its banks.
+const SPRING_SHARE: f32 = 0.5;
+
+/// The spring that feeds a river, over a disc about the channel's width.
 pub fn spring_for(river: &River, bed: &BedShaping) -> crate::Spring {
     let radius = (bed.river_width * river.discharge.max(1e-6).sqrt()).max(2.0);
     // A spring adds `rate` at its centre, falling off as (1 − r²)², which integrates to πR²/3.
     crate::Spring {
         center: river.source,
         radius,
-        rate: river.discharge * 3.0 / (std::f32::consts::PI * radius * radius),
+        rate: SPRING_SHARE * river.discharge * 3.0 / (std::f32::consts::PI * radius * radius),
     }
 }
 
@@ -396,8 +400,11 @@ struct Section {
     /// What steps and pools add to it on the thalweg (height units). It fades out toward the
     /// banks, so they do not become walls.
     extra: f32,
-    /// Thalweg offset toward the outer bank of a bend (texels, + to the left).
-    shift: f32,
+    /// How far the step lips bow downstream in the middle of the channel (channel widths).
+    bow: f32,
+    /// How sharply the channel bends, -1 to 1 (+ turning left). The thalweg moves toward the
+    /// outer bank under a steep cut bank, and a gently sloping point bar builds on the inner one.
+    bend: f32,
     tangent: Vec2,
 }
 
@@ -422,61 +429,83 @@ fn sections(river: &River, shape: &ChannelShape, detail: f32) -> Vec<Section> {
         ((river.profile[a] - river.profile[b]) * CELLS_PER_HEIGHT / (b - a).max(1) as f32).max(0.0)
     };
 
-    // Steps, as extra depth below the bank level. Between steps at `s` and `e` the bed is a
-    // tread that falls gently and ends on the bank level at its lip `e`; at each lip the bed
-    // drops about 0.6 of the fall since the last one, and a pool is scoured below the drop. Step
-    // height to spacing then comes to about the slope (Abrahams et al. 1995 find up to 1.5×),
-    // with the steps 1.5 to 3.5 channel widths apart (Chin 1999).
+    // Steps, as depth added to the channel's (positive, a pool) or taken from it (a lip).
+    // Between steps at `s` and `e` the bed is a nearly flat tread ending at the lip `e`; at each
+    // lip the bed drops about 0.9 of the fall since the last one into a pool scoured about 0.6
+    // of the fall deeper, so a step's height comes to about 1.5 × its spacing × the slope
+    // (Abrahams et al. 1995). Steps about 1.5 × the channel depth high then sit
+    // H / (1.5 S) apart, 1 to 4 channel widths (Chin 1999): closer on steeper reaches. Each lip
+    // sits 0.7 of the channel depth below the banks, so the channel stays continuous and holds
+    // its flow, and its pool hangs below that.
     let mut extra = vec![0.0f32; n];
+    // How far each step's lip bows downstream in the middle, in channel widths.
+    let mut bow = vec![0.4f32; n];
     let mut s = 0usize;
     let mut k = 0u32;
     while s + 1 < n {
-        let w = width(s);
-        let spacing = (2.0 * w * (1.5 + 2.0 * hash01(river.seed, k))).max(3.0) as usize;
+        let w = 2.0 * width(s);
+        let fall_rate = (slope(s) / CELLS_PER_HEIGHT).max(1e-6);
+        let jitter = 0.6 + 0.8 * hash01(river.seed, k);
+        let spacing = (base(s) / fall_rate * jitter).clamp(w, 4.0 * w).max(3.0) as usize;
         let e = (s + spacing).min(n - 1);
         let steep = smoothstep(STEP_POOL_SLOPE.0, STEP_POOL_SLOPE.1, slope(s)) * detail;
-        if steep > 0.0 {
+        if steep > 0.0 && e > s {
             let fall = (river.profile[s] - river.profile[e]).max(0.0);
-            let drop = 0.6 * (0.8 + 0.4 * hash01(river.seed ^ 0x51, k));
-            let reach = (0.3 * spacing as f32).max(1.0);
-            for (j, v) in extra.iter_mut().enumerate().take(e).skip(s) {
-                let left = (e - j) as f32 / (e - s) as f32;
-                let tread = river.profile[e] + (1.0 - drop) * fall * left;
-                let pool = 0.4 * fall * (-((j - s) as f32 / reach).powi(2)).exp();
-                *v += steep * ((river.profile[j] - tread).max(0.0) + pool);
+            let drop = (0.9 * (0.75 + 0.5 * hash01(river.seed ^ 0x51, k))).min(1.0);
+            let reach = (0.25 * spacing as f32).max(1.0);
+            let step: Vec<f32> = (s..e)
+                .map(|j| {
+                    let left = (e - j) as f32 / (e - s) as f32;
+                    let tread = river.profile[e] + (1.0 - drop) * fall * left;
+                    let pool = 0.6 * fall * (-((j - s) as f32 / reach).powi(2)).exp();
+                    (river.profile[j] - tread).max(0.0) + pool
+                })
+                .collect();
+            let lip = step.iter().fold(f32::MAX, |m, &d| m.min(d)) + 0.3 * base(s);
+            for (v, d) in extra[s..e].iter_mut().zip(&step) {
+                *v += steep * (d - lip);
+            }
+            bow[s..e].fill(0.2 + 0.5 * hash01(river.seed ^ 0x3c, k));
+        }
+        s = e;
+        k += 1;
+    }
+    // Riffle-pools: a pool every 5 to 7 channel widths (Leopold et al. 1964), from about 0.1 %
+    // slope to where step-pools take over. Each pool reaches about 0.8 of the channel depth
+    // deeper and the riffles between are a little shallower, so pools come to about twice the
+    // riffles' depth.
+    let mut s = 0usize;
+    while s + 1 < n {
+        let w = width(s);
+        let spacing = (2.0 * w * (5.0 + 2.0 * hash01(river.seed ^ 0xa7, k))).max(4.0) as usize;
+        let e = (s + spacing).min(n - 1);
+        let c = (s + e) / 2;
+        let gentle = smoothstep(RIFFLE_POOL_SLOPE.0, RIFFLE_POOL_SLOPE.1, slope(c))
+            * (1.0 - smoothstep(STEP_POOL_SLOPE.0, STEP_POOL_SLOPE.1, slope(c)))
+            * detail;
+        if gentle > 0.0 {
+            let pool: Vec<f32> = (s..e)
+                .map(|j| {
+                    let t = (j as f32 - c as f32) / w;
+                    0.8 * base(c) * (-t * t).exp()
+                })
+                .collect();
+            let mean = pool.iter().sum::<f32>() / pool.len() as f32;
+            for (v, d) in extra[s..e].iter_mut().zip(&pool) {
+                *v += gentle * (d - mean);
             }
         }
         s = e;
         k += 1;
     }
-    // Riffle-pools: a pool every 5 to 7 channel widths on gentler reaches (Leopold et al. 1964).
-    let mut s = 0usize;
-    while s < n {
-        let w = width(s);
-        let spacing = (2.0 * w * (5.0 + 2.0 * hash01(river.seed ^ 0xa7, k))).max(4.0) as usize;
-        let c = (s + spacing / 2).min(n - 1);
-        let gentle = smoothstep(RIFFLE_POOL_SLOPE.0, RIFFLE_POOL_SLOPE.1, slope(c))
-            * (1.0 - smoothstep(STEP_POOL_SLOPE.0, STEP_POOL_SLOPE.1, slope(c)))
-            * detail;
-        if gentle > 0.0 {
-            let pool = 0.6 * base(c);
-            let r = (3.0 * w).ceil() as usize;
-            for (j, v) in extra.iter_mut().enumerate().take((c + r).min(n)).skip(c.saturating_sub(r)) {
-                let t = (j as f32 - c as f32) / w;
-                *v += gentle * pool * (-t * t).exp();
-            }
-        }
-        s += spacing;
-        k += 1;
-    }
 
-    // A riser falls over a few texels rather than one (a cascade over a boulder line), and no
-    // step or pool goes deeper than 2.5 × the channel.
+    // A riser falls over a few texels rather than one (a cascade over a boulder line). No pool
+    // goes deeper than 3 × the channel, and no lip comes closer than 0.7 of it to the banks.
     let extra: Vec<f32> = (0..n)
         .map(|i| {
-            let (a, b) = (i.saturating_sub(2), (i + 2).min(n - 1));
+            let (a, b) = (i.saturating_sub(1), (i + 1).min(n - 1));
             let mean = extra[a..=b].iter().sum::<f32>() / (b - a + 1) as f32;
-            mean.min(2.5 * base(i))
+            mean.clamp(-0.3 * base(i), 3.0 * base(i))
         })
         .collect();
 
@@ -488,14 +517,14 @@ fn sections(river: &River, shape: &ChannelShape, detail: f32) -> Vec<Section> {
             let (a, b) = (i.saturating_sub(r), (i + r).min(n - 1));
             let turn = tangent(a).perp_dot(tangent(b));
             let curvature = turn / (b - a).max(1) as f32;
-            // The thalweg moves toward the outer bank and a point bar builds on the inner one.
-            let shift = (-curvature * w * w * 2.0 * detail).clamp(-0.4 * w, 0.4 * w);
+            let bend = (curvature * w * 4.0 * detail).clamp(-1.0, 1.0);
             Section {
                 // Pools are wider as well as deeper.
-                width: w * (1.0 + 0.25 * (extra[i] / base(i).max(1e-6)).min(1.0)),
+                width: w * (1.0 + 0.5 * (extra[i] / base(i).max(1e-6)).clamp(0.0, 1.0)),
+                bow: bow[i],
                 depth: base(i),
                 extra: extra[i],
-                shift,
+                bend,
                 tangent: tangent(i),
             }
         })
@@ -529,7 +558,7 @@ pub fn rasterize(rivers: &[River], shape: &ChannelShape, settings: &RiverSetting
         // Nearest sample per texel, for this river.
         let mut nearest = vec![(f32::INFINITY, u32::MAX); n];
         for (i, (p, sec)) in river.path.iter().zip(&secs).enumerate() {
-            let reach = sec.width + sec.shift.abs() + bank + 1.0;
+            let reach = sec.width + bank + 1.0;
             let lo = (*p - reach).floor().max(Vec2::ZERO).as_uvec2();
             let hi = (*p + reach).ceil().as_uvec2().min(size - 1);
             for y in lo.y..=hi.y {
@@ -555,20 +584,40 @@ pub fn rasterize(rivers: &[River], shape: &ChannelShape, settings: &RiverSetting
             {
                 continue;
             }
-            let across = sec.tangent.perp_dot(d) - sec.shift;
-            let x = across.abs() / sec.width;
+            // Across the channel from its centreline (+ to the left), and from the thalweg, which
+            // a bend moves toward its outer bank. The banks stay at ±width from the centreline:
+            // the outer side gets narrower and steep (the cut bank), the inner side wider and
+            // shallow (the point bar).
+            let centre = sec.tangent.perp_dot(d);
+            let thalweg = -0.35 * sec.bend * sec.width;
+            let across = centre - thalweg;
+            let bar_side = across * sec.bend > 0.0;
+            let half = if bar_side {
+                sec.width + thalweg.abs()
+            } else {
+                sec.width - thalweg.abs()
+            };
+            let x = across.abs() / half;
+            // At least about parabolic: a boxier section would stand its banks up as walls
+            // wherever a pool deepens the channel.
+            let rounded = shape.profile.max(1.2);
+            let profile = if bar_side {
+                rounded * (1.0 + 2.5 * sec.bend.abs())
+            } else {
+                rounded
+            };
             // Bank level at the texel's own place along the path, not its nearest sample's, so
             // a steep bed does not come out in stripes.
             let level = sample(&river.profile, i as f32 + d.dot(sec.tangent));
             let cell = if x < 1.0 {
                 let inner = (1.0 - x * x).max(0.0);
                 // Step lips bow downstream in the middle of the channel.
-                let along = i as f32 + d.dot(sec.tangent) - 0.4 * sec.width * inner;
+                let along = i as f32 + d.dot(sec.tangent) - sec.bow * sec.width * inner;
                 let extra = sample_extra(&secs, along);
-                let cut = sec.depth * inner.powf(shape.profile) + extra * inner.powf(1.5);
+                let cut = sec.depth * inner.powf(profile) + extra * inner.powf(2.0);
                 Vec4::new(level - cut, 0.0, settings.armour, sec.depth + extra)
             } else {
-                let out = across.abs() - sec.width;
+                let out = centre.abs() - sec.width;
                 if out >= bank {
                     continue;
                 }
@@ -738,10 +787,13 @@ mod tests {
             sections(r, &shape(), 1.0).iter().map(|s| s.extra).collect()
         };
         let base = shape().river_depth;
-        let spread = |d: &[f32]| d.iter().fold(0.0f32, |m, &v| m.max(v));
+        // From the shallowest lip to the deepest pool.
+        let spread = |d: &[f32]| {
+            d.iter().fold(f32::MIN, |m, &v| m.max(v)) - d.iter().fold(f32::MAX, |m, &v| m.min(v))
+        };
         let step_pool = depths(&steep(0.1));
         let plain = depths(&steep(0.001));
-        assert!(spread(&step_pool) > 2.0 * base, "steps vary the depth: {}", spread(&step_pool));
+        assert!(spread(&step_pool) > 0.5 * base, "steps vary the depth: {}", spread(&step_pool));
         assert!(spread(&plain) < 0.1 * base, "a gentle bed stays plain: {}", spread(&plain));
     }
 

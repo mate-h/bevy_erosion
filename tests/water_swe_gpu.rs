@@ -2368,3 +2368,147 @@ fn river_brush_keeps_its_steps() {
         "armour kept no more detail than a bare bed: {armoured:?} against {bare:?}"
     );
 }
+
+/// River brush data for a look at its realism. Tries sources on a grid and reports each route's
+/// length, drop and sinuosity, then places the longest winding one (or `TEST_RIVER_AT=x,y`),
+/// lets it flow for `TEST_FLOW_SECONDS` and writes, to `TEST_DATA_DIR`:
+/// * `river_long.csv`: per path sample, the ground, bank level, carved bed and bed after flow,
+///   water depth, speed and Froude number;
+/// * `river_sections.csv`: cross-sections every 30 samples, before and after carving;
+/// and hillshades of the carved terrain and the water to `TEST_IMAGE_DIR`.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn inspect_river_brush() {
+    use bevy_erosion::river::{self, RiverBed, RiverSettings};
+    use std::io::Write;
+    let seconds = std::env::var("TEST_FLOW_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20.0);
+    let g = WaterControl::default().gravity;
+    // `TEST_RIVER_TERRAIN=valley`: a winding valley at 1 % instead of the default terrain.
+    let valley = std::env::var("TEST_RIVER_TERRAIN").as_deref() == Ok("valley");
+    let mut h = if valley {
+        Harness::new(WaterSolver::Swe, |x, y| {
+            let centre = N as f32 / 2.0 + 30.0 * (x as f32 * std::f32::consts::TAU / 140.0).sin();
+            0.2 + 0.0001 * (N - 1 - x) as f32 + 0.0004 * (y as f32 - centre).abs()
+        })
+    } else {
+        Harness::natural(WaterSolver::Swe)
+    };
+    {
+        let mut water = h.water();
+        water.bed_load.live = true;
+        water.sediment_capacity = WaterControl::default().sediment_capacity;
+    }
+    let heights = h.read_heights();
+    let bed = h.water().bed;
+    let shape: river::ChannelShape = (&bed).into();
+    let settings = RiverSettings::default();
+    let size = UVec2::splat(N);
+    let sinuosity = |r: &river::River| {
+        let ends = r.path[0].distance(*r.path.last().unwrap()).max(1.0);
+        r.path.len() as f32 / ends
+    };
+    let mut best: Option<(f32, river::River)> = None;
+    for gy in (40..N - 40).step_by(24) {
+        for gx in (40..N - 40).step_by(24) {
+            let at = Vec2::new(gx as f32 + 0.5, gy as f32 + 0.5);
+            let Some(r) = river::place(&heights, &[], &[], size, at, 0.0, &settings, &shape, 1)
+            else {
+                continue;
+            };
+            let drop = (r.profile[0] - r.profile.last().unwrap()) * CELLS_PER_HEIGHT;
+            let s = sinuosity(&r);
+            println!(
+                "source {at}: {} texels, drop {drop:.1} cells, slope {:.3}, sinuosity {s:.2}",
+                r.path.len(),
+                drop / r.path.len() as f32
+            );
+            let score = r.path.len() as f32 * s;
+            if drop > 5.0 && best.as_ref().is_none_or(|(b, _)| score > *b) {
+                best = Some((score, r));
+            }
+        }
+    }
+    let placed = match std::env::var("TEST_RIVER_AT").ok().and_then(|v| {
+        let (x, y) = v.split_once(',')?;
+        Some(Vec2::new(x.parse().ok()?, y.parse().ok()?))
+    }) {
+        Some(at) => river::place(&heights, &[], &[], size, at, 0.0, &settings, &shape, 1).unwrap(),
+        None => best.expect("no river").1,
+    };
+    println!(
+        "placed from {}: {} texels, sinuosity {:.2}",
+        placed.source,
+        placed.path.len(),
+        sinuosity(&placed)
+    );
+    h.water().springs.push(river::spring_for(&placed, &bed));
+    {
+        let mut out = h.app.world_mut().resource_mut::<RiverBed>();
+        out.cells = std::sync::Arc::new(river::rasterize(
+            std::slice::from_ref(&placed),
+            &shape,
+            &settings,
+            size,
+        ));
+        out.generation += 1;
+    }
+    h.run(0.2);
+    let carved = h.read_heights();
+    h.run(seconds);
+    let after = h.read_heights();
+    let water = h.read_water();
+    let depth: Vec<f32> = water.iter().map(|w| w.depth).collect();
+    let speed: Vec<f32> = water.iter().map(|w| w.velocity.length()).collect();
+
+    let dir = std::env::var("TEST_DATA_DIR").unwrap_or_else(|_| "target/validation".into());
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut f = std::fs::File::create(format!("{dir}/river_long.csv")).unwrap();
+    writeln!(f, "s,x,y,ground,bank,carved,after,depth,speed,froude").unwrap();
+    let cell = |field: &[f32], p: Vec2| river::bilinear(field, size, p) * CELLS_PER_HEIGHT;
+    for (i, p) in placed.path.iter().enumerate() {
+        let d = cell(&depth, *p);
+        let u = river::bilinear(&speed, size, *p);
+        writeln!(
+            f,
+            "{i},{},{},{},{},{},{},{d},{u},{}",
+            p.x,
+            p.y,
+            cell(&heights, *p),
+            placed.profile[i] * CELLS_PER_HEIGHT,
+            cell(&carved, *p),
+            cell(&after, *p),
+            u / (g * d.max(1e-4)).sqrt()
+        )
+        .unwrap();
+    }
+    let mut f = std::fs::File::create(format!("{dir}/river_sections.csv")).unwrap();
+    writeln!(f, "s,offset,ground,carved,after,surface").unwrap();
+    for i in (15..placed.path.len()).step_by(30) {
+        let a = placed.path[i.saturating_sub(2)];
+        let b = placed.path[(i + 2).min(placed.path.len() - 1)];
+        let across = (b - a).normalize().perp();
+        for k in -24i32..=24 {
+            let p = placed.path[i] + across * k as f32;
+            writeln!(
+                f,
+                "{i},{k},{},{},{},{}",
+                cell(&heights, p),
+                cell(&carved, p),
+                cell(&after, p),
+                cell(&after, p) + cell(&depth, p)
+            )
+            .unwrap();
+        }
+    }
+    if let Ok(dir) = std::env::var("TEST_IMAGE_DIR") {
+        write_bmp(&format!("{dir}/inspect_carved.bmp"), &hillshade(&carved), N as usize, N as usize, 0.0, 1.0, 3);
+        write_bmp(&format!("{dir}/inspect_water.bmp"), &depth, N as usize, N as usize, 0.0, 0.02, 3);
+        for (name, field) in [("ground", &heights), ("carved", &carved), ("after", &after), ("depth", &depth)] {
+            let bytes: Vec<u8> = field.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(format!("{dir}/inspect_{name}.f32"), bytes).unwrap();
+        }
+    }
+}

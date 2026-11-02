@@ -164,6 +164,36 @@ signal: the outward shift was −0.4 to −1.7 texels at Helical Strength 8–40
 cross-sections are only 16 texels wide, and with weak gravitational smoothing other bedforms
 dominate them. The default stays at r = 1, and the slider covers the literature range.
 
+## River brush (`inspect_river_brush`)
+
+**Setup:** a river placed with the brush, carved, then run for 20 s with live bed load and full
+armour. Two terrains: the default eroded terrain from its highest corner (283 texels, 11 %
+slope), and a winding valley at 0.8 % (`TEST_RIVER_TERRAIN=valley`, 341 texels). The test
+writes the long profile, cross-sections and heights; steps are counted lip to pool on the
+detrended carved bed.
+
+| Measure | Literature | Model |
+|---|---|---|
+| Step height H, spacing L, slope S | H/L ≈ 1–2 × S (Abrahams et al. 1995) | H/L/S 1.30 (H 1.4 cells, L 9.8 texels) |
+| Step spacing | 1–4 channel widths, closer when steeper (Chin 1999) | 1.0 widths at 11 % slope |
+| Riffle-pool spacing | 5–7 channel widths (Leopold et al. 1964) | 73 texels, about 6.5 widths |
+| Pool depth | about twice the riffles' | 1.8 × |
+| Flow over steps and pools | supercritical over steps, subcritical in pools | Froude 0.3 in pools to 1.7 over steps |
+| Lowland flow | Froude about 0.1–0.4 | 0.1 mean, 0.37 max |
+| Flow kept in the channel | at or below bankfull | 1–2 % of wet cells outside the channel |
+| Bends | cut bank outside, point bar inside | thalweg toward the outer bank, gently sloping bar inside |
+
+- The first version was too smooth for its slope (H/L/S 0.84, steps 2.3 widths apart) and
+  carved twice the flow's depth, so the banks stood far above the water. Step height now
+  follows the channel depth and spacing follows H / (1.5 S); the lips sit 0.7 of the channel
+  depth below the banks, so the channel stays continuous.
+- The spring feeds half the design (bankfull) discharge. At the full discharge, a third of the
+  wet cells were outside the channel: the water spilled over the lips and ran down beside it.
+- Routes on the default terrain have sinuosity 1.01–1.2, typical of channels this steep; it
+  slopes 5–25 % everywhere, so every river there is a step-pool torrent.
+- With armour 1 the bed is unchanged after the flow; with armour 0, live bed load and water
+  erosion take its step relief from 0.46 to 0.19 cells in 15 s (`river_brush_keeps_its_steps`).
+
 ## Not yet validated
 
 - **Point bars at equilibrium** (Struiksma et al. 1985; Talmon et al. 1995): the transverse bed
@@ -198,6 +228,12 @@ The open-access copies of these papers could not be downloaded:
 - M. Wong & G. Parker (2006), *Reanalysis and correction of bed-load relation of Meyer-Peter and
   Müller using their own database*, J. Hydraul. Eng. 132(11)
   ([copy](https://documents.epfl.ch/users/b/bl/blanckae/www/HydrauliqueFluviale/Papers/2006_JHE_Wong_Parker.pdf)).
+- A. D. Abrahams, G. Li & J. F. Atkinson (1995), *Step-pool streams: adjustment to maximum flow
+  resistance*, Water Resour. Res. 31(10), 2593–2602 (cited, not read here).
+- A. Chin (1999), *The morphologic structure of step-pools in mountain streams*,
+  Geomorphology 27, 191–204 (cited, not read here).
+- L. B. Leopold, M. G. Wolman & J. P. Miller (1964), *Fluvial Processes in Geomorphology*
+  (cited, not read here).
 - G. Parker & N. Izumi (2000), *Purely erosional cyclic and solitary steps created by flow over
   a cohesive bed*, J. Fluid Mech. 419, 203–238 (https://doi.org/10.1017/S0022112000001403).
 - T. Sun & G. Parker (2005), *Transportational cyclic steps created by flow over an erodible
