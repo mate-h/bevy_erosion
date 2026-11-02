@@ -459,7 +459,13 @@ The CPU code in terracraft, ported to the GPU in `water_morpho.wgsl`:
 Verify on an S-bend carved with terrain edits: the deepest point of each bend's cross-section
 sits on the outer bank, and the skew changes sign between the two bends.
 
-### 4d. Deltas
+### 4d. Deltas (done: physical)
+
+Momentum and Exner build them without special code. In `bed_load_conserves_and_builds_a_delta`
+a steep channel enters a closed basin; after 30 s the bed at the mouth has risen 0.034 on
+average, in a fan that spreads from the jet, and the far basin is unchanged. The shaped path
+below is not needed.
+
 
 - **Physical:** with momentum (4a) and Exner (4b), bed load drops where the jet slows in still
   water, so a mouth bar and delta should grow without special code. Check this first.
