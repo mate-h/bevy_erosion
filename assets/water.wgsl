@@ -194,6 +194,17 @@ fn water_depth(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(water_out, p, vec4<f32>(d, v, sediment[i]));
 }
 
+// Fraction of a height difference that slumps per step where the slope (height per texel)
+// exceeds `WET_TALUS`: matches the old per-pair rule on a face that points down the fall line.
+fn slump_rate(p: vec2<i32>) -> f32 {
+    let lo = vec2<i32>(0);
+    let hi = vec2<i32>(params.size) - 1;
+    let gx = terrain(clamp(p + DIRS[1], lo, hi)) - terrain(clamp(p + DIRS[0], lo, hi));
+    let gy = terrain(clamp(p + DIRS[3], lo, hi)) - terrain(clamp(p + DIRS[2], lo, hi));
+    let g = 0.5 * length(vec2<f32>(gx, gy));
+    return SLUMP_RATE * max(g - WET_TALUS, 0.0) / max(g, 1e-9);
+}
+
 // Sediment capacity C = K * tilt * speed (Mei et al.): dissolve below capacity, deposit above.
 // Every cell reads its neighbours' heights, so the height change is staged in `sediment_tmp` and
 // applied by `water_apply`: writing it here would race the neighbours' reads and cut a
@@ -235,13 +246,20 @@ fn water_erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let from_sediment = dh;
 
-    // Slumping: steep banks in and next to water slide toward the lower side. Every cell applies
-    // its own share of each pairwise exchange, so material is (nearly) conserved.
-    if (near_water) {
-        for (var k = 0; k < 4; k = k + 1) {
-            let diff = terrain(nb[k]) - ground;
-            dh += SLUMP_RATE * sign(diff) * max(abs(diff) - WET_TALUS, 0.0) * 0.25;
+    // Slumping: steep banks in and next to water slide toward the lower side. The rate comes
+    // from the full slope, so it acts across the slope as well as down it; thresholding each
+    // neighbour pair instead smoothed only along the grid axis nearest the fall line and drew
+    // the runoff out into axis-aligned stripes. Only banks of real water slump (either side at
+    // least `FULL_DEPTH` deep): thin sheet runoff on slopes steeper than the talus would
+    // otherwise flatten whole hillsides. Both sides use the same mean rate, so the exchange is
+    // conserved.
+    let rate = slump_rate(p);
+    for (var k = 0; k < 4; k = k + 1) {
+        let q = nb[k];
+        if (all(q == p) || (d < FULL_DEPTH && depth[widx(q)] < FULL_DEPTH)) {
+            continue;
         }
+        dh += 0.5 * (rate + slump_rate(q)) * (terrain(q) - ground) * 0.25;
     }
     sediment_tmp[i] = max(ground + dh, 0.0) - ground;
     sediment[i] = max(s - from_sediment, 0.0);

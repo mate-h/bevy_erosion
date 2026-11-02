@@ -730,7 +730,11 @@ fn natural_ridge_pour_images() {
         water.radius = 8.0;
         water.rate = 0.05;
     }
-    h.run(4.0);
+    let pour_seconds = std::env::var("TEST_POUR_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4.0);
+    h.run(pour_seconds);
     let water = h.read_water();
     h.water().stroke_active = false;
     h.run(2.0);
@@ -766,6 +770,34 @@ fn natural_ridge_pour_images() {
     );
     write_bmp(&format!("{dir}/ridge_cut.bmp"), &cut, w, w, -cmax, cmax, 8);
     write_bmp(&format!("{dir}/ridge_bed.bmp"), &bed, w, w, blo, bhi, 8);
+    // Shaded relief of a wider area before and after, lit from the north-west.
+    let wide = 64u32;
+    let (x0, y0) = (
+        cx.saturating_sub(wide).max(1),
+        cy.saturating_sub(wide).max(1),
+    );
+    let (x1, y1) = ((cx + wide).min(N - 1), (cy + wide).min(N - 1));
+    for (name, hs) in [("before", &before), ("after", &after)] {
+        let mut shade = Vec::new();
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let dx = (hs[idx(x + 1, y)] - hs[idx(x - 1, y)]) * 50.0;
+                let dy = (hs[idx(x, y + 1)] - hs[idx(x, y - 1)]) * 50.0;
+                let n = Vec3::new(-dx, 1.0, -dy).normalize();
+                shade.push(n.dot(Vec3::new(-0.5, 1.0, -0.5).normalize()));
+            }
+        }
+        let (sw, sh) = ((x1 - x0) as usize, (y1 - y0) as usize);
+        write_bmp(
+            &format!("{dir}/relief_{name}.bmp"),
+            &shade,
+            sw,
+            sh,
+            0.3,
+            1.0,
+            4,
+        );
+    }
     let smax = speed.iter().fold(0.0f32, |a, b| a.max(*b));
     write_bmp(
         &format!("{dir}/ridge_speed.bmp"),

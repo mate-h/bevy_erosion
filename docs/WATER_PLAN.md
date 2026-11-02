@@ -297,6 +297,25 @@ On a smooth ridge the cut went from RMS 0.00069 (contour stripes plus a pit unde
 0.00003; `ridge_runoff_leaves_the_flanks_alone` keeps it there. `natural_ridge_pour_images`
 writes the depth, speed, bed and cut around a pour on the default terrain to `TEST_IMAGE_DIR`.
 
+Fixed: runoff left axis-aligned columns on steep faces. The wet-bank slumping in
+`water_erode` had two faults:
+- It thresholded each neighbour pair against `WET_TALUS`. Down the fall line every pair
+  exceeded it and across the slope almost none did, so it smoothed along one grid axis and drew
+  the wet area into straight columns.
+- It acted wherever either side had 0.0005 of water. Almost all natural slopes are steeper than
+  the 0.003-per-texel talus, so thin runoff made whole hillsides slide.
+
+Slumping now takes its rate from the full slope magnitude, which makes it isotropic. Each face
+uses the mean rate of its two cells, so it is conserved, and it matches the old rule on faces
+along the fall line. It only acts on banks of real water, where either side is at least
+`FULL_DEPTH` deep.
+
+After 20 s of pouring on the default terrain's sharpest ridge, the shaded relief keeps its
+texture, with a narrow channel cut down from the pour. Before, it showed straight columns; with
+isotropic slumping on thin sheets as well, it showed a flattened ramp.
+`TEST_POUR_SECONDS=20 TEST_IMAGE_DIR=<dir>` on `natural_ridge_pour_images` writes the
+`relief_before` and `relief_after` images.
+
 Known in bevy_fft:
 - `integrateHeight` and `overshootReduce` update depth in place while reading their neighbours'
   depth. That is a data race, but it made no measurable difference here.
