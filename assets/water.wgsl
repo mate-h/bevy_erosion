@@ -7,6 +7,8 @@
 //     (Mei et al. capacity model), which carves channels and flattens pool beds;
 //   * wet cells are KTT outflow (`masks.y`), so particle trails drain into them;
 //   * the optional ocean (terrain below `sea_level`) and the map border drain water away.
+// Every dispatch of the solver is one fixed time step (`WATER_STEP` in `lib.rs`); the rates in
+// `WaterParams` are already per step.
 
 const HEIGHT_SCALE: f32 = 1000000.0;
 // dt * g * pipe area / pipe length per substep (stable below 0.25 on a 4-neighbour grid).
@@ -27,17 +29,24 @@ const MAX_CUT: f32 = 0.0001;
 const WET_TALUS: f32 = 0.003;
 const SLUMP_RATE: f32 = 0.1;
 
+// Must match `MAX_WATER_SOURCES` in `lib.rs`.
+const MAX_SOURCES: u32 = 17u;
+
 struct WaterParams {
     size: vec2<u32>,
     pad_offset: vec2<u32>,
     grid_size: vec2<u32>,
-    brush_center: vec2<f32>,
-    brush_radius: f32,
-    brush_rate: f32,
     clear: u32,
+    // Fraction of the depth lost per step.
     evaporation: f32,
     capacity: f32,
     sea_level: f32,
+    // Depth added everywhere per step.
+    rain: f32,
+    source_count: u32,
+    // Springs and the brush: xy = disc center (texels), z = radius, w = depth per step at the
+    // center (negative removes water).
+    sources: array<vec4<f32>, MAX_SOURCES>,
 }
 
 @group(0) @binding(0) var<storage, read_write> height: array<atomic<u32>>;
@@ -77,26 +86,30 @@ fn is_ocean(h: f32) -> bool {
 
 const DIRS = array<vec2<i32>, 4>(vec2<i32>(-1, 0), vec2<i32>(1, 0), vec2<i32>(0, -1), vec2<i32>(0, 1));
 
-// Brush: add or remove water in a disc; or clear everything.
+// Remove all water.
 @compute @workgroup_size(8, 8, 1)
-fn water_source(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn water_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec2<i32>(gid.xy);
     if (!inside(p)) { return; }
     let i = widx(p);
-    if (params.clear != 0u) {
-        depth[i] = 0.0;
-        flux[i] = vec4<f32>(0.0);
-        sediment[i] = 0.0;
-        sediment_tmp[i] = 0.0;
-        velocity[i] = vec2<f32>(0.0);
-    }
-    if (params.brush_radius > 0.0) {
-        let r = distance(vec2<f32>(p) + 0.5, params.brush_center) / params.brush_radius;
+    depth[i] = 0.0;
+    flux[i] = vec4<f32>(0.0);
+    sediment[i] = 0.0;
+    sediment_tmp[i] = 0.0;
+    velocity[i] = vec2<f32>(0.0);
+}
+
+// Water added (or removed) this step by rain, springs and the brush.
+fn source_depth(p: vec2<i32>) -> f32 {
+    var add = params.rain;
+    for (var k = 0u; k < params.source_count; k = k + 1u) {
+        let s = params.sources[k];
+        let r = distance(vec2<f32>(p) + 0.5, s.xy) / s.z;
         if (r < 1.0) {
-            let w = (1.0 - r * r) * (1.0 - r * r);
-            depth[i] = max(depth[i] + params.brush_rate * w, 0.0);
+            add += s.w * (1.0 - r * r) * (1.0 - r * r);
         }
     }
+    return add;
 }
 
 // Pipe fluxes from the water surface difference to each neighbour, scaled so a cell never sends
@@ -139,8 +152,8 @@ fn water_depth(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (inside(p + DIRS[2])) { fin.z = flux[widx(p + DIRS[2])].w; }
     if (inside(p + DIRS[3])) { fin.w = flux[widx(p + DIRS[3])].z; }
     let d_old = depth[i];
-    var d = max(d_old + (fin.x + fin.y + fin.z + fin.w) - (f.x + f.y + f.z + f.w), 0.0);
-    d *= 1.0 - params.evaporation;
+    var d = d_old + (fin.x + fin.y + fin.z + fin.w) - (f.x + f.y + f.z + f.w);
+    d = max(d + source_depth(p), 0.0) * (1.0 - params.evaporation);
     let ground = terrain(p);
     if (is_ocean(ground)) {
         d = 0.0;

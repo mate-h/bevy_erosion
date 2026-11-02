@@ -7,13 +7,15 @@
 //!   one frame.
 //! * [`BrushMode::WaterBody`] pours water into the shallow-water solver ([`WaterControl`]); it
 //!   pools in depressions and runs off downhill as rivers, with no water level to set.
+//!   Alt + click places a [`Spring`] that keeps pouring at the brush's rate, so rivers keep
+//!   flowing; Alt + Shift + click removes the springs under the brush.
 //!
 //! Shift + drag erases (removes water, or undoes terrain edits). Put [`TerrainSurface`] on the
 //! displaced terrain mesh so clicks can be ray-cast against it.
 
 use crate::{
-    BrushStroke, ErosionConfig, ErosionImages, ResetSim, WaterControl, camera::OrbitController,
-    camera::OrbitInputBlocked,
+    BrushStroke, ErosionConfig, ErosionImages, MAX_SPRINGS, ResetSim, Spring, WaterControl,
+    camera::OrbitController, camera::OrbitInputBlocked,
 };
 use bevy::{
     prelude::*,
@@ -120,7 +122,7 @@ pub struct WaterBrush {
     pub radius: f32,
     /// Rate: rain trails (× [`RAIN_STARTS_PER_SECOND`]), terrain change, or water poured.
     pub strength: f32,
-    /// Set to remove all water on the next frame.
+    /// Set to remove all water and springs on the next frame.
     pub clear_water: bool,
     /// Set to undo all terrain edits on the next frame.
     pub clear_terrain: bool,
@@ -374,8 +376,9 @@ fn paint_water(
     };
     let dt = time.delta_secs();
     let erase = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
-    let painting =
-        brush.enabled && !blocked.0 && buttons.pressed(MouseButton::Left) && hit.world.is_some();
+    let alt = keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]);
+    let can_paint = brush.enabled && !blocked.0 && hit.world.is_some();
+    let painting = can_paint && !alt && buttons.pressed(MouseButton::Left);
     if !buttons.pressed(MouseButton::Left) {
         brush.flatten_target = None;
     }
@@ -388,11 +391,34 @@ fn paint_water(
 
     if std::mem::take(&mut brush.clear_water) {
         water.clear_generation = water.clear_generation.wrapping_add(1);
+        water.springs.clear();
+    }
+    let pour = brush.strength * WATER_DEPTH_PER_SECOND;
+    if can_paint
+        && alt
+        && brush.mode == BrushMode::WaterBody
+        && buttons.just_pressed(MouseButton::Left)
+    {
+        if erase {
+            let (texel, radius) = (hit.texel, brush.radius);
+            water
+                .springs
+                .retain(|s| s.center.distance(texel) > radius.max(s.radius));
+        } else {
+            if water.springs.len() >= MAX_SPRINGS {
+                water.springs.remove(0);
+            }
+            water.springs.push(Spring {
+                center: hit.texel,
+                radius: brush.radius,
+                rate: pour,
+            });
+        }
+        info!("Springs: {}", water.springs.len());
     }
     water.stroke_active = painting && brush.mode == BrushMode::WaterBody;
     water.center = hit.texel;
     water.radius = brush.radius;
-    let pour = brush.strength * WATER_DEPTH_PER_SECOND * dt;
     water.rate = if erase { -4.0 * pour } else { pour };
 
     let clear_terrain = std::mem::take(&mut brush.clear_terrain);
@@ -456,23 +482,45 @@ fn paint_water(
     reset.generation = reset.generation.wrapping_add(1);
 }
 
-/// Ring that follows the terrain under the cursor.
+/// Ring that follows the terrain under the cursor, plus one per spring.
+#[allow(clippy::too_many_arguments)]
 fn draw_brush(
     brush: Res<WaterBrush>,
     hit: Res<BrushHit>,
+    water: Res<WaterControl>,
     cache: Res<HeightCache>,
     config: Res<ErosionConfig>,
     keys: Res<ButtonInput<KeyCode>>,
     terrain: Query<(&TerrainSurface, &GlobalTransform)>,
     mut gizmos: Gizmos,
 ) {
-    let (Some(_), Ok((surface, tf))) = (hit.world, terrain.single()) else {
+    let Ok((surface, tf)) = terrain.single() else {
         return;
     };
     if !brush.enabled {
         return;
     }
     let map = config.map_size.as_vec2();
+    let mut ring = |center: Vec2, radius: f32, color: Color| {
+        let points = (0..=64).map(|i| {
+            let a = i as f32 / 64.0 * std::f32::consts::TAU;
+            let texel = center + Vec2::new(a.cos(), a.sin()) * radius;
+            let xz = (texel / map - 0.5) * surface.size;
+            let y = cache.sample(texel) * surface.height_scale + 0.3;
+            tf.transform_point(Vec3::new(xz.x, y, xz.y))
+        });
+        gizmos.linestrip(points, color);
+    };
+    for spring in &water.springs {
+        ring(
+            spring.center,
+            spring.radius * 0.5,
+            Color::srgb(0.2, 0.95, 0.9),
+        );
+    }
+    if hit.world.is_none() {
+        return;
+    }
     let color = if keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]) {
         Color::srgb(1.0, 0.45, 0.2)
     } else {
@@ -482,14 +530,7 @@ fn draw_brush(
             BrushMode::WaterBody => Color::srgb(0.3, 0.7, 1.0),
         }
     };
-    let points = (0..=64).map(|i| {
-        let a = i as f32 / 64.0 * std::f32::consts::TAU;
-        let texel = hit.texel + Vec2::new(a.cos(), a.sin()) * brush.radius;
-        let xz = (texel / map - 0.5) * surface.size;
-        let y = cache.sample(texel) * surface.height_scale + 0.3;
-        tf.transform_point(Vec3::new(xz.x, y, xz.y))
-    });
-    gizmos.linestrip(points, color);
+    ring(hit.texel, brush.radius, color);
 }
 
 #[cfg(test)]

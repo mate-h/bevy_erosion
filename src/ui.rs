@@ -109,6 +109,7 @@ enum ErosionSliderFieldKind {
     BrushStrength,
     WaterErosion,
     WaterEvaporation,
+    WaterRainfall,
 }
 
 impl ErosionSliderFieldKind {
@@ -172,7 +173,10 @@ impl ErosionSliderFieldKind {
             Self::BrushRadius => brush.radius = value,
             Self::BrushStrength => brush.strength = value,
             Self::WaterErosion => water.sediment_capacity = value,
-            Self::WaterEvaporation => water.evaporation = value,
+            // Shown in % per second.
+            Self::WaterEvaporation => water.evaporation = value / 100.0,
+            // Shown in ‰ of the map height per second.
+            Self::WaterRainfall => water.rainfall = value / 1000.0,
         }
     }
 
@@ -385,7 +389,9 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
             --
             @slider_row("Water Erosion", 0.0, 0.01, WaterControl::default().sediment_capacity, ErosionSliderFieldKind::WaterErosion)
             --
-            @slider_row("Evaporation", 0.0, 0.0002, WaterControl::default().evaporation, ErosionSliderFieldKind::WaterEvaporation)
+            @slider_row("Evaporation %/s", 0.0, 10.0, WaterControl::default().evaporation * 100.0, ErosionSliderFieldKind::WaterEvaporation)
+            --
+            @slider_row("Rainfall ‰/s", 0.0, 1.0, WaterControl::default().rainfall * 1000.0, ErosionSliderFieldKind::WaterRainfall)
             --
             Node {
                 display: Display::Flex,

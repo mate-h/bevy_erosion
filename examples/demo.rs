@@ -94,7 +94,8 @@ fn print_controls() {
     println!("  V - cycle brush: rain / terrain / water body");
     println!("  T - cycle terrain tool: raise / lower / flatten / smooth");
     println!("  [ / ] - brush radius");
-    println!("  C - clear water   X - reset terrain edits");
+    println!("  Alt + click (water body) - place a spring, Alt + Shift + click removes springs");
+    println!("  C - clear water and springs   X - reset terrain edits");
 }
 
 fn spawn_terrain(

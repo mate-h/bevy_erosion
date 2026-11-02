@@ -9,6 +9,12 @@
 // The source outflow goes through heightfield_blur1 ("expand", radius VoxelSize / 4, 10 iterations)
 // at every level, so thin outflows survive on coarse grids; approximated here by a distance-weighted
 // max over the level cell's source footprint.
+// Water bodies (`water.wgsl` depth on the base map) count as source outflow too, so the coarse
+// levels of a restarted cascade drain into the lakes like the finest level does.
+
+// Wet thresholds, as in `water.wgsl`.
+const WET_DEPTH: f32 = 0.0005;
+const FULL_DEPTH: f32 = 0.004;
 
 // Houdini gauss filter with filterscale 1.5 (source voxels) ≈ sigma 0.75.
 const GAUSS_SIGMA: f32 = 0.75;
@@ -38,6 +44,7 @@ struct PyramidResampleParams {
 @group(0) @binding(5) var<storage, read_write> dst_outflow_acc: array<f32>;
 @group(0) @binding(6) var<storage, read_write> dst_layers: array<vec2<f32>>;
 @group(0) @binding(7) var<uniform> resample: PyramidResampleParams;
+@group(0) @binding(8) var<storage, read> water_depth: array<f32>;
 
 fn clamp_texel(q: vec2<i32>, size: vec2<u32>) -> u32 {
     let c = clamp(q, vec2<i32>(0), vec2<i32>(size) - 1);
@@ -104,7 +111,9 @@ fn expanded_orig_outflow(pos: vec2<f32>, ratio: f32) -> f32 {
             let q = center + vec2<i32>(i, j);
             let d = length(vec2<f32>(q) + 0.5 - pos);
             let w = clamp((falloff - d) / (falloff - core), 0.0, 1.0);
-            o = max(o, orig_masks[clamp_texel(q, resample.orig_size)].y * w);
+            let k = clamp_texel(q, resample.orig_size);
+            let wet = smoothstep(WET_DEPTH, FULL_DEPTH, water_depth[k]);
+            o = max(o, max(orig_masks[k].y, wet) * w);
         }
     }
     return o;

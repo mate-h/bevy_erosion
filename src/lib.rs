@@ -695,6 +695,9 @@ pub struct BrushStroke {
 /// Water fills depressions and spills downhill along the current terrain; flowing water carries
 /// sediment, still water drops it, and wet cells act as KTT outflow so trails drain into them.
 /// The optional ocean (`ErodeParams::outflow_sea_level`) is a sink for this water.
+///
+/// The solver advances in fixed steps of [`WATER_STEP`] seconds of the frame time, so all rates
+/// here are per second and do not depend on the frame rate.
 #[derive(Resource, Clone, ExtractResource, Debug)]
 #[extract_app(RenderApp)]
 pub struct WaterControl {
@@ -704,16 +707,20 @@ pub struct WaterControl {
     pub center: Vec2,
     /// Disc radius in map texels.
     pub radius: f32,
-    /// Water depth added per frame at the disc center (height units).
+    /// Water depth added per second at the disc center (height units).
     pub rate: f32,
+    /// Persistent water sources (at most [`MAX_SPRINGS`]); they keep rivers flowing.
+    pub springs: Vec<Spring>,
+    /// Water depth added per second everywhere (height units).
+    pub rainfall: f32,
     /// Bump to remove all water.
     pub clear_generation: u32,
-    /// Fraction of water lost per substep.
+    /// Fraction of water lost per second.
     pub evaporation: f32,
     /// Sediment carrying capacity of flowing water (0 = water never erodes).
     pub sediment_capacity: f32,
-    /// Solver substeps per frame.
-    pub substeps: u32,
+    /// Seconds since the last frame (set from [`Time`]); the solver catches up by this much.
+    pub dt: f32,
 }
 
 impl Default for WaterControl {
@@ -723,13 +730,35 @@ impl Default for WaterControl {
             center: Vec2::ZERO,
             radius: 0.0,
             rate: 0.0,
+            springs: Vec::new(),
+            rainfall: 0.0,
             clear_generation: 0,
-            evaporation: 0.00002,
+            evaporation: 0.01,
             sediment_capacity: 0.0005,
-            substeps: 8,
+            dt: 0.0,
         }
     }
 }
+
+/// A persistent water source: a disc that adds water like a held brush.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Spring {
+    /// Disc center in map texels.
+    pub center: Vec2,
+    /// Disc radius in map texels.
+    pub radius: f32,
+    /// Water depth added per second at the center (height units).
+    pub rate: f32,
+}
+
+/// Most springs [`WaterControl`] uploads.
+pub const MAX_SPRINGS: usize = 16;
+/// Springs plus the brush (must match `MAX_SOURCES` in `water.wgsl`).
+const MAX_WATER_SOURCES: usize = MAX_SPRINGS + 1;
+/// Simulated seconds per water solver step (8 steps per frame at 60 fps).
+pub const WATER_STEP: f32 = 1.0 / 480.0;
+/// Most solver steps per frame; below 15 fps the water slows down instead of stalling the GPU.
+const MAX_WATER_STEPS: u32 = 32;
 
 /// Uniform for `water.wgsl`.
 #[derive(Clone, Copy, ShaderType)]
@@ -739,14 +768,17 @@ pub struct WaterParams {
     /// Base map offset inside the padded finest level (height and masks grid).
     pub pad_offset: UVec2,
     pub grid_size: UVec2,
-    pub brush_center: Vec2,
-    pub brush_radius: f32,
-    pub brush_rate: f32,
     pub clear: u32,
+    /// Fraction of the depth lost per step.
     pub evaporation: f32,
     pub capacity: f32,
     /// Ocean level (0 = no ocean): terrain below it drains water away.
     pub sea_level: f32,
+    /// Depth added everywhere per step.
+    pub rain: f32,
+    pub source_count: u32,
+    /// Springs and the brush: center, radius, depth per step at the center.
+    pub sources: [Vec4; MAX_WATER_SOURCES],
 }
 
 /// Resource to trigger simulation reset
@@ -833,6 +865,12 @@ fn setup_erosion_resources(
     commands.insert_resource(WaterControl::default());
 }
 
+fn update_water_time(time: Res<Time>, water: Option<ResMut<WaterControl>>) {
+    if let Some(mut water) = water {
+        water.dt = time.delta_secs();
+    }
+}
+
 impl Plugin for ErosionComputePlugin {
     fn build(&self, app: &mut App) {
         let progress = PyramidProgress::default();
@@ -846,7 +884,8 @@ impl Plugin for ErosionComputePlugin {
                 ExtractResourcePlugin::<BrushStroke>::default(),
                 ExtractResourcePlugin::<WaterControl>::default(),
             ))
-            .add_systems(Startup, setup_erosion_resources);
+            .add_systems(Startup, setup_erosion_resources)
+            .add_systems(PostUpdate, update_water_time);
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -893,7 +932,7 @@ struct ErosionPipeline {
     pipeline_ao: CachedComputePipelineId,
     pipeline_blur_h: CachedComputePipelineId,
     pipeline_blur_v: CachedComputePipelineId,
-    /// `water.wgsl`: source/clear, flux, depth, erode, advect, copy.
+    /// `water.wgsl`: clear, flux, depth, erode, advect, copy.
     pipelines_water: [CachedComputePipelineId; 6],
 }
 
@@ -1025,6 +1064,7 @@ fn init_erosion_pipeline(
                 storage_buffer::<f32>(false),           // dst outflow accumulation
                 storage_buffer::<Vec2>(false),          // dst layers
                 uniform_buffer::<PyramidResampleParams>(true),
+                storage_buffer_read_only::<f32>(false), // water depth (lakes are outflow)
             ),
         ),
     );
@@ -1152,7 +1192,7 @@ fn init_erosion_pipeline(
 
     let water_shader = asset_server.load(WATER_SHADER);
     let pipelines_water = [
-        "water_source",
+        "water_clear",
         "water_flux",
         "water_depth",
         "water_erode",
@@ -1275,13 +1315,13 @@ impl WaterBuffers {
                 size,
                 pad_offset: UVec2::ZERO,
                 grid_size: size,
-                brush_center: Vec2::ZERO,
-                brush_radius: 0.0,
-                brush_rate: 0.0,
                 clear: 0,
                 evaporation: 0.0,
                 capacity: 0.0,
                 sea_level: 0.0,
+                rain: 0.0,
+                source_count: 0,
+                sources: [Vec4::ZERO; MAX_WATER_SOURCES],
             }),
         };
         b.depth.write_buffer(device, queue);
@@ -1443,6 +1483,7 @@ fn prepare_erosion_bind_groups(
                 &dst.outflow_acc,
                 &dst.layers,
                 &buffers.resample_params,
+                buffers.water.depth.binding().unwrap(),
             )),
         )
     };
@@ -1536,11 +1577,11 @@ enum FrameCmd {
         offset: u32,
         size: UVec2,
     },
-    /// Water solver substeps on the finest level (plus the brush / clear pass when `source`).
+    /// Water solver steps on the finest level, after removing all water when `clear`.
     Water {
         set: usize,
-        substeps: u32,
-        source: bool,
+        steps: u32,
+        clear: bool,
     },
     Display {
         set: usize,
@@ -1568,6 +1609,8 @@ struct ErosionState {
     /// Some water exists, so the water solver runs every frame.
     water_active: bool,
     last_water_clear: u32,
+    /// Frame time not yet simulated by the water solver (below one [`WATER_STEP`]).
+    water_time: f32,
     /// Cascade was finished last frame (AO refresh on the frame it finishes).
     was_finished: bool,
     /// Finest-level displays since AO was last computed (`None` before the first one).
@@ -1743,35 +1786,64 @@ fn plan_erosion_frame(
         state.last_water_clear = water.clear_generation;
         state.water_active = false;
     }
-    let source = clear || (water.stroke_active && water.rate != 0.0);
-    if water.stroke_active && water.rate > 0.0 {
+    let stroke = water.stroke_active && water.rate != 0.0;
+    if (water.stroke_active && water.rate > 0.0)
+        || !water.springs.is_empty()
+        || water.rainfall > 0.0
+    {
         state.water_active = true;
     }
-    if finest_ready && (source || (state.water_active && !sim.paused)) {
+    if finest_ready && (clear || stroke || (state.water_active && !sim.paused)) {
+        let steps = if sim.paused {
+            // One step so a brush stroke still shows.
+            1
+        } else {
+            state.water_time += water.dt;
+            let steps = ((state.water_time / WATER_STEP) as u32).min(MAX_WATER_STEPS);
+            state.water_time = (state.water_time - steps as f32 * WATER_STEP).min(WATER_STEP);
+            steps
+        };
         let sea_level = if params.use_outflow != 0 {
             params.outflow_sea_level
         } else {
             0.0
         };
+        let brush = stroke.then(|| Spring {
+            center: water.center,
+            radius: water.radius,
+            rate: water.rate,
+        });
+        let mut sources = [Vec4::ZERO; MAX_WATER_SOURCES];
+        let mut source_count = 0;
+        for s in water.springs.iter().take(MAX_SPRINGS).chain(&brush) {
+            sources[source_count] = s
+                .center
+                .extend(s.radius.max(0.5))
+                .extend(s.rate * WATER_STEP);
+            source_count += 1;
+        }
         buffers.water.params.set(WaterParams {
             size: params.map_size,
             pad_offset,
             grid_size: finest_size,
-            brush_center: water.center,
-            brush_radius: water.radius,
-            brush_rate: if water.stroke_active { water.rate } else { 0.0 },
             clear: u32::from(clear),
-            evaporation: water.evaporation,
+            evaporation: 1.0 - (1.0 - water.evaporation.clamp(0.0, 0.999)).powf(WATER_STEP),
             capacity: water.sediment_capacity,
             sea_level,
+            rain: water.rainfall * WATER_STEP,
+            source_count: source_count as u32,
+            sources,
         });
         buffers.water.params.write_buffer(&render_device, &queue);
-        state.frame.push(FrameCmd::Water {
-            set: state.cascade.current,
-            // Paused: one substep so a brush stroke still shows.
-            substeps: if sim.paused { 1 } else { water.substeps },
-            source,
-        });
+        if clear || steps > 0 {
+            state.frame.push(FrameCmd::Water {
+                set: state.cascade.current,
+                steps,
+                clear,
+            });
+        }
+    } else {
+        state.water_time = 0.0;
     }
     if !state.frame.is_empty() {
         let level = level_at(state.cascade.level);
@@ -1912,13 +1984,9 @@ fn erosion_compute(
                     pass.dispatch_workgroups(gx, gy, 1);
                 }
             }
-            FrameCmd::Water {
-                set,
-                substeps,
-                source,
-            } => {
+            FrameCmd::Water { set, steps, clear } => {
                 let (gx, gy) = dispatch_grid(params.map_size);
-                let [p_source, p_flux, p_depth, p_erode, p_advect, p_copy] =
+                let [p_clear, p_flux, p_depth, p_erode, p_advect, p_copy] =
                     pipes.pipelines_water.map(get);
                 let (Some(p_flux), Some(p_depth), Some(p_erode), Some(p_advect), Some(p_copy)) =
                     (p_flux, p_depth, p_erode, p_advect, p_copy)
@@ -1927,11 +1995,11 @@ fn erosion_compute(
                 };
                 pass.set_bind_group(0, &groups.water[set], &[]);
                 pass.set_bind_group(1, &groups.water_out, &[]);
-                if source && let Some(p) = p_source {
+                if clear && let Some(p) = p_clear {
                     pass.set_pipeline(p);
                     pass.dispatch_workgroups(gx, gy, 1);
                 }
-                for _ in 0..substeps {
+                for _ in 0..steps {
                     for p in [p_flux, p_depth, p_erode, p_advect, p_copy] {
                         pass.set_pipeline(p);
                         pass.dispatch_workgroups(gx, gy, 1);
