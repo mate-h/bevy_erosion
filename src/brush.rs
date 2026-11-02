@@ -1,15 +1,18 @@
-//! Interactive water placement on the terrain with the mouse, in two modes:
+//! Mouse brushes on the terrain:
 //!
 //! * [`BrushMode::Rain`] releases erosion trails under the brush ([`BrushStroke`]); they flow
 //!   downhill and carve the current terrain live, on top of whatever the cascade produced.
-//! * [`BrushMode::Sea`] paints [`ErosionImages::water`] into the KTT `__Outflow` mask: erosion
-//!   drains into it and its cells keep the source terrain. Every stroke restarts the cascade,
-//!   whose coarse levels finish in one frame.
+//! * [`BrushMode::Terrain`] edits the source terrain ([`ErosionImages::terrain_edit`]): raise,
+//!   lower, flatten or smooth. Every stroke restarts the cascade, whose coarse levels finish in
+//!   one frame.
+//! * [`BrushMode::WaterBody`] pours water into the shallow-water solver ([`WaterControl`]); it
+//!   pools in depressions and runs off downhill as rivers, with no water level to set.
 //!
-//! Put [`TerrainSurface`] on the displaced terrain mesh so clicks can be ray-cast against it.
+//! Shift + drag erases (removes water, or undoes terrain edits). Put [`TerrainSurface`] on the
+//! displaced terrain mesh so clicks can be ray-cast against it.
 
 use crate::{
-    BrushStroke, ErosionConfig, ErosionImages, ResetSim, camera::OrbitController,
+    BrushStroke, ErosionConfig, ErosionImages, ResetSim, WaterControl, camera::OrbitController,
     camera::OrbitInputBlocked,
 };
 use bevy::{
@@ -46,13 +49,66 @@ const RAIN_STARTS_PER_SECOND: f32 = 2.0;
 /// Rain dispatches per frame (one ridge-biased, one flow-biased, like the cascade alternates).
 const RAIN_PASSES: u32 = 2;
 
+/// Water depth poured per second at the brush center at strength 1 (height units).
+const WATER_DEPTH_PER_SECOND: f32 = 0.02;
+/// Terrain raise / lower per second at strength 1 (height units).
+const TERRAIN_HEIGHT_PER_SECOND: f32 = 0.1;
+/// Flatten / smooth weight gained per second at strength 1.
+const TERRAIN_BLEND_PER_SECOND: f32 = 2.0;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BrushMode {
     /// Release erosion trails under the brush.
     #[default]
     Rain,
-    /// Paint outflow (sea / lake) that erosion drains into; restarts the cascade.
-    Sea,
+    /// Edit the source terrain.
+    Terrain(TerrainTool),
+    /// Pour water that pools into lakes and runs off as rivers.
+    WaterBody,
+}
+
+impl BrushMode {
+    /// Rain → Terrain → Water Body → Rain.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Rain => Self::Terrain(TerrainTool::Raise),
+            Self::Terrain(_) => Self::WaterBody,
+            Self::WaterBody => Self::Rain,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rain => "Rain",
+            Self::Terrain(TerrainTool::Raise) => "Terrain: Raise",
+            Self::Terrain(TerrainTool::Lower) => "Terrain: Lower",
+            Self::Terrain(TerrainTool::Flatten) => "Terrain: Flatten",
+            Self::Terrain(TerrainTool::Smooth) => "Terrain: Smooth",
+            Self::WaterBody => "Water Body",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TerrainTool {
+    #[default]
+    Raise,
+    Lower,
+    /// Pull toward the height under the cursor where the stroke started.
+    Flatten,
+    /// Blend toward a blurred version of the source noise.
+    Smooth,
+}
+
+impl TerrainTool {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Raise => Self::Lower,
+            Self::Lower => Self::Flatten,
+            Self::Flatten => Self::Smooth,
+            Self::Smooth => Self::Raise,
+        }
+    }
 }
 
 #[derive(Resource, Clone, Debug)]
@@ -62,10 +118,14 @@ pub struct WaterBrush {
     pub mode: BrushMode,
     /// Brush radius in map texels.
     pub radius: f32,
-    /// Rain: rate (× [`RAIN_STARTS_PER_SECOND`]). Sea: water added per frame at the center (0..1).
+    /// Rate: rain trails (× [`RAIN_STARTS_PER_SECOND`]), terrain change, or water poured.
     pub strength: f32,
-    /// Set to clear all painted water on the next frame.
-    pub clear_requested: bool,
+    /// Set to remove all water on the next frame.
+    pub clear_water: bool,
+    /// Set to undo all terrain edits on the next frame.
+    pub clear_terrain: bool,
+    /// Flatten target captured when the stroke started.
+    flatten_target: Option<f32>,
 }
 
 impl WaterBrush {
@@ -90,7 +150,9 @@ impl Default for WaterBrush {
             mode: BrushMode::Rain,
             radius: 12.0,
             strength: 0.35,
-            clear_requested: false,
+            clear_water: false,
+            clear_terrain: false,
+            flatten_target: None,
         }
     }
 }
@@ -291,13 +353,15 @@ fn ray_hit(
     None
 }
 
-/// Left drag rains (or paints sea, Shift + left drag erases sea and restarts the erosion).
+/// Applies the active brush for this frame (see the module docs).
 #[allow(clippy::too_many_arguments)]
 fn paint_water(
     mut brush: ResMut<WaterBrush>,
     mut stroke: ResMut<BrushStroke>,
+    mut water: ResMut<WaterControl>,
     time: Res<Time>,
     hit: Res<BrushHit>,
+    cache: Res<HeightCache>,
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     blocked: Res<OrbitInputBlocked>,
@@ -308,29 +372,51 @@ fn paint_water(
     let Some(erosion_images) = erosion_images else {
         return;
     };
-    let clear = std::mem::take(&mut brush.clear_requested);
-    let painting = brush.enabled && !blocked.0 && buttons.pressed(MouseButton::Left);
-    let rain = painting && hit.world.is_some() && brush.mode == BrushMode::Rain;
-    *stroke = if rain {
-        brush.rain_stroke(hit.texel, time.delta_secs())
+    let dt = time.delta_secs();
+    let erase = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    let painting =
+        brush.enabled && !blocked.0 && buttons.pressed(MouseButton::Left) && hit.world.is_some();
+    if !buttons.pressed(MouseButton::Left) {
+        brush.flatten_target = None;
+    }
+
+    *stroke = if painting && brush.mode == BrushMode::Rain {
+        brush.rain_stroke(hit.texel, dt)
     } else {
         BrushStroke::default()
     };
-    let sea = painting && hit.world.is_some() && brush.mode == BrushMode::Sea;
-    if !clear && !sea {
+
+    if std::mem::take(&mut brush.clear_water) {
+        water.clear_generation = water.clear_generation.wrapping_add(1);
+    }
+    water.stroke_active = painting && brush.mode == BrushMode::WaterBody;
+    water.center = hit.texel;
+    water.radius = brush.radius;
+    let pour = brush.strength * WATER_DEPTH_PER_SECOND * dt;
+    water.rate = if erase { -4.0 * pour } else { pour };
+
+    let clear_terrain = std::mem::take(&mut brush.clear_terrain);
+    let tool = match brush.mode {
+        BrushMode::Terrain(tool) if painting => Some(tool),
+        _ => None,
+    };
+    if !clear_terrain && tool.is_none() {
         return;
     }
-    let Some(mut image) = images.get_mut(&erosion_images.water) else {
+    let Some(mut image) = images.get_mut(&erosion_images.terrain_edit) else {
         return;
     };
     let size = image.size();
     let Some(data) = image.data.as_mut() else {
         return;
     };
-    if clear {
+    if clear_terrain {
         data.fill(0);
-    } else {
-        let erase = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    }
+    if let Some(tool) = tool {
+        let target = *brush
+            .flatten_target
+            .get_or_insert_with(|| cache.sample(hit.texel));
         let r = brush.radius.max(0.5);
         let lo = (hit.texel - r).floor().max(Vec2::ZERO).as_uvec2();
         let hi = (hit.texel + r).ceil().as_uvec2().min(size - 1);
@@ -341,15 +427,29 @@ fn paint_water(
                     continue;
                 }
                 // Smooth falloff toward the rim.
-                let w = brush.strength * (1.0 - d * d).powi(2);
-                let o = ((y * size.x + x) * 4) as usize;
-                let mut v = f32::from_le_bytes(data[o..o + 4].try_into().unwrap());
-                v = if erase {
-                    (v - w).max(0.0)
-                } else {
-                    (v + w).min(1.0)
-                };
-                data[o..o + 4].copy_from_slice(&v.to_le_bytes());
+                let w = brush.strength * dt * (1.0 - d * d).powi(2);
+                let o = ((y * size.x + x) * 16) as usize;
+                let mut e = Vec4::from_array(std::array::from_fn(|c| {
+                    f32::from_le_bytes(data[o + c * 4..o + c * 4 + 4].try_into().unwrap())
+                }));
+                let blend = w * TERRAIN_BLEND_PER_SECOND;
+                match (tool, erase) {
+                    (TerrainTool::Raise | TerrainTool::Lower, true) => {
+                        e.x -= e.x.signum() * (w * TERRAIN_HEIGHT_PER_SECOND).min(e.x.abs());
+                    }
+                    (TerrainTool::Raise, false) => e.x += w * TERRAIN_HEIGHT_PER_SECOND,
+                    (TerrainTool::Lower, false) => e.x -= w * TERRAIN_HEIGHT_PER_SECOND,
+                    (TerrainTool::Flatten, true) => e.y = (e.y - blend).max(0.0),
+                    (TerrainTool::Flatten, false) => {
+                        e.y = (e.y + blend).min(1.0);
+                        e.z = target;
+                    }
+                    (TerrainTool::Smooth, true) => e.w = (e.w - blend).max(0.0),
+                    (TerrainTool::Smooth, false) => e.w = (e.w + blend).min(1.0),
+                }
+                for (c, v) in e.to_array().into_iter().enumerate() {
+                    data[o + c * 4..o + c * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                }
             }
         }
     }
@@ -376,7 +476,11 @@ fn draw_brush(
     let color = if keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]) {
         Color::srgb(1.0, 0.45, 0.2)
     } else {
-        Color::srgb(0.3, 0.7, 1.0)
+        match brush.mode {
+            BrushMode::Rain => Color::srgb(0.75, 0.9, 1.0),
+            BrushMode::Terrain(_) => Color::srgb(0.95, 0.8, 0.4),
+            BrushMode::WaterBody => Color::srgb(0.3, 0.7, 1.0),
+        }
     };
     let points = (0..=64).map(|i| {
         let a = i as f32 / 64.0 * std::f32::consts::TAU;

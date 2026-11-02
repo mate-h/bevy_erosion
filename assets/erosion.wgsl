@@ -190,14 +190,32 @@ fn outflow_source(gid: vec2<u32>, h: f32) -> f32 {
     return o;
 }
 
-// Painted water (`ErosionImages::water`), only bound for init_fbm.
-@group(1) @binding(0) var water_paint: texture_2d<f32>;
+// Terrain brush edits (`ErosionImages::terrain_edit`), only bound for init_fbm:
+// R = height offset, G = flatten weight, B = flatten target, A = smooth weight.
+@group(1) @binding(0) var terrain_edit: texture_2d<f32>;
+// Smooth brush: radius (texels) of the fbm average.
+const SMOOTH_RADIUS: f32 = 6.0;
+
+fn edited_height(uv: vec2<f32>, gid: vec2<u32>) -> f32 {
+    var h = fbm(uv) * params.noise_scale;
+    let e = textureLoad(terrain_edit, vec2<i32>(gid), 0);
+    if (e.a > 0.0) {
+        var sum = h;
+        for (var k = 0; k < 8; k = k + 1) {
+            let a = f32(k) * 0.785398;
+            sum += fbm(uv + vec2<f32>(cos(a), sin(a)) * SMOOTH_RADIUS) * params.noise_scale;
+        }
+        h = mix(h, sum / 9.0, clamp(e.a, 0.0, 1.0));
+    }
+    h += e.r;
+    return mix(h, e.b, clamp(e.g, 0.0, 1.0));
+}
 
 @compute @workgroup_size(8,8,1)
 fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
     let uv = vec2<f32>(gid.xy);
-    var hval = fbm(uv) * params.noise_scale;
+    var hval = edited_height(uv, gid.xy);
     let idx = gid.y * params.map_size.x + gid.x;
 
     // Adjust_Bedrock: bedrock = height - depth, or with a bedrock map height - map * depth (Depth
@@ -232,8 +250,6 @@ fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (params.use_outflow != 0u) {
         m.y = outflow_source(gid.xy, hval);
     }
-    // Painted water always drains, whether or not the procedural outflow is on.
-    m.y = max(m.y, clamp(textureLoad(water_paint, vec2<i32>(gid.xy), 0).x, 0.0, 1.0));
     if (params.use_erosion_mask != 0u) {
         m.z = mask_noise(uv, MASK_ERODE_SEED);
     }

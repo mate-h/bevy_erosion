@@ -27,6 +27,27 @@ struct PreviewParams {
     mode: u32,  // 0=PBR, 1=Flow, 2=Sediment, 3=Erosion, 4=Height, 5=ViewSpaceNormals, 6=Curvature, 7=Age
 }
 @group(#{MATERIAL_BIND_GROUP}) @binding(107) var<uniform> preview_params: PreviewParams;
+// Water solver output: R = depth, G = speed, B = suspended sediment.
+@group(#{MATERIAL_BIND_GROUP}) @binding(108) var water_tex: texture_2d<f32>;
+struct SeaParams {
+    level: f32, // 0 = no ocean
+}
+@group(#{MATERIAL_BIND_GROUP}) @binding(109) var<uniform> sea: SeaParams;
+
+// Water depth above the terrain at `uv`: lakes and rivers from the solver, plus the ocean.
+fn water_depth_at(uv: vec2<f32>, ground: f32) -> f32 {
+    var d = textureSampleLevel(water_tex, height_sampler, uv, 0.0).x;
+    if (sea.level > 0.0) {
+        d = max(d, sea.level - ground);
+    }
+    return max(d, 0.0);
+}
+
+// Displayed surface: terrain, or the water surface where there is water.
+fn surface_at(uv: vec2<f32>) -> f32 {
+    let ground = textureSampleLevel(height_tex, height_sampler, uv, 0.0).x;
+    return ground + water_depth_at(uv, ground);
+}
 
 struct VertexIn {
     @builtin(instance_index) instance_index: u32,
@@ -39,7 +60,7 @@ struct VertexIn {
 @vertex
 fn vertex(v: VertexIn) -> VertexOutput {
     // Sample height at UV to displace along local +Y (using sampler for smooth interpolation)
-    let h = textureSampleLevel(height_tex, height_sampler, v.uv, 0.0).x;
+    let h = surface_at(v.uv);
     let displaced_local = vec3<f32>(v.position.x, v.position.y + h * terrain_params.height_scale, v.position.z);
 
     var out: VertexOutput;
@@ -50,10 +71,10 @@ fn vertex(v: VertexIn) -> VertexOutput {
     // Compute normal from height gradients in UV space
     let dims = vec2<f32>(textureDimensions(height_tex, 0));
     let texel = 1.0 / max(dims, vec2(1.0, 1.0));
-    let h_l = textureSampleLevel(height_tex, height_sampler, v.uv - vec2(texel.x, 0.0), 0.0).x;
-    let h_r = textureSampleLevel(height_tex, height_sampler, v.uv + vec2(texel.x, 0.0), 0.0).x;
-    let h_d = textureSampleLevel(height_tex, height_sampler, v.uv - vec2(0.0, texel.y), 0.0).x;
-    let h_u = textureSampleLevel(height_tex, height_sampler, v.uv + vec2(0.0, texel.y), 0.0).x;
+    let h_l = surface_at(v.uv - vec2(texel.x, 0.0));
+    let h_r = surface_at(v.uv + vec2(texel.x, 0.0));
+    let h_d = surface_at(v.uv - vec2(0.0, texel.y));
+    let h_u = surface_at(v.uv + vec2(0.0, texel.y));
     let d_hx = (h_r - h_l) * terrain_params.height_scale;
     let d_hz = (h_u - h_d) * terrain_params.height_scale;
     let n_local = normalize(vec3<f32>(-d_hx, 1.0, -d_hz));
@@ -199,8 +220,16 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     
     // Apply base color and lighting
     if (preview_params.mode == MODE_PBR) {
+        // Water: tint by depth and make the surface glossy.
+        let ground = textureSampleLevel(height_tex, height_sampler, in.uv, 0.0).x;
+        let depth = water_depth_at(in.uv, ground);
+        let wet = smoothstep(0.0005, 0.004, depth);
+        let water_color = mix(vec3<f32>(0.10, 0.32, 0.36), vec3<f32>(0.02, 0.07, 0.14), smoothstep(0.0, 0.06, depth));
+        var color = base_color;
+        color = vec4<f32>(mix(color.rgb, water_color, wet), color.a);
+        pbr_input.material.perceptual_roughness = mix(pbr_input.material.perceptual_roughness, 0.06, wet);
         // Full PBR lighting for default mode
-        pbr_input.material.base_color = alpha_discard(pbr_input.material, base_color);
+        pbr_input.material.base_color = alpha_discard(pbr_input.material, color);
         // Apply AO to diffuse_occlusion
         pbr_input.diffuse_occlusion = vec3<f32>(ao_value);
         out.color = apply_pbr_lighting(pbr_input);

@@ -22,8 +22,8 @@ use bevy::{
 
 use crate::camera::OrbitInputBlocked;
 use crate::{
-    ErodeParams, PyramidProgress, ResetSim, SimControl,
-    brush::{BrushMode, WaterBrush},
+    ErodeParams, PyramidProgress, ResetSim, SimControl, WaterControl,
+    brush::{BrushMode, TerrainTool, WaterBrush},
 };
 
 /// Marker for the erosion params panel root.
@@ -47,6 +47,9 @@ struct PyramidLevelCountText;
 
 #[derive(Component, Clone, Default)]
 struct PyramidStatusText;
+
+#[derive(Component, Clone, Default)]
+struct BrushModeText;
 
 /// Marks erosion param sliders for styling (height, font).
 #[derive(Component, Clone, Default)]
@@ -104,6 +107,8 @@ enum ErosionSliderFieldKind {
     AgeStrength,
     BrushRadius,
     BrushStrength,
+    WaterErosion,
+    WaterEvaporation,
 }
 
 impl ErosionSliderFieldKind {
@@ -112,6 +117,7 @@ impl ErosionSliderFieldKind {
         params: &mut ErodeParams,
         sim: &mut SimControl,
         brush: &mut WaterBrush,
+        water: &mut WaterControl,
         value: f32,
     ) {
         match self {
@@ -165,6 +171,8 @@ impl ErosionSliderFieldKind {
             Self::AgeStrength => params.age_strength = value,
             Self::BrushRadius => brush.radius = value,
             Self::BrushStrength => brush.strength = value,
+            Self::WaterErosion => water.sediment_capacity = value,
+            Self::WaterEvaporation => water.evaporation = value,
         }
     }
 
@@ -213,9 +221,14 @@ impl Plugin for ErosionParamsPlugin {
                 ),
             )
             .init_resource::<WaterBrush>()
+            .init_resource::<WaterControl>()
             .add_systems(
                 PostUpdate,
-                (update_pyramid_ui_labels, sync_water_brush_checkbox),
+                (
+                    update_pyramid_ui_labels,
+                    sync_water_brush_checkbox,
+                    update_brush_mode_label,
+                ),
             );
     }
 }
@@ -323,23 +336,67 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                 })
             ),
             (
-                @FeathersCheckbox {
-                    @caption: bsn! { (Text("Paint Sea Instead Of Rain") ThemedText) },
+                Node {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    min_height: px(SLIDER_HEIGHT),
                 }
-                on(checkbox_self_update)
-                on(|change: On<ValueChange<bool>>, mut brush: ResMut<WaterBrush>| {
-                    brush.mode = if change.value { BrushMode::Sea } else { BrushMode::Rain };
-                })
+                ThemedText
+                Children [(
+                    Text("Brush: Rain (off)")
+                    ThemedText
+                    BrushModeText
+                )]
+            ),
+            button_row(
+                brush_mode_button("Rain", BrushMode::Rain),
+                brush_mode_button("Terrain", BrushMode::Terrain(TerrainTool::Raise)),
+                brush_mode_button("Water Body", BrushMode::WaterBody),
+            ),
+            (
+                Node {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Row,
+                    column_gap: px(ROW_GAP),
+                }
+                ThemedText
+                Children [
+                    brush_mode_button("Raise", BrushMode::Terrain(TerrainTool::Raise)),
+                    brush_mode_button("Lower", BrushMode::Terrain(TerrainTool::Lower)),
+                    brush_mode_button("Flatten", BrushMode::Terrain(TerrainTool::Flatten)),
+                    brush_mode_button("Smooth", BrushMode::Terrain(TerrainTool::Smooth)),
+                ]
             ),
             slider_row("Brush Radius", 2.0, 128.0, WaterBrush::default().radius, ErosionSliderFieldKind::BrushRadius),
             slider_row("Brush Strength", 0.01, 5.0, WaterBrush::default().strength, ErosionSliderFieldKind::BrushStrength),
+            slider_row("Water Erosion", 0.0, 0.01, WaterControl::default().sediment_capacity, ErosionSliderFieldKind::WaterErosion),
+            slider_row("Evaporation", 0.0, 0.0002, WaterControl::default().evaporation, ErosionSliderFieldKind::WaterEvaporation),
             (
-                @FeathersButton {
-                    @caption: bsn! { (Text("Clear Sea (C)") ThemedText) },
+                Node {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Row,
+                    column_gap: px(ROW_GAP),
                 }
-                on(|_: On<Activate>, mut brush: ResMut<WaterBrush>| {
-                    brush.clear_requested = true;
-                })
+                ThemedText
+                Children [
+                    (
+                        @FeathersButton {
+                            @caption: bsn! { (Text("Clear Water (C)") ThemedText) },
+                        }
+                        on(|_: On<Activate>, mut brush: ResMut<WaterBrush>| {
+                            brush.clear_water = true;
+                        })
+                    ),
+                    (
+                        @FeathersButton {
+                            @caption: bsn! { (Text("Reset Terrain Edits") ThemedText) },
+                        }
+                        on(|_: On<Activate>, mut brush: ResMut<WaterBrush>| {
+                            brush.clear_terrain = true;
+                        })
+                    ),
+                ]
             ),
             section_label("Noise"),
             slider_row("Noise Freq", 0.001, 0.05, params.noise_frequency, ErosionSliderFieldKind::NoiseFrequency),
@@ -649,6 +706,45 @@ fn pyramid_info_row(level_count: usize) -> impl Scene {
     }
 }
 
+fn button_row(a: impl Scene, b: impl Scene, c: impl Scene) -> impl Scene {
+    bsn! {
+        Node {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            column_gap: px(ROW_GAP),
+        }
+        ThemedText
+        Children [a, b, c]
+    }
+}
+
+/// Selects a brush mode and turns the brush on.
+fn brush_mode_button(label: &str, mode: BrushMode) -> impl Scene {
+    let label = label.to_string();
+    bsn! {
+        @FeathersButton {
+            @caption: bsn! { (template_value(Text::new(label.clone())) ThemedText) },
+        }
+        on(move |_: On<Activate>, mut brush: ResMut<WaterBrush>| {
+            brush.mode = mode;
+            brush.enabled = true;
+        })
+    }
+}
+
+fn update_brush_mode_label(brush: Res<WaterBrush>, mut q: Query<&mut Text, With<BrushModeText>>) {
+    if !brush.is_changed() {
+        return;
+    }
+    for mut text in &mut q {
+        **text = format!(
+            "Brush: {}{}",
+            brush.mode.label(),
+            if brush.enabled { "" } else { " (off)" }
+        );
+    }
+}
+
 fn slider_row_int(
     label: &str,
     min: f32,
@@ -692,8 +788,8 @@ fn slider_row_int(
                     SliderPrecision(0)
                     ErosionSliderField
                     on(slider_self_update)
-                    on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut brush: ResMut<WaterBrush>, mut reset: ResMut<ResetSim>| {
-                        field.apply(&mut params, &mut sim, &mut brush, change.value);
+                    on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut brush: ResMut<WaterBrush>, mut water: ResMut<WaterControl>, mut reset: ResMut<ResetSim>| {
+                        field.apply(&mut params, &mut sim, &mut brush, &mut water, change.value);
                         if field.resets_sim() {
                             reset.generation = reset.generation.wrapping_add(1);
                         }
@@ -799,8 +895,8 @@ fn slider_row(
                     SliderPrecision(3)
                     ErosionSliderField
                     on(slider_self_update)
-                    on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut brush: ResMut<WaterBrush>, mut reset: ResMut<ResetSim>| {
-                        field.apply(&mut params, &mut sim, &mut brush, change.value);
+                    on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut brush: ResMut<WaterBrush>, mut water: ResMut<WaterControl>, mut reset: ResMut<ResetSim>| {
+                        field.apply(&mut params, &mut sim, &mut brush, &mut water, change.value);
                         if field.resets_sim() {
                             reset.generation = reset.generation.wrapping_add(1);
                         }

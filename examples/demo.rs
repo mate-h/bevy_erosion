@@ -54,6 +54,7 @@ fn main() {
                 handle_sim_input,
                 handle_preview_mode_input,
                 handle_brush_input,
+                sync_sea_level,
             ),
         )
         .run();
@@ -88,10 +89,11 @@ fn print_controls() {
     println!("  6 - View-space normals preview");
     println!("  7 - Curvature map preview");
     println!("  8 - Age map preview");
-    println!("  B - toggle water brush (left drag rains erosion trails, right drag orbits)");
-    println!("  V - switch the brush between rain and sea (Shift + drag erases sea)");
-    println!("  [ / ] - water brush radius");
-    println!("  C - clear painted sea");
+    println!("  B - toggle the brush (left drag paints, Shift + drag erases, right drag orbits)");
+    println!("  V - cycle brush: rain / terrain / water body");
+    println!("  T - cycle terrain tool: raise / lower / flatten / smooth");
+    println!("  [ / ] - brush radius");
+    println!("  C - clear water   X - reset terrain edits");
 }
 
 fn spawn_terrain(
@@ -131,6 +133,8 @@ fn spawn_terrain(
             ao_tex: erosion_images.ao.clone(),
             height_scale,
             preview_mode: 0, // Default to PBR
+            water_tex: erosion_images.water.clone(),
+            sea_level: 0.0,
         },
     });
 
@@ -234,20 +238,44 @@ fn handle_brush_input(keys: Res<ButtonInput<KeyCode>>, mut brush: ResMut<WaterBr
         println!("Water brush: {}", if brush.enabled { "on" } else { "off" });
     }
     if keys.just_pressed(KeyCode::KeyV) {
+        brush.mode = brush.mode.next();
+        println!("Brush: {}", brush.mode.label());
+    }
+    if keys.just_pressed(KeyCode::KeyT) {
         brush.mode = match brush.mode {
-            BrushMode::Rain => BrushMode::Sea,
-            BrushMode::Sea => BrushMode::Rain,
+            BrushMode::Terrain(tool) => BrushMode::Terrain(tool.next()),
+            _ => BrushMode::Terrain(Default::default()),
         };
-        println!("Water brush mode: {:?}", brush.mode);
+        println!("Brush: {}", brush.mode.label());
     }
     if keys.just_pressed(KeyCode::KeyC) {
-        brush.clear_requested = true;
+        brush.clear_water = true;
+    }
+    if keys.just_pressed(KeyCode::KeyX) {
+        brush.clear_terrain = true;
     }
     if keys.just_pressed(KeyCode::BracketLeft) {
         brush.radius = (brush.radius / 1.25).max(2.0);
     }
     if keys.just_pressed(KeyCode::BracketRight) {
         brush.radius = (brush.radius * 1.25).min(128.0);
+    }
+}
+
+/// The ocean renders flat at the sea level while procedural outflow is on.
+fn sync_sea_level(params: Res<ErodeParams>, mut materials: ResMut<Assets<TerrainMaterial>>) {
+    if !params.is_changed() {
+        return;
+    }
+    let level = if params.use_outflow != 0 {
+        params.outflow_sea_level
+    } else {
+        0.0
+    };
+    for (_, mat) in materials.iter_mut() {
+        if mat.extension.sea_level != level {
+            mat.extension.sea_level = level;
+        }
     }
 }
 

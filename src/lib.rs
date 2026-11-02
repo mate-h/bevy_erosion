@@ -36,6 +36,7 @@ const EROSION_SHADER: &str = "erosion.wgsl";
 const PYRAMID_RESAMPLE_SHADER: &str = "pyramid_resample.wgsl";
 const PYRAMID_RIVERS_SHADER: &str = "pyramid_rivers.wgsl";
 const PYRAMID_MASKS_SHADER: &str = "pyramid_masks.wgsl";
+const WATER_SHADER: &str = "water.wgsl";
 /// Erode dispatches per `writeBack` at geological age 0 (`Compute_Erosion.iterations`).
 const ERODE_ITERS_PER_WRITEBACK: u32 = 200;
 const TERRAIN_SHADER: &str = "terrain_extended.wgsl";
@@ -311,9 +312,12 @@ pub struct ErosionImages {
     pub analysis: Handle<Image>, // Combined: R=flow_mag, G=sediment, B=erosion, A=flow_dir_encoded
     pub ao: Handle<Image>,       // Ambient occlusion texture
     pub ao_temp: Handle<Image>,  // Temporary texture for AO blur
-    /// Painted water (R32Float, 0..1, map size): added to the source outflow mask at init.
-    /// Edit it on the CPU and bump [`ResetSim`] to re-erode (see [`brush`]).
+    /// Water solver output (Rgba16Float, map size): R = depth, G = speed, B = carried sediment.
     pub water: Handle<Image>,
+    /// Terrain brush edits (Rgba32Float, map size), applied to the source terrain at init:
+    /// R = height offset, G = flatten weight, B = flatten target height, A = smooth weight.
+    /// Edit it on the CPU and bump [`ResetSim`] to re-erode (see [`brush`]).
+    pub terrain_edit: Handle<Image>,
 }
 
 /// Creates all erosion render-target images for the given map size and adds them to `images`.
@@ -335,12 +339,13 @@ pub fn create_erosion_images(images: &mut Assets<Image>, size: UVec2) -> Erosion
         analysis: add(images, TextureFormat::Rgba16Float),
         ao: add(images, TextureFormat::R16Float),
         ao_temp: add(images, TextureFormat::R16Float),
-        water: images.add(empty_water_image(size)),
+        water: add(images, TextureFormat::Rgba16Float),
+        terrain_edit: images.add(empty_terrain_edit_image(size)),
     }
 }
 
-/// A cleared [`ErosionImages::water`] paint map.
-pub fn empty_water_image(size: UVec2) -> Image {
+/// A cleared [`ErosionImages::terrain_edit`] layer.
+pub fn empty_terrain_edit_image(size: UVec2) -> Image {
     let mut image = Image::new_fill(
         Extent3d {
             width: size.x,
@@ -348,8 +353,8 @@ pub fn empty_water_image(size: UVec2) -> Image {
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
-        &0f32.to_le_bytes(),
-        TextureFormat::R32Float,
+        &[0u8; 16],
+        TextureFormat::Rgba32Float,
         RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
     );
     image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
@@ -416,6 +421,12 @@ pub struct TerrainExtension {
     // Preview mode: 0=PBR, 1=Flow, 2=Sediment, 3=Erosion, 4=Height, 5=Normals, 6=Curvature, 7=Age
     #[uniform(107)]
     pub preview_mode: u32,
+    /// Water solver output ([`ErosionImages::water`]): the surface rises to terrain + depth.
+    #[texture(108)]
+    pub water_tex: Handle<Image>,
+    /// Ocean level (0 = no ocean): terrain below it renders as a flat sea.
+    #[uniform(109)]
+    pub sea_level: f32,
 }
 
 impl Default for TerrainExtension {
@@ -427,6 +438,8 @@ impl Default for TerrainExtension {
             ao_tex: Default::default(),
             height_scale: 50.0,
             preview_mode: 0,
+            water_tex: Default::default(),
+            sea_level: 0.0,
         }
     }
 }
@@ -675,6 +688,63 @@ pub struct BrushStroke {
     pub passes: u32,
 }
 
+/// Water bodies (lakes and rivers): a shallow-water solver on the finest level (`water.wgsl`).
+/// Water fills depressions and spills downhill along the current terrain; flowing water carries
+/// sediment, still water drops it, and wet cells act as KTT outflow so trails drain into them.
+/// The optional ocean (`ErodeParams::outflow_sea_level`) is a sink for this water.
+#[derive(Resource, Clone, ExtractResource, Debug)]
+pub struct WaterControl {
+    /// Add (rate > 0) or remove (rate < 0) water in a disc this frame.
+    pub stroke_active: bool,
+    /// Disc center in map texels.
+    pub center: Vec2,
+    /// Disc radius in map texels.
+    pub radius: f32,
+    /// Water depth added per frame at the disc center (height units).
+    pub rate: f32,
+    /// Bump to remove all water.
+    pub clear_generation: u32,
+    /// Fraction of water lost per substep.
+    pub evaporation: f32,
+    /// Sediment carrying capacity of flowing water (0 = water never erodes).
+    pub sediment_capacity: f32,
+    /// Solver substeps per frame.
+    pub substeps: u32,
+}
+
+impl Default for WaterControl {
+    fn default() -> Self {
+        Self {
+            stroke_active: false,
+            center: Vec2::ZERO,
+            radius: 0.0,
+            rate: 0.0,
+            clear_generation: 0,
+            evaporation: 0.00002,
+            sediment_capacity: 0.0005,
+            substeps: 8,
+        }
+    }
+}
+
+/// Uniform for `water.wgsl`.
+#[derive(Clone, Copy, ShaderType)]
+pub struct WaterParams {
+    /// Base map size (the water grid).
+    pub size: UVec2,
+    /// Base map offset inside the padded finest level (height and masks grid).
+    pub pad_offset: UVec2,
+    pub grid_size: UVec2,
+    pub brush_center: Vec2,
+    pub brush_radius: f32,
+    pub brush_rate: f32,
+    pub clear: u32,
+    pub evaporation: f32,
+    pub capacity: f32,
+    /// Ocean level (0 = no ocean): terrain below it drains water away.
+    pub sea_level: f32,
+}
+
 /// Resource to trigger simulation reset
 #[derive(Resource, Clone, ExtractResource, Default)]
 pub struct ResetSim {
@@ -754,6 +824,7 @@ fn setup_erosion_resources(
     commands.insert_resource(ResetSim::default());
     commands.insert_resource(SimControl::default());
     commands.insert_resource(BrushStroke::default());
+    commands.insert_resource(WaterControl::default());
 }
 
 impl Plugin for ErosionComputePlugin {
@@ -767,6 +838,7 @@ impl Plugin for ErosionComputePlugin {
                 ExtractResourcePlugin::<ResetSim>::default(),
                 ExtractResourcePlugin::<SimControl>::default(),
                 ExtractResourcePlugin::<BrushStroke>::default(),
+                ExtractResourcePlugin::<WaterControl>::default(),
             ))
             .add_systems(Startup, setup_erosion_resources);
 
@@ -794,7 +866,9 @@ impl Plugin for ErosionComputePlugin {
 struct ErosionPipeline {
     layout_erosion: BindGroupLayoutDescriptor,
     layout_color: BindGroupLayoutDescriptor,
+    layout_terrain_edit: BindGroupLayoutDescriptor,
     layout_water: BindGroupLayoutDescriptor,
+    layout_water_out: BindGroupLayoutDescriptor,
     layout_blit: BindGroupLayoutDescriptor,
     layout_blit_blur: BindGroupLayoutDescriptor,
     layout_blit_level: BindGroupLayoutDescriptor,
@@ -813,6 +887,8 @@ struct ErosionPipeline {
     pipeline_ao: CachedComputePipelineId,
     pipeline_blur_h: CachedComputePipelineId,
     pipeline_blur_v: CachedComputePipelineId,
+    /// `water.wgsl`: source/clear, flux, depth, erode, advect, copy.
+    pipelines_water: [CachedComputePipelineId; 6],
 }
 
 impl ErosionPipeline {
@@ -959,12 +1035,41 @@ fn init_erosion_pipeline(
         ),
     );
 
-    // Painted water for init (group 1 of init_fbm).
-    let layout_water = BindGroupLayoutDescriptor::new(
-        "ErosionWaterGroup1",
+    // Terrain brush edits for init (group 1 of init_fbm).
+    let layout_terrain_edit = BindGroupLayoutDescriptor::new(
+        "ErosionTerrainEditGroup1",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (texture_2d(TextureSampleType::Float { filterable: false }),),
+        ),
+    );
+
+    // Water solver on the finest work set (`water.wgsl`).
+    let layout_water = BindGroupLayoutDescriptor::new(
+        "WaterGroup0",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                storage_buffer::<u32>(false),  // work set height (atomic, fixed-point)
+                storage_buffer::<f32>(false),  // water depth
+                storage_buffer::<Vec4>(false), // outflow flux L, R, T, B
+                storage_buffer::<f32>(false),  // suspended sediment
+                storage_buffer::<f32>(false),  // advected sediment (scratch)
+                storage_buffer::<Vec2>(false), // velocity
+                storage_buffer::<Vec4>(false), // work set masks (outflow)
+                storage_buffer_read_only::<Vec4>(false), // source masks
+                uniform_buffer::<WaterParams>(false),
+            ),
+        ),
+    );
+    let layout_water_out = BindGroupLayoutDescriptor::new(
+        "WaterGroup1",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (texture_storage_2d(
+                TextureFormat::Rgba16Float,
+                StorageTextureAccess::WriteOnly,
+            ),),
         ),
     );
 
@@ -979,7 +1084,7 @@ fn init_erosion_pipeline(
             })
         };
     let pipeline_init = compute(
-        vec![layout_erosion.clone(), layout_water.clone()],
+        vec![layout_erosion.clone(), layout_terrain_edit.clone()],
         &shader,
         "init_fbm",
     );
@@ -1039,10 +1144,29 @@ fn init_erosion_pipeline(
         "blur_ao_vertical",
     );
 
+    let water_shader = asset_server.load(WATER_SHADER);
+    let pipelines_water = [
+        "water_source",
+        "water_flux",
+        "water_depth",
+        "water_erode",
+        "water_advect",
+        "water_copy",
+    ]
+    .map(|entry| {
+        compute(
+            vec![layout_water.clone(), layout_water_out.clone()],
+            &water_shader,
+            entry,
+        )
+    });
+
     commands.insert_resource(ErosionPipeline {
         layout_erosion,
         layout_color,
+        layout_terrain_edit,
         layout_water,
+        layout_water_out,
         layout_blit,
         layout_blit_blur,
         layout_blit_level,
@@ -1061,6 +1185,7 @@ fn init_erosion_pipeline(
         pipeline_ao,
         pipeline_blur_h,
         pipeline_blur_v,
+        pipelines_water,
     });
 }
 
@@ -1118,6 +1243,49 @@ struct ErosionBuffers {
     /// One entry per level transition this frame (dynamic offset per `Seed`).
     resample_params: DynamicUniformBuffer<PyramidResampleParams>,
     blit_display: UniformBuffer<BlitDisplayParams>,
+    water: WaterBuffers,
+}
+
+/// Water solver state at base map size (`water.wgsl`).
+struct WaterBuffers {
+    depth: StorageBuffer<Vec<f32>>,
+    flux: StorageBuffer<Vec<Vec4>>,
+    sediment: StorageBuffer<Vec<f32>>,
+    sediment_tmp: StorageBuffer<Vec<f32>>,
+    velocity: StorageBuffer<Vec<Vec2>>,
+    params: UniformBuffer<WaterParams>,
+}
+
+impl WaterBuffers {
+    fn new(size: UVec2, device: &RenderDevice, queue: &RenderQueue) -> Self {
+        let n = (size.x * size.y) as usize;
+        let mut b = Self {
+            depth: StorageBuffer::from(vec![0f32; n]),
+            flux: StorageBuffer::from(vec![Vec4::ZERO; n]),
+            sediment: StorageBuffer::from(vec![0f32; n]),
+            sediment_tmp: StorageBuffer::from(vec![0f32; n]),
+            velocity: StorageBuffer::from(vec![Vec2::ZERO; n]),
+            params: UniformBuffer::from(WaterParams {
+                size,
+                pad_offset: UVec2::ZERO,
+                grid_size: size,
+                brush_center: Vec2::ZERO,
+                brush_radius: 0.0,
+                brush_rate: 0.0,
+                clear: 0,
+                evaporation: 0.0,
+                capacity: 0.0,
+                sea_level: 0.0,
+            }),
+        };
+        b.depth.write_buffer(device, queue);
+        b.flux.write_buffer(device, queue);
+        b.sediment.write_buffer(device, queue);
+        b.sediment_tmp.write_buffer(device, queue);
+        b.velocity.write_buffer(device, queue);
+        b.params.write_buffer(device, queue);
+        b
+    }
 }
 
 #[derive(Resource)]
@@ -1130,7 +1298,10 @@ struct ErosionBindGroups {
     upscale_masks: [BindGroup; 2],
     level_blit: BindGroup,
     color: BindGroup,
-    water: BindGroup,
+    terrain_edit: BindGroup,
+    /// Water solver, indexed by work set.
+    water: [BindGroup; 2],
+    water_out: BindGroup,
     blit: BindGroup,
     blit_blur: BindGroup,
 }
@@ -1158,6 +1329,7 @@ fn prepare_erosion_buffers(
         params: DynamicUniformBuffer::default(),
         resample_params: DynamicUniformBuffer::default(),
         blit_display,
+        water: WaterBuffers::new(params.map_size, &render_device, &queue),
     });
 }
 
@@ -1182,6 +1354,7 @@ fn prepare_erosion_bind_groups(
         Some(view_ao),
         Some(view_ao_temp),
         Some(view_water),
+        Some(view_terrain_edit),
     ) = (
         gpu_images.get(&images.height),
         gpu_images.get(&images.color),
@@ -1190,6 +1363,7 @@ fn prepare_erosion_bind_groups(
         gpu_images.get(&images.ao),
         gpu_images.get(&images.ao_temp),
         gpu_images.get(&images.water),
+        gpu_images.get(&images.terrain_edit),
     )
     else {
         return;
@@ -1282,9 +1456,32 @@ fn prepare_erosion_bind_groups(
             &layout(&pipeline.layout_color),
             &BindGroupEntries::sequential((&view_color.texture_view,)),
         ),
-        water: render_device.create_bind_group(
+        terrain_edit: render_device.create_bind_group(
             None,
-            &layout(&pipeline.layout_water),
+            &layout(&pipeline.layout_terrain_edit),
+            &BindGroupEntries::sequential((&view_terrain_edit.texture_view,)),
+        ),
+        water: [0, 1].map(|set| {
+            let w = &buffers.water;
+            render_device.create_bind_group(
+                None,
+                &layout(&pipeline.layout_water),
+                &BindGroupEntries::sequential((
+                    buffers.sets[set].height.binding().unwrap(),
+                    w.depth.binding().unwrap(),
+                    w.flux.binding().unwrap(),
+                    w.sediment.binding().unwrap(),
+                    w.sediment_tmp.binding().unwrap(),
+                    w.velocity.binding().unwrap(),
+                    buffers.sets[set].masks.binding().unwrap(),
+                    buffers.sets[SET_SOURCE].masks.binding().unwrap(),
+                    w.params.binding().unwrap(),
+                )),
+            )
+        }),
+        water_out: render_device.create_bind_group(
+            None,
+            &layout(&pipeline.layout_water_out),
             &BindGroupEntries::sequential((&view_water.texture_view,)),
         ),
         blit: render_device.create_bind_group(
@@ -1333,6 +1530,12 @@ enum FrameCmd {
         offset: u32,
         size: UVec2,
     },
+    /// Water solver substeps on the finest level (plus the brush / clear pass when `source`).
+    Water {
+        set: usize,
+        substeps: u32,
+        source: bool,
+    },
     Display {
         set: usize,
         offset: u32,
@@ -1356,6 +1559,11 @@ struct ErosionState {
     frame: Vec<FrameCmd>,
     /// Iteration counter for rain brush dispatches (randomness and ridge/flow alternation).
     brush_iteration: u32,
+    /// Some water exists, so the water solver runs every frame.
+    water_active: bool,
+    last_water_clear: u32,
+    /// Cascade was finished last frame (AO refresh on the frame it finishes).
+    was_finished: bool,
     /// Finest-level displays since AO was last computed (`None` before the first one).
     displays_since_ao: Option<u32>,
 }
@@ -1368,6 +1576,7 @@ fn plan_erosion_frame(
     sim: Res<SimControl>,
     params: Res<ErodeParams>,
     stroke: Res<BrushStroke>,
+    water: Res<WaterControl>,
     progress: Res<PyramidProgress>,
     mut buffers: ResMut<ErosionBuffers>,
     mut state: ResMut<ErosionState>,
@@ -1394,6 +1603,7 @@ fn plan_erosion_frame(
         state.last_reset_gen = reset.generation;
         state.cascade.restart(params.pyramid_levels());
         state.displays_since_ao = None;
+        state.was_finished = false;
     }
 
     let budget = if sim.paused {
@@ -1521,17 +1731,56 @@ fn plan_erosion_frame(
             });
         }
     }
+    // Water bodies: the solver runs on the finest level whenever any water exists.
+    let clear = water.clear_generation != state.last_water_clear;
+    if clear {
+        state.last_water_clear = water.clear_generation;
+        state.water_active = false;
+    }
+    let source = clear || (water.stroke_active && water.rate != 0.0);
+    if water.stroke_active && water.rate > 0.0 {
+        state.water_active = true;
+    }
+    if finest_ready && (source || (state.water_active && !sim.paused)) {
+        let sea_level = if params.use_outflow != 0 {
+            params.outflow_sea_level
+        } else {
+            0.0
+        };
+        buffers.water.params.set(WaterParams {
+            size: params.map_size,
+            pad_offset,
+            grid_size: finest_size,
+            brush_center: water.center,
+            brush_radius: water.radius,
+            brush_rate: if water.stroke_active { water.rate } else { 0.0 },
+            clear: u32::from(clear),
+            evaporation: water.evaporation,
+            capacity: water.sediment_capacity,
+            sea_level,
+        });
+        buffers.water.params.write_buffer(&render_device, &queue);
+        state.frame.push(FrameCmd::Water {
+            set: state.cascade.current,
+            // Paused: one substep so a brush stroke still shows.
+            substeps: if sim.paused { 1 } else { water.substeps },
+            source,
+        });
+    }
     if !state.frame.is_empty() {
         let level = level_at(state.cascade.level);
         let finest = level.size == finest_size;
-        // Paused steps and the cascade's final frame are the last display for a while: refresh AO.
-        let last = state.cascade.finished || sim.paused;
+        // Paused steps and the frame the cascade finishes are the last display for a while:
+        // refresh AO. (Later frames still display while rain or water keeps changing heights.)
+        let just_finished = state.cascade.finished && !state.was_finished;
+        let last = just_finished || sim.paused;
         let ao = finest && (last || state.displays_since_ao.is_none_or(|n| n + 1 >= AO_INTERVAL));
         state.displays_since_ao = match (finest, ao) {
             (false, _) => None,
             (true, true) => Some(0),
             (true, false) => state.displays_since_ao.map(|n| n + 1),
         };
+        state.was_finished = state.cascade.finished;
         state.frame.push(FrameCmd::Display {
             set: state.cascade.current,
             offset: buffers.params.push(&level_erode_params(params, &level, 0)),
@@ -1608,7 +1857,7 @@ fn erosion_compute(
                 if let Some(p) = get(pipes.pipeline_init) {
                     pass.set_pipeline(p);
                     pass.set_bind_group(0, source, &[offset]);
-                    pass.set_bind_group(1, &groups.water, &[]);
+                    pass.set_bind_group(1, &groups.terrain_edit, &[]);
                     pass.dispatch_workgroups(gx, gy, 1);
                 }
                 if let Some(p) = get(pipes.pipeline_init_color) {
@@ -1655,6 +1904,32 @@ fn erosion_compute(
                     pass.set_pipeline(p);
                     pass.set_bind_group(0, &groups.erosion[set], &[offset]);
                     pass.dispatch_workgroups(gx, gy, 1);
+                }
+            }
+            FrameCmd::Water {
+                set,
+                substeps,
+                source,
+            } => {
+                let (gx, gy) = dispatch_grid(params.map_size);
+                let [p_source, p_flux, p_depth, p_erode, p_advect, p_copy] =
+                    pipes.pipelines_water.map(get);
+                let (Some(p_flux), Some(p_depth), Some(p_erode), Some(p_advect), Some(p_copy)) =
+                    (p_flux, p_depth, p_erode, p_advect, p_copy)
+                else {
+                    continue;
+                };
+                pass.set_bind_group(0, &groups.water[set], &[]);
+                pass.set_bind_group(1, &groups.water_out, &[]);
+                if source && let Some(p) = p_source {
+                    pass.set_pipeline(p);
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
+                for _ in 0..substeps {
+                    for p in [p_flux, p_depth, p_erode, p_advect, p_copy] {
+                        pass.set_pipeline(p);
+                        pass.dispatch_workgroups(gx, gy, 1);
+                    }
                 }
             }
             FrameCmd::Display {
