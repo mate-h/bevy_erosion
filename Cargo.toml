@@ -23,3 +23,4 @@ ui = ["bevy/bevy_feathers"]
 
 [dependencies]
 bevy = "0.20"
+bevy_fft = { git = "https://github.com/mate-h/bevy_fft", branch = "water-foundations" }

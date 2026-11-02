@@ -31,6 +31,7 @@ use bevy::{
 use crate::camera::OrbitInputBlocked;
 use crate::{
     ErodeParams, MAX_BANK_WIDTH, MAX_SPRINGS, PyramidProgress, ResetSim, SimControl, WaterControl,
+    WaterSolver,
     brush::{BrushMode, TerrainTool, WaterBrush},
 };
 
@@ -133,6 +134,7 @@ enum ErosionSliderFieldKind {
     WaterErosion,
     WaterEvaporation,
     WaterRainfall,
+    WaterManning,
     BedMaxDepth,
     BedShoreSlope,
     BedProfile,
@@ -205,6 +207,7 @@ impl ErosionSliderFieldKind {
             Self::WaterEvaporation => water.evaporation = value / 100.0,
             // Shown in ‰ of the map height per second.
             Self::WaterRainfall => water.rainfall = value / 1000.0,
+            Self::WaterManning => water.manning_n = value,
             Self::BedMaxDepth => water.bed.max_depth = value,
             Self::BedShoreSlope => water.bed.shore_slope = value,
             Self::BedProfile => water.bed.profile = value,
@@ -266,10 +269,17 @@ enum ToggleKind {
     BedrockMapIsHeight,
     AdditiveSediment,
     NormalizeAge,
+    MomentumFlow,
 }
 
 impl ToggleKind {
-    fn get(self, params: &ErodeParams, sim: &SimControl, brush: &WaterBrush) -> bool {
+    fn get(
+        self,
+        params: &ErodeParams,
+        sim: &SimControl,
+        brush: &WaterBrush,
+        water: &WaterControl,
+    ) -> bool {
         match self {
             Self::Paused => sim.paused,
             Self::ContinueAfterCascade => sim.continue_after_cascade,
@@ -288,10 +298,18 @@ impl ToggleKind {
             Self::BedrockMapIsHeight => params.bedrock_mode != 0,
             Self::AdditiveSediment => params.additive_sediment != 0,
             Self::NormalizeAge => params.normalize_age != 0,
+            Self::MomentumFlow => water.solver == WaterSolver::Swe,
         }
     }
 
-    fn set(self, params: &mut ErodeParams, sim: &mut SimControl, brush: &mut WaterBrush, on: bool) {
+    fn set(
+        self,
+        params: &mut ErodeParams,
+        sim: &mut SimControl,
+        brush: &mut WaterBrush,
+        water: &mut WaterControl,
+        on: bool,
+    ) {
         let v = u32::from(on);
         match self {
             Self::Paused => sim.paused = on,
@@ -311,6 +329,13 @@ impl ToggleKind {
             Self::BedrockMapIsHeight => params.bedrock_mode = v,
             Self::AdditiveSediment => params.additive_sediment = v,
             Self::NormalizeAge => params.normalize_age = v,
+            Self::MomentumFlow => {
+                water.solver = if on {
+                    WaterSolver::Swe
+                } else {
+                    WaterSolver::Pipes
+                }
+            }
         }
     }
 
@@ -387,14 +412,20 @@ fn sync_toggles(
     params: Res<ErodeParams>,
     sim: Res<SimControl>,
     brush: Res<WaterBrush>,
+    water: Res<WaterControl>,
     toggles: Query<(Entity, &Toggle, Has<Checked>)>,
     added: Query<(), Added<Toggle>>,
 ) {
-    if !(params.is_changed() || sim.is_changed() || brush.is_changed() || !added.is_empty()) {
+    if !(params.is_changed()
+        || sim.is_changed()
+        || brush.is_changed()
+        || water.is_changed()
+        || !added.is_empty())
+    {
         return;
     }
     for (entity, toggle, checked) in &toggles {
-        let on = toggle.kind.get(&params, &sim, &brush);
+        let on = toggle.kind.get(&params, &sim, &brush, &water);
         if on && !checked {
             commands.entity(entity).insert(Checked);
         } else if !on && checked {
@@ -593,6 +624,10 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         @slider_row("Evaporation %/s", 0.0, 10.0, water.evaporation * 100.0, ErosionSliderFieldKind::WaterEvaporation)
                         --
                         @slider_row("Rainfall ‰/s", 0.0, 1.0, water.rainfall * 1000.0, ErosionSliderFieldKind::WaterRainfall)
+                        --
+                        @toggle_row("Momentum Flow (SWE)", ToggleKind::MomentumFlow)
+                        --
+                        @slider_row("Bed Friction (Manning n)", 0.0, 0.2, water.manning_n, ErosionSliderFieldKind::WaterManning)
                         --
                         @note_text("Springs: 0")
                         SpringCountText
@@ -949,8 +984,8 @@ fn toggle_row(label: &str, kind: ToggleKind) -> impl Scene {
         }
         Toggle { kind: {kind} }
         on(checkbox_self_update)
-        on(move |change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut brush: ResMut<WaterBrush>, mut reset: ResMut<ResetSim>| {
-            kind.set(&mut params, &mut sim, &mut brush, change.value);
+        on(move |change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut brush: ResMut<WaterBrush>, mut water: ResMut<WaterControl>, mut reset: ResMut<ResetSim>| {
+            kind.set(&mut params, &mut sim, &mut brush, &mut water, change.value);
             if kind.resets_sim() {
                 reset.generation = reset.generation.wrapping_add(1);
             }

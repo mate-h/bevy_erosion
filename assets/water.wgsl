@@ -9,6 +9,11 @@
 //   * the optional ocean (terrain below `sea_level`) and the map border drain water away.
 // Every dispatch of the solver is one fixed time step (`WATER_STEP` in `lib.rs`); the rates in
 // `WaterParams` are already per step.
+//
+// With `WaterSolver::Swe` the pipe kernels are replaced by bevy_fft's staggered shallow-water
+// solver, which `lib.rs` steps between `swe_export` (bed and sources in) and `swe_gather` (depth
+// and velocity out). The solver works in cells: heights are scaled by `CELLS_PER_HEIGHT`, so
+// depths and the bed share the texel unit of the grid spacing.
 
 const HEIGHT_SCALE: f32 = 1000000.0;
 // dt * g * pipe area / pipe length per substep (stable below 0.25 on a 4-neighbour grid).
@@ -22,6 +27,8 @@ const DEPOSIT_RATE: f32 = 0.3;
 // Heights are ~1 unit over ~100 texels of rise; scale gradients to a tangent.
 const SLOPE_SCALE: f32 = 100.0;
 const MIN_TILT: f32 = 0.05;
+// Height units to solver cells (the same vertical scale as `SLOPE_SCALE`).
+const CELLS_PER_HEIGHT: f32 = 100.0;
 // Most a substep may cut from one cell.
 const MAX_CUT: f32 = 0.0001;
 // Bank slumping in and next to water: height step per texel above which material slides down,
@@ -43,6 +50,8 @@ struct WaterParams {
     sea_level: f32,
     // Depth added everywhere per step.
     rain: f32,
+    // Seconds per step.
+    step_seconds: f32,
     source_count: u32,
     // Springs and the brush: xy = disc center (texels), z = radius, w = depth per step at the
     // center (negative removes water).
@@ -61,6 +70,14 @@ struct WaterParams {
 @group(0) @binding(8) var<uniform> params: WaterParams;
 // R = depth, GB = velocity (texels per step), A = suspended sediment (for rendering).
 @group(1) @binding(0) var water_out: texture_storage_2d<rgba16float, write>;
+// bevy_fft solver inputs: bed height in cells, and sources (x = depth per second in cells,
+// y = sink weight).
+@group(1) @binding(1) var swe_bed: texture_storage_2d<r32float, write>;
+@group(1) @binding(2) var swe_source: texture_storage_2d<rgba32float, write>;
+// bevy_fft solver state: x = bed, y = depth (cells), and the cell-centred velocity (cells per
+// second).
+@group(1) @binding(3) var swe_water: texture_storage_2d<rgba32float, read_write>;
+@group(1) @binding(4) var swe_velocity: texture_2d<f32>;
 
 fn inside(p: vec2<i32>) -> bool {
     return all(p >= vec2<i32>(0)) && all(p < vec2<i32>(params.size));
@@ -250,4 +267,52 @@ fn water_copy(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (!inside(p)) { return; }
     let i = widx(p);
     sediment[i] = sediment_tmp[i];
+}
+
+// Bed and sources for the bevy_fft solver. The map border and the ocean are full sinks.
+@compute @workgroup_size(8, 8, 1)
+fn swe_export(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = vec2<i32>(gid.xy);
+    if (!inside(p)) { return; }
+    let ground = terrain(p);
+    textureStore(swe_bed, p, vec4<f32>(ground * CELLS_PER_HEIGHT, 0.0, 0.0, 0.0));
+    let edge = any(p == vec2<i32>(0)) || any(p == vec2<i32>(params.size) - 1);
+    let sink = select(0.0, 1.0, edge || is_ocean(ground));
+    let rate = source_depth(p) / params.step_seconds * CELLS_PER_HEIGHT;
+    textureStore(swe_source, p, vec4<f32>(rate, sink, 0.0, 0.0));
+}
+
+// Depth and velocity back from the bevy_fft solver, then the same outputs as `water_depth`:
+// KTT outflow and the render texture.
+@compute @workgroup_size(8, 8, 1)
+fn swe_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = vec2<i32>(gid.xy);
+    if (!inside(p)) { return; }
+    let i = widx(p);
+    let d = textureLoad(swe_water, p).y / CELLS_PER_HEIGHT;
+    depth[i] = d;
+    var v = textureLoad(swe_velocity, p, 0).xy * params.step_seconds;
+    let speed = length(v);
+    if (speed > 1.0) {
+        v /= speed;
+    }
+    velocity[i] = v;
+
+    let wet = smoothstep(WET_DEPTH, FULL_DEPTH, d);
+    let gi = gidx(p);
+    var m = masks[gi];
+    m.y = max(source_masks[i].y, wet);
+    masks[gi] = m;
+
+    textureStore(water_out, p, vec4<f32>(d, v, sediment[i]));
+}
+
+// Hand this crate's depth to the bevy_fft solver (after bed shaping, or when switching solvers).
+@compute @workgroup_size(8, 8, 1)
+fn swe_import(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = vec2<i32>(gid.xy);
+    if (!inside(p)) { return; }
+    var w = textureLoad(swe_water, p);
+    w.y = depth[widx(p)] * CELLS_PER_HEIGHT;
+    textureStore(swe_water, p, w);
 }
