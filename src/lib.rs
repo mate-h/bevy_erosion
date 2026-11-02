@@ -615,6 +615,8 @@ pub struct ErodeParams {
     /// Bevy-only, set per frame: the water solver runs, so trails on the finest level that reach
     /// water (`masks.y` > 0.5) hand it their sediment and end.
     pub water_handoff: u32,
+    /// Bevy-only: shifts the source terrain noise, so each seed is a different landscape.
+    pub noise_seed: u32,
 }
 
 impl Default for ErodeParams {
@@ -701,6 +703,7 @@ impl Default for ErodeParams {
             spawn_count: 0,
             rain_water: 0.0,
             water_handoff: 0,
+            noise_seed: 0,
         }
     }
 }

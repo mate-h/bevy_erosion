@@ -7,8 +7,9 @@
 //! n seconds; `EROSION_BENCH_SPRING=1` places a spring at the map centre so the water solver runs,
 //! `EROSION_BENCH_PIPES=1` switches it to the pipe model, and `EROSION_NO_ENV_FREEZE=1` keeps
 //! re-filtering the environment map every frame. `EROSION_BENCH_POUR=x,y` places a spring at
-//! texel (x, y) and moves the camera close to it (`EROSION_BENCH_DISTANCE`, `_PITCH` and `_YAW`,
-//! in degrees, frame it). `EROSION_BENCH_SCREENSHOT=<path>` hides the settings panel and saves
+//! texel (x, y) and moves the camera close to it (or to `EROSION_BENCH_TARGET=x,y`;
+//! `EROSION_BENCH_DISTANCE`, `_PITCH` and `_YAW`,
+//! in degrees, frame it), and `EROSION_BENCH_RAIN=<‰/s>` rains on the whole map. `EROSION_BENCH_SCREENSHOT=<path>` hides the settings panel and saves
 //! the window just before the bench quits.
 
 use bevy::{
@@ -65,6 +66,13 @@ fn bench_seconds() -> Option<f32> {
         .and_then(|v| v.parse().ok())
 }
 
+/// `EROSION_SEED=<n>` starts on another landscape (the Seed slider under Terrain Source).
+fn seed_from_env(mut params: ResMut<ErodeParams>) {
+    if let Some(seed) = std::env::var("EROSION_SEED").ok().and_then(|v| v.parse().ok()) {
+        params.noise_seed = seed;
+    }
+}
+
 fn main() {
     let simple = simple_mode();
     let present_mode = if simple || bench_seconds().is_some() {
@@ -98,7 +106,7 @@ fn main() {
             ErosionParamsPlugin,
         ))
         .add_systems(Startup, (setup, print_controls))
-        .add_systems(PostStartup, spawn_terrain)
+        .add_systems(PostStartup, (spawn_terrain, seed_from_env))
         .add_systems(
             Update,
             (
@@ -215,6 +223,12 @@ fn log_frame_times(
             });
         }
         // `x,y` in texels: pour there and look at it from close by.
+        if let Some(rain) = std::env::var("EROSION_BENCH_RAIN")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+        {
+            water.rainfall = rain / 1000.0;
+        }
         if let Ok(pour) = std::env::var("EROSION_BENCH_POUR")
             && let Some((x, y)) = pour.split_once(',')
             && let (Ok(x), Ok(y)) = (x.parse::<f32>(), y.parse::<f32>())
@@ -227,8 +241,15 @@ fn log_frame_times(
             let size = progress.get().size.as_vec2();
             let half = size.x * 0.25;
             let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok());
+            let (tx, ty) = std::env::var("EROSION_BENCH_TARGET")
+                .ok()
+                .and_then(|t| {
+                    let (a, b) = t.split_once(',')?;
+                    Some((a.parse::<f32>().ok()?, b.parse::<f32>().ok()?))
+                })
+                .unwrap_or((x, y));
             for mut orbit in &mut cameras {
-                orbit.target = Vec3::new(x / size.x * 2.0 * half - half, 20.0, y / size.y * 2.0 * half - half);
+                orbit.target = Vec3::new(tx / size.x * 2.0 * half - half, 20.0, ty / size.y * 2.0 * half - half);
                 orbit.distance = env("EROSION_BENCH_DISTANCE").unwrap_or(45.0);
                 if let Some(pitch) = env("EROSION_BENCH_PITCH") {
                     orbit.pitch = pitch.to_radians();

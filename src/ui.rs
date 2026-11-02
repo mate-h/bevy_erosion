@@ -117,6 +117,7 @@ enum ErosionSliderFieldKind {
     UpliftRiverCarving,
     NoiseFrequency,
     NoiseScale,
+    NoiseSeed,
     FeatureSize,
     SourceDetailSmoothing,
     GeologicalAge,
@@ -201,6 +202,7 @@ impl ErosionSliderFieldKind {
             Self::UpliftRiverCarving => params.uplift_river_carving = value,
             Self::NoiseFrequency => params.noise_frequency = value,
             Self::NoiseScale => params.noise_scale = value,
+            Self::NoiseSeed => params.noise_seed = value as u32,
             Self::FeatureSize => params.feature_size = value,
             Self::SourceDetailSmoothing => params.source_detail_smoothing = value,
             Self::GeologicalAge => params.geological_age = value,
@@ -248,6 +250,7 @@ impl ErosionSliderFieldKind {
             self,
             Self::NoiseFrequency
                 | Self::NoiseScale
+                | Self::NoiseSeed
                 | Self::ReferenceDetailScale
                 | Self::FeatureSize
                 | Self::SourceDetailSmoothing
@@ -263,6 +266,7 @@ impl ErosionSliderFieldKind {
         matches!(
             self,
             Self::RidgeErosionSteps
+                | Self::NoiseSeed
                 | Self::IterationsPerFrame
                 | Self::BrushRadius
                 | Self::BedBankWidth
@@ -746,6 +750,8 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         @slider_row("Noise Freq", 0.001, 0.05, params.noise_frequency, ErosionSliderFieldKind::NoiseFrequency)
                         --
                         @slider_row("Noise Scale", 0.5, 5.0, params.noise_scale, ErosionSliderFieldKind::NoiseScale)
+                        --
+                        @slider_row("Seed", 0.0, 100.0, params.noise_seed as f32, ErosionSliderFieldKind::NoiseSeed)
                         --
                         @FeathersButton {
                             @caption: bsn! { Text("Reset Terrain Edits (X)") ThemedText },

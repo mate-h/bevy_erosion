@@ -96,6 +96,8 @@ struct ErodeParams {
     rain_water: f32,
     // Bevy-only: the water solver is running, so trails that reach water hand it their load.
     water_handoff: u32,
+    // Bevy-only: shifts the source terrain noise.
+    noise_seed: u32,
 }
 
 @group(0) @binding(1) var<uniform> params: ErodeParams;
@@ -164,10 +166,17 @@ fn fbm(p: vec2<f32>) -> f32 {
     var total = 0.0;
     var amp = 0.5;
     var freq = params.noise_frequency;
+    // Each seed samples a different region of the noise (0 keeps the original landscape).
+    let s = f32(params.noise_seed);
+    let seed_offset = select(
+        vec2<f32>(0.0),
+        vec2<f32>(hash21(vec2<f32>(s, 1.7)), hash21(vec2<f32>(s, 9.2))) * 1000.0,
+        params.noise_seed != 0u,
+    );
     for (var i = 0u; i < FBM_OCTAVES; i = i + 1u) {
         // Offset each octave so stacked layers don't align on the same grid.
         let offset = vec2<f32>(f32(i) * 17.3, f32(i) * 23.7);
-        total += value_noise(p * freq + offset) * amp;
+        total += value_noise(p * freq + offset + seed_offset) * amp;
         amp *= FBM_PERSISTENCE;
         freq *= FBM_LACUNARITY;
     }
