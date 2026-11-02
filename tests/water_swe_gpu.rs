@@ -1138,6 +1138,9 @@ fn run_flume(bed: impl Fn(u32, u32) -> f32, radius: f32, rate: f32, seconds: f32
     {
         let mut water = h.water();
         water.bed_load.live = true;
+        if let Some(a) = std::env::var("TEST_SLOPE_EFFECT").ok().and_then(|v| v.parse().ok()) {
+            water.bed_load.slope_effect = a;
+        }
         water.springs.push(Spring {
             center: Vec2::new(12.0, N as f32 / 2.0),
             radius,
@@ -1150,6 +1153,14 @@ fn run_flume(bed: impl Fn(u32, u32) -> f32, radius: f32, rate: f32, seconds: f32
     let before = h.read_heights();
     h.water().bed_load.live = true;
     h.run(seconds);
+    if let Some(steps) = std::env::var("TEST_REFINE").ok().and_then(|v| v.parse().ok()) {
+        h.water().bed_load.refine_steps = steps;
+        {
+            let mut water = h.water();
+            water.refine_generation = water.refine_generation.wrapping_add(1);
+        }
+        h.run(steps as f32 / 64.0 / FPS + 1.0);
+    }
     let water = h.read_water();
     let after = h.read_heights();
     assert!(
@@ -1688,4 +1699,312 @@ fn bed_load_respects_rock() {
     // f16 readback resolves about 0.00025 at these heights.
     assert!(floored < depth + 0.0005, "bed load cut {floored} below the bedrock");
     assert!(hard < 0.8 * soft, "hard rock moved as much as soft");
+}
+
+// ---- Validation sweeps against the literature (docs/VALIDATION.md). Each writes a CSV to
+// `TEST_DATA_DIR` (default `target/validation`) and prints its rows.
+
+fn data_file(name: &str, header: &str) -> std::fs::File {
+    use std::io::Write;
+    let dir = std::env::var("TEST_DATA_DIR").unwrap_or_else(|_| "target/validation".into());
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut f = std::fs::File::create(format!("{dir}/{name}.csv")).unwrap();
+    writeln!(f, "{header}").unwrap();
+    f
+}
+
+fn row(f: &mut std::fs::File, values: &[f32]) {
+    use std::io::Write;
+    let line: Vec<String> = values.iter().map(|v| format!("{v:.5}")).collect();
+    println!("  {}", line.join(", "));
+    writeln!(f, "{}", line.join(",")).unwrap();
+}
+
+/// Detrended coefficient of variation of `v` (std of the residual from a linear fit / mean).
+fn detrended_cv(v: &[f32]) -> f32 {
+    let n = v.len() as f32;
+    let xm = (n - 1.0) / 2.0;
+    let ym = v.iter().sum::<f32>() / n;
+    let (mut sxy, mut sxx) = (0.0, 0.0);
+    for (i, y) in v.iter().enumerate() {
+        sxy += (i as f32 - xm) * (y - ym);
+        sxx += (i as f32 - xm).powi(2);
+    }
+    let b = sxy / sxx;
+    let var = v
+        .iter()
+        .enumerate()
+        .map(|(i, y)| (y - ym - b * (i as f32 - xm)).powi(2))
+        .sum::<f32>()
+        / n;
+    var.sqrt() / ym.abs().max(1e-9)
+}
+
+/// Roll waves: Manning theory (Jeffreys 1925; Vedernikov) puts their onset in a wide channel at
+/// Froude 1.5. Sweep the Froude number with Manning n on a fixed-bed flume and measure the depth
+/// unevenness along the flow.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn validate_roll_wave_onset() {
+    let mut f = data_file(
+        "roll_waves",
+        "manning_n,depth_cells,speed,froude,depth_cv,cv_upstream,cv_downstream",
+    );
+    let g = WaterControl::default().gravity;
+    let mid = N / 2;
+    for n in [0.016, 0.012, 0.0095, 0.008, 0.007, 0.006, 0.005, 0.0042, 0.0035, 0.0028, 0.0022, 0.0017, 0.0013] {
+        let mut h = Harness::new(WaterSolver::Swe, flume(0.002, 24.0));
+        h.water().manning_n = n;
+        h.water().springs.push(Spring {
+            center: Vec2::new(12.0, N as f32 / 2.0),
+            radius: 6.0,
+            rate: 0.05,
+        });
+        // Long enough for the front to leave the flume at the slowest flow.
+        h.run(25.0);
+        let (mut cv, mut up, mut down, mut depth, mut speed) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for _ in 0..3 {
+            let water = h.read_water();
+            let line: Vec<f32> = (64..N - 16).map(|x| water[idx(x, mid)].depth).collect();
+            cv += detrended_cv(&line) / 3.0;
+            // An instability grows as it travels: compare the two halves of the reach.
+            up += detrended_cv(&line[..line.len() / 2]) / 3.0;
+            down += detrended_cv(&line[line.len() / 2..]) / 3.0;
+            depth += line.iter().sum::<f32>() / line.len() as f32 * CELLS_PER_HEIGHT / 3.0;
+            speed += (64..N - 16)
+                .map(|x| water[idx(x, mid)].velocity.length())
+                .sum::<f32>()
+                / (N - 80) as f32
+                / 3.0;
+            h.run(0.3);
+        }
+        let froude = speed / (g * depth).sqrt();
+        row(&mut f, &[n, depth, speed, froude, cv, up, down]);
+    }
+}
+
+/// Plane tilted along x with a faint V across it, so a stream stays near y = N/2.
+fn tilted_plane(x: u32, y: u32) -> f32 {
+    0.02 + 0.002 * (N - 1 - x) as f32 + 0.0001 * (y as f32 + 0.5 - N as f32 / 2.0).abs()
+}
+
+/// Emergent hydraulic geometry: springs of different discharge carve their own channels in an
+/// erodible plane with bed load (fast-forwarded by Refine Beds). Width and depth against the
+/// discharge are compared with Leopold and Maddock (1953): width ∝ Q^0.5, depth ∝ Q^0.4.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn validate_hydraulic_geometry() {
+    let mut f = data_file(
+        "hydraulic_geometry",
+        "discharge,wet_width,mean_depth_cells,max_depth_cells,incision,channel_width,cut_width",
+    );
+    let mut points = Vec::new();
+    for factor in [0.25f32, 0.5, 1.0, 2.0, 4.0] {
+        let mut h = Harness::new(WaterSolver::Swe, tilted_plane);
+        if let Some(a) = std::env::var("TEST_SLOPE_EFFECT").ok().and_then(|v| v.parse().ok()) {
+            h.water().bed_load.slope_effect = a;
+        }
+        h.water().springs.push(Spring {
+            center: Vec2::new(16.0, N as f32 / 2.0),
+            radius: 6.0,
+            rate: 0.05 * factor,
+        });
+        h.run(8.0);
+        let before = h.read_heights();
+        h.water().bed_load.refine_steps = 3000;
+        {
+            let mut water = h.water();
+            water.refine_generation = water.refine_generation.wrapping_add(1);
+        }
+        h.run(1.5);
+        h.water().bed_load.live = true;
+        h.run(6.0);
+        let water = h.read_water();
+        let q = h.read_discharge();
+        let after = h.read_heights();
+        let (mut width, mut depth, mut deepest, mut incision, mut discharge, mut count) =
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let (mut channel, mut cut_width) = (0.0, 0.0);
+        for x in (96..208).step_by(8) {
+            let wet: Vec<u32> = (0..N).filter(|&y| water[idx(x, y)].depth > 0.002).collect();
+            if wet.is_empty() {
+                continue;
+            }
+            width += wet.len() as f32;
+            // Channel: deeper than half the section's deepest water; cut: lowered by more than
+            // half the section's deepest cut.
+            let top = wet.iter().map(|&y| water[idx(x, y)].depth).fold(0.0, f32::max);
+            channel += wet.iter().filter(|&&y| water[idx(x, y)].depth > 0.5 * top).count() as f32;
+            let cuts: Vec<f32> = (0..N).map(|y| before[idx(x, y)] - after[idx(x, y)]).collect();
+            let most = cuts.iter().fold(0.0f32, |a, b| a.max(*b));
+            cut_width += cuts.iter().filter(|&&c| most > 0.0 && c > 0.5 * most).count() as f32;
+            depth += wet.iter().map(|&y| water[idx(x, y)].depth).sum::<f32>() / wet.len() as f32;
+            deepest += wet.iter().map(|&y| water[idx(x, y)].depth).fold(0.0, f32::max);
+            incision += (0..N)
+                .map(|y| before[idx(x, y)] - after[idx(x, y)])
+                .fold(0.0, f32::max);
+            discharge += (0..N).map(|y| q[idx(x, y)].x).sum::<f32>();
+            count += 1.0;
+        }
+        let r = [
+            discharge / count,
+            width / count,
+            depth / count * CELLS_PER_HEIGHT,
+            deepest / count * CELLS_PER_HEIGHT,
+            incision / count,
+            channel / count,
+            cut_width / count,
+        ];
+        row(&mut f, &r);
+        points.push(r);
+    }
+    let fit = |k: usize| {
+        let xs: Vec<f32> = points.iter().map(|p| p[0].ln()).collect();
+        let ys: Vec<f32> = points.iter().map(|p| p[k].max(1e-6).ln()).collect();
+        let (xm, ym) = (
+            xs.iter().sum::<f32>() / xs.len() as f32,
+            ys.iter().sum::<f32>() / ys.len() as f32,
+        );
+        xs.iter().zip(&ys).map(|(x, y)| (x - xm) * (y - ym)).sum::<f32>()
+            / xs.iter().map(|x| (x - xm).powi(2)).sum::<f32>()
+    };
+    println!(
+        "hydraulic geometry exponents: wet width {:.2}, channel width {:.2}, cut width {:.2}, \
+         mean depth {:.2}, max depth {:.2}",
+        fit(1),
+        fit(5),
+        fit(6),
+        fit(2),
+        fit(3)
+    );
+}
+
+/// Alternate bars: theory and flume data (Redolfi et al. 2020; Crosato and Mosselman 2009) form
+/// bars only above a critical half-width-to-depth ratio β = W / 2h, with wavelengths of several
+/// widths. Sweep the flume width at a fixed slope and discharge.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn validate_alternate_bars() {
+    let mut f = data_file(
+        "alternate_bars",
+        "width,depth_cells,beta,shields,thalweg_std,wavelength,wavelength_over_width",
+    );
+    let mid = N / 2;
+    let g = WaterControl::default();
+    for width in [6.0f32, 10.0, 16.0, 24.0, 36.0, 52.0] {
+        let radius = (width / 2.0 - 1.0).min(6.0);
+        let slope = std::env::var("TEST_BAR_SLOPE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.003);
+        let r = run_flume(
+            flume(slope, width),
+            radius,
+            0.05 * 36.0 / (radius * radius),
+            30.0,
+        );
+        let half = (width / 2.0) as u32 - 1;
+        let thalweg: Vec<f32> = (40..N - 16)
+            .map(|x| {
+                (mid - half..mid + half)
+                    .min_by(|&a, &b| r.after[idx(x, a)].total_cmp(&r.after[idx(x, b)]))
+                    .unwrap() as f32
+            })
+            .collect();
+        let mean = thalweg.iter().sum::<f32>() / thalweg.len() as f32;
+        let spread = (thalweg.iter().map(|t| (t - mean).powi(2)).sum::<f32>()
+            / thalweg.len() as f32)
+            .sqrt();
+        if let Ok(dir) = std::env::var("TEST_IMAGE_DIR") {
+            // Detrended bed of the channel, stretched across.
+            let rows = 2 * half;
+            let bed: Vec<f32> = (0..rows)
+                .flat_map(|j| (0..N).map(move |x| (x, mid - half + j)))
+                .map(|(x, y)| r.after[idx(x, y)] - r.before[idx(x, y)])
+                .collect();
+            let m = bed.iter().fold(1e-6f32, |a, b| a.max(b.abs()));
+            write_bmp(
+                &format!("{dir}/bars_w{}.bmp", width as u32),
+                &bed,
+                N as usize,
+                rows as usize,
+                -m,
+                m,
+                3,
+            );
+        }
+        // The fundamental alternate-bar mode: bed on the left half minus the right half.
+        let asymmetry: Vec<f32> = (40..N - 16)
+            .map(|x| {
+                let side = |ys: std::ops::Range<u32>| {
+                    ys.clone().map(|y| r.after[idx(x, y)]).sum::<f32>() / ys.len() as f32
+                };
+                side(mid - half..mid) - side(mid..mid + half)
+            })
+            .collect();
+        let (period, ..) = dominant_period(&asymmetry);
+        let wet: Vec<f32> = (64..N - 24)
+            .flat_map(|x| (mid - half..mid + half).map(move |y| (x, y)))
+            .map(|(x, y)| r.water[idx(x, y)])
+            .filter(|w| w.depth > 0.0005)
+            .map(|w| w.depth)
+            .collect();
+        let depth = wet.iter().sum::<f32>() / wet.len().max(1) as f32 * CELLS_PER_HEIGHT;
+        let speed = (64..N - 24)
+            .flat_map(|x| (mid - half..mid + half).map(move |y| (x, y)))
+            .map(|(x, y)| r.water[idx(x, y)])
+            .filter(|w| w.depth > 0.0005)
+            .map(|w| w.velocity.length())
+            .sum::<f32>()
+            / wet.len().max(1) as f32;
+        let shields = g.manning_n.powi(2) * speed * speed
+            / (g.bed_load.grain * depth.max(1e-4).cbrt());
+        row(
+            &mut f,
+            &[
+                width,
+                depth,
+                width / (2.0 * depth),
+                shields,
+                spread,
+                period,
+                period / width,
+            ],
+        );
+    }
+}
+
+/// Cyclic steps: supercritical flow over an erodible bed forms steps (Parker and Izumi 2000;
+/// Balmforth and Vakil 2012). Sweep the slope of a narrow flume and record the Froude number,
+/// the step wavelength in flow depths and the relief.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn validate_cyclic_steps() {
+    let mut f = data_file(
+        "cyclic_steps",
+        "slope_cells,depth_cells,froude,wavelength,wavelength_over_depth,relief_cells,band_share",
+    );
+    let mid = N / 2;
+    let g = WaterControl::default().gravity;
+    for slope in [0.001f32, 0.002, 0.004, 0.006, 0.009, 0.013] {
+        let r = run_flume(flume(slope, 6.0), 2.0, 0.45, 25.0);
+        let profile: Vec<f32> = (48..N - 24).map(|x| r.after[idx(x, mid)]).collect();
+        let (period, _, band, relief) = dominant_period(&profile);
+        let line: Vec<Water> = (64..N - 24).map(|x| r.water[idx(x, mid)]).collect();
+        let depth = line.iter().map(|w| w.depth).sum::<f32>() / line.len() as f32 * CELLS_PER_HEIGHT;
+        let speed = line.iter().map(|w| w.velocity.length()).sum::<f32>() / line.len() as f32;
+        let froude = speed / (g * depth.max(1e-4)).sqrt();
+        row(
+            &mut f,
+            &[
+                slope * CELLS_PER_HEIGHT,
+                depth,
+                froude,
+                period,
+                period / depth.max(1e-4),
+                relief * CELLS_PER_HEIGHT,
+                band,
+            ],
+        );
+    }
 }

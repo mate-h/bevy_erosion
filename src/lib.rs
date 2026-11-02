@@ -805,7 +805,10 @@ pub struct BedLoad {
     pub k: f32,
     /// Shields number θ_c below which the bed does not move.
     pub critical_shields: f32,
-    /// Talmon's A_s: how weakly bed load slides down cross-slopes (larger is weaker).
+    /// Talmon's A_s: how weakly bed load slides down cross-slopes (larger is weaker). It is 1/r
+    /// in tan γ = −(r/√θ) ∂η/∂n. Flume calibrations put r at 0.3–0.6 (Redolfi et al. 2020: 0.40);
+    /// the default r = 1 keeps bends scouring their outer banks reliably at this resolution (see
+    /// docs/VALIDATION.md).
     pub slope_effect: f32,
     /// A_h in the helical deflection δ = atan(A_h · I_s) toward the inner bank. Rivers measure
     /// 7–11; the default is larger because these channels are shallow against their bends.
