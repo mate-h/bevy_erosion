@@ -123,10 +123,24 @@ Not done: blending the ocean shoreline into the lakes beyond what the shared sha
 ## Phase 4 (planned): morphodynamics
 
 Goal: on wet cells, replace the Phase 1 capacity model with bed load that moves along the flow
-and is conserved. Pools should form on the outer banks of bends and bars on the inner banks.
-Rivers should build deltas where they enter lakes, and straight channels should keep a smooth
-floor without the grid-aligned grooves. Phase 2 shapes the bed once; Phase 4 lets the flow
-evolve it.
+and is conserved. The bed should reach its shape from the flow, not from repeated button
+presses:
+- pools on the outer banks of bends and bars on the inner banks;
+- deltas where rivers enter lakes;
+- **steps and pools on steep reaches.** In supercritical flow over an erodible bed the water
+  speeds up over a lip, jumps below it and scours a pool, and the bed settles into a staircase
+  (cyclic steps, Parker and Izumi 2000; step-pools in mountain streams);
+- no grid-aligned grooves or columns.
+
+Phase 2 shapes the bed once; Phase 4 lets the flow evolve it.
+
+Design constraints:
+- **Keep the roll waves.** The solver forms them in thin, fast streams on steep slopes, and
+  their surges and jumps are what seed steps. Do not raise the default friction or add eddy
+  viscosity to remove them.
+- **No smoothing along the channel.** The Talmon slope term, the bank slumping and any bed
+  shaping must stay weak along the flow so steps survive. Grid artifacts (the contour stripes
+  and axis-aligned columns fixed in 4a) are bugs; steps and roll waves are not.
 
 ### What the references actually contain
 
@@ -374,27 +388,34 @@ non-dimensional versions of `riverbed.typ` stage 4:
   `R` (UI: Grain).
 - **MPM:** `|q_b| = K · max(θ − θ_c, 0)^1.5` (UI: Bed Load K, Critical Shields θ_c).
 - **Direction:** along û, rotated by the helical angle δ (4c), with Talmon's slope term
-  `− |q_b| / (A_s · sqrt(θ)) · ∇z_b` (UI: Slope Effect A_s). The slope term is what keeps
-  channels from growing grooves; it acts as anisotropic diffusion.
+  `− |q_b| / (A_s · sqrt(θ)) · ∇z_b` (UI: Slope Effect A_s). Apply it across the flow (the
+  component of ∇z_b normal to û). Across the flow it keeps cross-sections from growing grooves;
+  along the flow it would flatten steps, so keep that component weak or off.
 - **Exner on faces:** compute q_b on the same staggered faces as u and w, with the face velocity
   and face bed slope, then `Δz = −mor_fac · Δt · div(q_b)`. Material is conserved exactly
   apart from the outflow through the border and ocean.
-- **Height quantization (must fix):** heights are `u32` at 1e-6, and `u32(new · SCALE)`
-  truncates, so small per-step changes vanish or drift downward.
-  - Accumulate Δz in a float `bed_delta` buffer.
-  - Flush whole quanta, rounded to nearest, into the atomic heights.
-  - Also switch `water_erode` to round to nearest.
+- **Height quantization:** heights are `u32` at 1e-6.
+  - `water_erode` already stages its change and `water_apply` rounds it (4a).
+  - Exner's per-step Δz can be far below 1e-6, so accumulate it in a float `bed_delta` buffer
+    and flush whole quanta, rounded, into the heights.
 - **Coupling with the existing model:**
   - Cells deeper than `FULL_DEPTH` use Exner only.
   - Thin sheet flow and drying cells keep the capacity model, so hillslope wash still works.
-  - Wet slumping stays as the angle of repose.
+  - Wet slumping stays as the angle of repose, isotropic and only beside water at least
+    `FULL_DEPTH` deep (4a).
   - Suspended `sediment` stays for the silt tint.
 - **Bed stability:** clamp `|Δz|` per step to a fraction of the local depth, so a large
   `mor_fac` cannot dry a cell in one step.
 
-Verify:
+Verify (as GPU tests in `tests/water_swe_gpu.rs`):
 - the bed volume change equals the border and ocean outflow of bed load (within quantization);
-- a straight tilted flume lowers uniformly with no grid grooves;
+- a gentle tilted flume (subcritical) lowers uniformly with no grid grooves;
+- **cyclic steps:** a steep erodible flume (supercritical, Froude above about 1.5) with a
+  steady inflow grows steps that migrate upstream. Report their wavelength against the flow
+  depth, and check that it does not lock to the grid (stable under a few degrees of rotation);
+- **convergence:** with a steady inflow, the bed stops deepening once the bed shear falls to
+  the Shields threshold. Exner reaches a stable channel without Shape Beds;
+- roll waves still form on the steep flume;
 - no NaNs;
 - a dry map is unchanged.
 
@@ -425,17 +446,41 @@ sits on the outer bank, and the skew changes sign between the two bends.
 
 ### 4e. Run modes and UI
 
+- **Live Bed Load** (the target default): Exner runs every water step, with `mor_fac` = 1.
+  Beds then form while you watch, the way the rain brush cuts channels now.
 - **Refine Beds** (button, M in the demo, since R is taken): runs N steps (default 400) of flow
-  plus Exner with `mor_fac` (default about 20), spread over a few frames. Springs keep flowing
-  and the KTT cascade restarts once at the end, as Shape Beds does.
-- **Live Bed Load** checkbox: Exner runs every water step instead of only on request, with
-  `mor_fac` = 1.
+  plus Exner with `mor_fac` (default about 20), spread over a few frames, to fast-forward.
+  Springs keep flowing and the KTT cascade restarts once at the end, as Shape Beds does.
 - **New panel controls:** Manning n, Grain, Bed Load K, Critical Shields, Slope Effect, Helical
   Strength, Morph. Factor, Refine Steps.
 
+### 4f. Shape Beds from discharge
+
+Shape Beds cuts the bed a target depth below the water surface as it is when pressed. The flow
+then drains into the deeper bed, the surface drops, and the next press cuts deeper again. It
+never converges, and thin streams sit outside its wet domain until they have widened. Fix it so
+one press is enough and a second press changes nothing:
+- **Depth from discharge, not from the surface:** hydraulic geometry, depth `a · Q^0.4` and
+  half-width `b · Q^0.5`. Q is the solver's unit discharge `h·|u|`, averaged over a few seconds
+  so roll waves don't make it flicker (later, the shared discharge of 6a).
+- **Domain from discharge:** a cell joins the channel when Q passes a threshold, not when its
+  depth passes 0.002, so thin streams are shaped too.
+- **Leave the long profile alone:** shape the cross-section, but do not run the screened
+  Poisson smoothing along the flow, or steps formed by 4b are flattened. Smooth across the
+  channel only (along the τ direction), or blend the result toward the current bed along û.
+- **Idempotent:** cut to the target bed `min(ground, η_ref − d(Q))`, where the reference
+  surface `η_ref` is taken from the bank height, not from the current water surface.
+
+Once 4b runs live, Shape Beds becomes a quick start for Exner rather than the way to make a
+river.
+
+Verify: pressing twice in a row changes the bed by under one fixed-point quantum, and a
+spring-fed stream gets a channel on the first press.
+
 ### Order and risks
 
-- **Order:** 4a.0 (bevy_fft), then 4a, 4b and 4c, with 4d last.
+- **Order:** 4a.0 (bevy_fft) and 4a (done), then 4f (small, fixes the repeated presses), then
+  4b and 4c, with 4d last.
   - 4a stands on its own and is worth having even if Exner slips.
   - 4b–4d only need the face velocities, so they can be prototyped on the pipe solver's flux
     while 4a.0 is in progress.
@@ -477,6 +522,78 @@ in bevy_fft's solver, so its `lod_write` pass can feed the shared water LOD data
 depth in the foam texture's green channel, and velocity plus the surface rise rate in the flow
 texture. Before 4a, the same blend would have to read this crate's water texture. It requires
 HDR, a depth prepass, `Msaa::Off` and one water viewer.
+
+## Phase 6 (planned): one water and sediment model (KTT and the solver)
+
+The KTT kernel and the water solver now model the same landscape on two time scales and do not
+talk to each other except through the outflow mask.
+
+| | KTT kernel | Water solver |
+|---|---|---|
+| Time scale | Geologic (the cascade, and the rain brush sped up locally) | Present-day seconds |
+| "River" | A momentum field (`mx`/`my`) that steers trails into channels, and `flow_buffer`, trails per texel: a long-term discharge | Water depth and velocity; unit discharge `q = h·|u|` |
+| Erosion | Trails carve and deposit (flow accumulation, channeling, river momentum) | `water_erode` capacity model, then Exner (Phase 4b) |
+| Brush | Rain: spawns trails at the brush | Water body: adds depth |
+| Coupling today | Wet cells are KTT outflow, so trails end in lakes | None back from KTT |
+
+Roles once unified:
+- KTT shapes the valley network.
+- The solver fills it with water.
+- One discharge field and one sediment budget connect them, so beds, deltas and steps come from
+  how much water and sediment a channel actually carries.
+
+### 6a. Shared discharge field
+
+- A `discharge` buffer at base map size (in this crate's water layouts, not bevy_fft's), with
+  two parts:
+  - the solver's `h·|u|`, averaged over a few seconds by `swe_gather` (exponential moving
+    average, so roll waves do not make it flicker);
+  - KTT's `flow_buffer` on the finest level (fixed point, /10000), scaled to the same units
+    with a calibration factor fitted once on a spring-fed valley.
+- Used by Shape Beds (4f), by Exner (4b) for its sediment supply at inflows, and by the
+  analysis view (replacing the flow-only preview).
+- Verify: on a spring-fed valley, KTT's flow and the solver's discharge peak in the same cells.
+  Report their correlation.
+
+### 6b. Rain feeds the water
+
+The open item from Phase 1.5: rain trails leave water along their path.
+- The erode pass already binds 8 storage buffers. Free one by packing `mx` and `my` into a
+  single `vec2` buffer, and bind a `rain_splat` buffer (atomic `u32`, fixed point).
+- Each trail step adds a share of its water to `rain_splat` at its cell; `swe_export` adds
+  `rain_splat` to the solver's sources and zeroes it.
+- UI: **Rain Water** (how much water a trail leaves, 0 = today's behaviour).
+- After this the rain brush carves and wets in one stroke, and the water brush only adds water.
+- Verify: the water added equals the splatted total, with no frame-rate dependence.
+
+### 6c. Water steers KTT rivers
+
+- When the cascade restarts or continues at the finest level, seed the river momentum
+  (`mx`/`my`) from the solver's discharge and velocity, so new trails follow the rivers that
+  exist now instead of carving parallel channels.
+- Verify: after a restart with a river present, trail density overlaps the wet channel.
+
+### 6d. One sediment budget
+
+- Trails that end in water hand their remaining sediment to the water's suspended load, or to
+  Exner's bed load once 4b exists. It then builds deltas in lakes instead of a pile at the
+  shoreline.
+- Clear Water deposits the suspended load in place instead of deleting it.
+- Water deposition shows in KTT's deposition buffer, so the sediment and erosion preview modes
+  show both.
+- Verify: total height plus suspended sediment stays constant through trails ending in a lake,
+  apart from what leaves through the border and the ocean.
+
+### Order and risks
+
+- **Order:** 6a first (4f and 4b want it), then 6b (small once the binding is freed), then 6d,
+  with 6c last.
+- **Time-scale mismatch:** a trail stands for geologic amounts of water. Rain Water and the 6a
+  calibration factor scale it down to the solver's seconds. Expect to tune them by eye.
+- **Binding budget:** the erode pass is at 8 storage buffers. Freeing one by packing `mx`/`my`
+  touches every KTT kernel that reads river momentum.
+- **Determinism:** trails splat with atomics, as the erosion buffers already do. Fixed-point
+  accumulation keeps the order of additions from mattering.
 
 ## Units
 
