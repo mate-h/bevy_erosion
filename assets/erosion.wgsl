@@ -81,6 +81,10 @@ struct ErodeParams {
     granularity_strength: f32,
     age_strength: f32,
     normalize_age: u32,
+    bedrock_mode: u32,     // 0 = Depth (below the source surface), 1 = Height (absolute)
+    // Compute_Padding: this level's grid covers the padded base; the source sits at `pad_offset`.
+    pad_offset: vec2<u32>,
+    padded_size: vec2<u32>,
 }
 
 @group(0) @binding(1) var<uniform> params: ErodeParams;
@@ -181,6 +185,9 @@ fn outflow_source(gid: vec2<u32>, h: f32) -> f32 {
     return o;
 }
 
+// Painted water (`ErosionImages::water`), only bound for init_fbm.
+@group(1) @binding(0) var water_paint: texture_2d<f32>;
+
 @compute @workgroup_size(8,8,1)
 fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
@@ -188,18 +195,20 @@ fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     var hval = fbm(uv) * params.noise_scale;
     let idx = gid.y * params.map_size.x + gid.x;
 
-    // Adjust_Bedrock: bedrock = height - depth (× map in Depth mode). Additive_Sediment instead keeps
-    // the bedrock at the source surface and adds the depth as loose sediment on top.
+    // Adjust_Bedrock: bedrock = height - depth, or with a bedrock map height - map * depth (Depth
+    // mode) / map * depth (Height mode, clamped to the surface). Additive_Sediment instead keeps the
+    // bedrock at the source surface and adds the gap as loose sediment on top.
     var bedrock = 0.0;
     if (params.use_bedrock != 0u) {
-        var depth = params.bedrock_depth;
+        bedrock = hval - params.bedrock_depth;
         if (params.use_bedrock_map != 0u) {
-            depth *= mask_noise(uv, MASK_BEDROCK_SEED);
+            let depth = params.bedrock_depth * mask_noise(uv, MASK_BEDROCK_SEED);
+            bedrock = select(hval - depth, min(depth, hval), params.bedrock_mode == 1u);
         }
-        bedrock = hval - depth;
         if (params.additive_sediment != 0u) {
+            let sediment = hval - bedrock;
             bedrock = hval;
-            hval += depth;
+            hval += sediment;
         }
     }
     atomicStore(&height[idx], u32(max(hval, 0.0) * HEIGHT_SCALE));
@@ -218,6 +227,8 @@ fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (params.use_outflow != 0u) {
         m.y = outflow_source(gid.xy, hval);
     }
+    // Painted water always drains, whether or not the procedural outflow is on.
+    m.y = max(m.y, clamp(textureLoad(water_paint, vec2<i32>(gid.xy), 0).x, 0.0, 1.0));
     if (params.use_erosion_mask != 0u) {
         m.z = mask_noise(uv, MASK_ERODE_SEED);
     }
@@ -567,7 +578,13 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
         let cell = vec2<i32>(clamp(i32(p.x), 0, res_x - 1), clamp(i32(p.y), 0, res_y - 1));
         let idx = u32(cell.y * res_x + cell.x);
 
-        let h = load_height(cell);
+        // Issue every per-cell load up front so they overlap instead of stalling one by one
+        // through the step (the trail is a long serial chain; this is its latency).
+        let h_bits = atomicLoad(&height[idx]);
+        let h = f32(h_bits) / HEIGHT_SCALE;
+        let cell_masks = masks[idx];
+        let cell_layers = layers[idx];
+        let dep_val = load_deposition(cell);
         var hmin = h;
         var hmax = h;
         var havg = 0.0;
@@ -577,7 +594,11 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var j = -1; j <= 1; j = j + 2) {
             let pxj = vec2<i32>(clamp(cell.x + j, 0, res_x - 1), cell.y);
             let hs = load_height(pxj);
-            grad.x += f32(j) * (hs + params.flow_volume * load_deposition(pxj));
+            var gs = hs;
+            if (params.flow_volume != 0.0) {
+                gs += params.flow_volume * load_deposition(pxj);
+            }
+            grad.x += f32(j) * gs;
             if (do_rivers) {
                 mgrad.x += f32(j) * river_momentum(pxj);
                 havg += hs;
@@ -588,7 +609,11 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var j = -1; j <= 1; j = j + 2) {
             let pyj = vec2<i32>(cell.x, clamp(cell.y + j, 0, res_y - 1));
             let hs = load_height(pyj);
-            grad.y += f32(j) * (hs + params.flow_volume * load_deposition(pyj));
+            var gs = hs;
+            if (params.flow_volume != 0.0) {
+                gs += params.flow_volume * load_deposition(pyj);
+            }
+            grad.y += f32(j) * gs;
             if (do_rivers) {
                 mgrad.y += f32(j) * river_momentum(pyj);
                 havg += hs;
@@ -597,7 +622,6 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
             hmax = max(hmax, hs);
         }
 
-        let dep_val = load_deposition(cell);
         var scarring_coefficient = 1.0;
 
         if (do_rivers) {
@@ -682,15 +706,15 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
             return;
         }
 
-        dh = max(dh, -dep_val) + min(dh + dep_val, 0.0) * params.rock_softness * masks[idx].x;
+        dh = max(dh, -dep_val) + min(dh + dep_val, 0.0) * params.rock_softness * cell_masks.x;
 
         // Release the carried material (scarring is 1 without rivers)
         dh += min((1.0 - params.suspended_load) * carry * scarring_coefficient, max_deposit_angle * dx_scaled);
 
         // Never cut into the bedrock
-        let bedrock = layers[idx].x;
+        let bedrock = cell_layers.x;
         if (params.use_bedrock != 0u) {
-            dh = max(dh, bedrock - load_height(cell));
+            dh = max(dh, bedrock - h);
         }
         carry -= dh;
         carry = max(carry, 0.0);
@@ -708,11 +732,11 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         // Clamp to the neighbourhood, scale by outflow, keep above bedrock, and write, all against
         // the cell's current value (see `update_cell_height`).
-        dh = update_cell_height(idx, dh, hmin, hmax, 1.0 - masks[idx].y, bedrock);
+        dh = update_cell_height(idx, h_bits, dh, hmin, hmax, 1.0 - cell_masks.y, bedrock);
 
         let dep_delta = max(dh, -dep_val);
         atomicAdd(&deposition[idx], i32(dep_delta * DEPOSITION_SCALE));
-        layers[idx].y *= pow(0.1, abs(dh) * dx_inv);
+        layers[idx].y = cell_layers.y * pow(0.1, abs(dh) * dx_inv);
         if (dh < 0.0) {
             atomicAdd(&erosion_buffer[idx], u32(-dh * 100000.0));
         }
@@ -731,8 +755,10 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
 // stays inside [hmin, hmax]. Separate atomicAdd/atomicSub calls would instead stack every
 // concurrent cut sized against the same reading; where many trails converge (strong momentum
 // coherence) that drove river cells below zero and wrapped the u32 height.
-fn update_cell_height(idx: u32, dh_in: f32, hmin: f32, hmax: f32, scale: f32, bedrock: f32) -> f32 {
-    var old_bits = atomicLoad(&height[idx]);
+// `expected_bits` is the caller's earlier read: the exchange only retries if another trail wrote
+// the cell since.
+fn update_cell_height(idx: u32, expected_bits: u32, dh_in: f32, hmin: f32, hmax: f32, scale: f32, bedrock: f32) -> f32 {
+    var old_bits = expected_bits;
     loop {
         let old_h = f32(old_bits) / HEIGHT_SCALE;
         var dh = clamp(old_h + dh_in, hmin, max(hmin, hmax)) - old_h;
@@ -890,17 +916,19 @@ fn write_back(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(8,8,1)
 fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
+    // The finest level may be padded (Compute_Padding): read at the offset, write the base map.
+    let out_px = vec2<i32>(gid.xy);
+    if (any(gid.xy >= textureDimensions(display_out))) { return; }
     let size_x = i32(params.map_size.x);
     let size_y = i32(params.map_size.y);
-    let px = i32(gid.x);
-    let py = i32(gid.y);
+    let px = i32(gid.x + params.pad_offset.x);
+    let py = i32(gid.y + params.pad_offset.y);
     let idx = u32(py * size_x + px);
     let h = f32(atomicLoad(&height[idx])) / HEIGHT_SCALE;
 
     // Height in R (and B); the Age view in G.
     let c = h;
-    textureStore(display_out, vec2<i32>(px, py), vec4<f32>(c, age_display(layers[idx].y), c, 1.0));
+    textureStore(display_out, out_px, vec4<f32>(c, age_display(layers[idx].y), c, 1.0));
 
     // compute normals from central differences of height field
     let xm1 = max(px - 1, 0);
@@ -917,7 +945,7 @@ fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dy = hU - hD;
     let n = normalize(vec3<f32>(-dx, 1.0, -dy));
     let enc = n * 0.5 + vec3<f32>(0.5, 0.5, 0.5);
-    textureStore(normal_out, vec2<i32>(px, py), vec4<f32>(enc, 1.0));
+    textureStore(normal_out, out_px, vec4<f32>(enc, 1.0));
     
     // Pack flow, deposition (sediment), and erosion into single analysis texture
     let flow_mag = f32(atomicLoad(&flow_buffer[idx])) / 10000.0;
@@ -941,7 +969,7 @@ fn blit_to_texture(@builtin(global_invocation_id) gid: vec3<u32>) {
         erosion,
         curvature
     );
-    textureStore(analysis_out, vec2<i32>(px, py), analysis);
+    textureStore(analysis_out, out_px, analysis);
 }
 
 // KTT age visualization: Age * 10^Age_Strength, optionally normalized to v / (1 + v).
@@ -976,9 +1004,9 @@ struct BlitDisplayParams {
 
 // Map a full-res display pixel center into coarse-grid coordinates (same space as erosion `pos`).
 fn display_to_coarse_pos(gid: vec2<u32>) -> vec2<f32> {
-    return (vec2<f32>(f32(gid.x), f32(gid.y)) + 0.5)
+    return (vec2<f32>(gid + params.pad_offset) + 0.5)
         * vec2<f32>(params.map_size.xy)
-        / vec2<f32>(blit_display.display_size.xy);
+        / vec2<f32>(params.padded_size.xy);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -989,7 +1017,7 @@ fn blit_level_to_display(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px = i32(gid.x);
     let py = i32(gid.y);
     let pos = display_to_coarse_pos(gid.xy);
-    let dpos = vec2<f32>(params.map_size.xy) / vec2<f32>(blit_display.display_size.xy);
+    let dpos = vec2<f32>(params.map_size.xy) / vec2<f32>(params.padded_size.xy);
 
     let h = bilinear_sample_height(pos);
     let age = age_display(bilinear_sample_age(pos));
@@ -1057,19 +1085,20 @@ const PI_2 = 6.28318530718;
 // Sample count, radius, strength are hardcoded for compute shader
 @compute @workgroup_size(8,8,1)
 fn compute_ao(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
+    let dims = textureDimensions(ao_out);
+    if (any(gid.xy >= dims)) { return; }
     
     let size_x = i32(params.map_size.x);
     let size_y = i32(params.map_size.y);
-    let px = i32(gid.x);
-    let py = i32(gid.y);
+    let px = i32(gid.x + params.pad_offset.x);
+    let py = i32(gid.y + params.pad_offset.y);
     let idx = u32(py * size_x + px);
     
     let current_height = f32(atomicLoad(&height[idx])) / HEIGHT_SCALE;
     
     // AO parameters (matching the default values from Rust)
     let sample_count = 64u; // Increased for smoother result
-    let sample_radius_px = 0.08 * f32(params.map_size.x); // Convert UV radius to pixels
+    let sample_radius_px = 0.08 * f32(dims.x); // Convert UV radius to pixels
     let strength = 1.5;
     let bias = 0.0;
     let height_scale = 50.0; // Match terrain height scale
@@ -1104,7 +1133,7 @@ fn compute_ao(@builtin(global_invocation_id) gid: vec3<u32>) {
         let px_distance = length(offset);
         
         // Convert to world distance
-        let world_distance = (px_distance / f32(params.map_size.x)) * terrain_size;
+        let world_distance = (px_distance / f32(dims.x)) * terrain_size;
         
         // Skip if distance is too small
         if (world_distance < 0.1) {
@@ -1139,7 +1168,7 @@ fn compute_ao(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ao = max(ao_final, bias);
     
     // Write AO value to texture (single channel R16Float)
-    textureStore(ao_out, vec2<i32>(px, py), vec4<f32>(ao, 0.0, 0.0, 0.0));
+    textureStore(ao_out, vec2<i32>(gid.xy), vec4<f32>(ao, 0.0, 0.0, 0.0));
 }
 
 // Gaussian blur pass for smoothing AO
@@ -1148,11 +1177,12 @@ fn compute_ao(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(8,8,1)
 fn blur_ao_horizontal(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
+    let dims = textureDimensions(ao_out);
+    if (any(gid.xy >= dims)) { return; }
     
     let px = i32(gid.x);
     let py = i32(gid.y);
-    let size_x = i32(params.map_size.x);
+    let size_x = i32(dims.x);
     
     // 5-tap Gaussian kernel weights (approximation: 1, 4, 6, 4, 1) / 16
     let weights = array<f32, 5>(0.0625, 0.25, 0.375, 0.25, 0.0625);
@@ -1171,11 +1201,12 @@ fn blur_ao_horizontal(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(8,8,1)
 fn blur_ao_vertical(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.map_size.x || gid.y >= params.map_size.y) { return; }
+    let dims = textureDimensions(ao_out);
+    if (any(gid.xy >= dims)) { return; }
     
     let px = i32(gid.x);
     let py = i32(gid.y);
-    let size_y = i32(params.map_size.y);
+    let size_y = i32(dims.y);
     
     // 5-tap Gaussian kernel weights
     let weights = array<f32, 5>(0.0625, 0.25, 0.375, 0.25, 0.0625);

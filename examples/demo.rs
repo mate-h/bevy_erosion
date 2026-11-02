@@ -16,6 +16,7 @@ use bevy::{
 use bevy_erosion::ui::ErosionParamsPlugin;
 use bevy_erosion::{
     ErosionConfig,
+    brush::{TerrainSurface, WaterBrush, WaterBrushPlugin},
     camera::{OrbitCameraPlugin, OrbitController},
     sun::{Sun, SunController, SunPlugin},
     *,
@@ -40,6 +41,7 @@ fn main() {
             OrbitCameraPlugin,
             SunPlugin,
             AutoExposurePlugin,
+            WaterBrushPlugin,
             #[cfg(feature = "ui")]
             ErosionParamsPlugin,
         ))
@@ -51,6 +53,7 @@ fn main() {
                 handle_reset_input,
                 handle_sim_input,
                 handle_preview_mode_input,
+                handle_brush_input,
             ),
         )
         .run();
@@ -85,6 +88,9 @@ fn print_controls() {
     println!("  6 - View-space normals preview");
     println!("  7 - Curvature map preview");
     println!("  8 - Age map preview");
+    println!("  B - toggle water brush (left drag paints, Shift erases, right drag orbits)");
+    println!("  [ / ] - water brush radius");
+    println!("  C - clear painted water");
 }
 
 fn spawn_terrain(
@@ -107,6 +113,7 @@ fn spawn_terrain(
             .size(half_size, half_size),
     );
     let mesh_handle = meshes.add(plane);
+    let height_scale = 50.0;
 
     let mat_handle = materials.add(ExtendedMaterial {
         base: StandardMaterial {
@@ -121,7 +128,7 @@ fn spawn_terrain(
             color_tex: erosion_images.color.clone(),
             analysis_tex: erosion_images.analysis.clone(),
             ao_tex: erosion_images.ao.clone(),
-            height_scale: 50.0,
+            height_scale,
             preview_mode: 0, // Default to PBR
         },
     });
@@ -130,6 +137,10 @@ fn spawn_terrain(
         Mesh3d(mesh_handle),
         MeshMaterial3d(mat_handle),
         Transform::from_xyz(0.0, 0.0, 0.0),
+        TerrainSurface {
+            size: Vec2::splat(half_size),
+            height_scale,
+        },
     ));
 
     let earth_medium = scattering_mediums.add(ScatteringMedium::earth(256, 256));
@@ -213,6 +224,22 @@ fn handle_sim_input(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<SimControl>
     }
     if sim.paused && keys.just_pressed(KeyCode::KeyE) {
         sim.step_counter = sim.step_counter.wrapping_add(1);
+    }
+}
+
+fn handle_brush_input(keys: Res<ButtonInput<KeyCode>>, mut brush: ResMut<WaterBrush>) {
+    if keys.just_pressed(KeyCode::KeyB) {
+        brush.enabled = !brush.enabled;
+        println!("Water brush: {}", if brush.enabled { "on" } else { "off" });
+    }
+    if keys.just_pressed(KeyCode::KeyC) {
+        brush.clear_requested = true;
+    }
+    if keys.just_pressed(KeyCode::BracketLeft) {
+        brush.radius = (brush.radius / 1.25).max(2.0);
+    }
+    if keys.just_pressed(KeyCode::BracketRight) {
+        brush.radius = (brush.radius * 1.25).min(128.0);
     }
 }
 

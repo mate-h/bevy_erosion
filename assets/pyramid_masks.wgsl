@@ -26,6 +26,8 @@ struct PyramidResampleParams {
     granularity_amount: f32,
     granularity_scale: f32,
     granularity_strength: f32,
+    padded_size: vec2<u32>,  // finest level (padded base)
+    pad_offset: vec2<u32>,   // base map offset inside the padded grid (Compute_Padding)
 }
 
 @group(0) @binding(0) var<storage, read> src_outflow_acc: array<f32>;
@@ -116,9 +118,10 @@ fn pyramid_upscale_masks(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dst_idx = gid.y * resample.dst_size.x + gid.x;
     let center = vec2<f32>(gid.xy) + 0.5;
     let dst_size = vec2<f32>(resample.dst_size);
-    let orig_pos = center * vec2<f32>(resample.orig_size) / dst_size;
+    // Undo Compute_Padding: padded texels clamp to the source edge.
+    let orig_pos = center * vec2<f32>(resample.padded_size) / dst_size - vec2<f32>(resample.pad_offset);
     let src_pos = center * vec2<f32>(resample.src_size) / dst_size;
-    let ratio = f32(resample.orig_size.x) / dst_size.x;
+    let ratio = f32(resample.padded_size.x) / dst_size.x;
 
     let outflow = clamp(expanded_orig_outflow(orig_pos, ratio), 0.0, 1.0);
     var acc = outflow;

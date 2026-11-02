@@ -10,7 +10,8 @@ use bevy::{
         render_resource::{
             TextureFormat, TextureUsages,
             binding_types::{
-                storage_buffer, storage_buffer_read_only, texture_storage_2d, uniform_buffer,
+                storage_buffer, storage_buffer_read_only, texture_2d, texture_storage_2d,
+                uniform_buffer,
             },
             *,
         },
@@ -24,6 +25,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+pub mod brush;
 pub mod camera;
 pub mod sun;
 
@@ -61,7 +63,9 @@ pub fn pyramid_level_fraction(feature_size: f32, detail_scale: f32) -> f32 {
 /// Eroded pyramid levels, coarsest first; the last one is always `base`.
 ///
 /// `repeat_begin1` starts from `base / 2^ceil(Iterations)` and doubles the resolution before each
-/// of its `ceil(Iterations)` erosion passes. Non-divisible sizes are rounded up instead of padded.
+/// of its `ceil(Iterations)` erosion passes. Like `Compute_Padding`, the base is first padded to a
+/// multiple of `2^steps`, so every level is an exact halving and the finest level is the padded
+/// base (see [`pyramid_padding`]).
 pub fn pyramid_levels(
     base: UVec2,
     feature_size: f32,
@@ -80,13 +84,14 @@ pub fn pyramid_levels(
         frac * frac
     };
     let scale = detail_scale.max(1e-3);
+    let grid = 1u32 << steps;
+    let padded = UVec2::new(base.x.next_multiple_of(grid), base.y.next_multiple_of(grid));
     (0..steps)
         .rev()
         .enumerate()
         .map(|(pass, k)| {
-            let div = 1u32 << k;
-            let size = UVec2::new(base.x.div_ceil(div), base.y.div_ceil(div));
-            let voxel_size = base.x as f32 / size.x as f32;
+            let size = padded / (1u32 << k);
+            let voxel_size = padded.x as f32 / size.x as f32;
             let voxel_scale = (voxel_size / scale).max(1.0);
             let iterations = (ERODE_ITERS_PER_WRITEBACK as f32
                 * voxel_scale.powf(geological_age / 10.0))
@@ -100,6 +105,19 @@ pub fn pyramid_levels(
             }
         })
         .collect()
+}
+
+/// `Compute_Padding` offset of the base map inside the finest (padded) level: half the padding,
+/// rounded down.
+pub fn pyramid_padding(base: UVec2, levels: &[PyramidLevel]) -> UVec2 {
+    levels.last().map_or(UVec2::ZERO, |l| (l.size - base) / 2)
+}
+
+/// Largest padded base any level count can produce, so the work sets never need reallocating.
+fn pyramid_capacity(base: UVec2) -> UVec2 {
+    let max_steps = (base.min_element().max(PYRAMID_MIN_SIZE) / PYRAMID_MIN_SIZE).ilog2() + 1;
+    let grid = 1u32 << max_steps;
+    UVec2::new(base.x.next_multiple_of(grid), base.y.next_multiple_of(grid))
 }
 
 /// `ErodeParams` for one dispatch at `level`.
@@ -135,6 +153,9 @@ pub struct PyramidResampleParams {
     pub granularity_amount: f32,
     pub granularity_scale: f32,
     pub granularity_strength: f32,
+    /// Finest-level (padded base) size; level texel `p` covers base texel `p * padded / size - pad_offset`.
+    pub padded_size: UVec2,
+    pub pad_offset: UVec2,
 }
 
 #[derive(Clone, Copy, ShaderType)]
@@ -290,6 +311,9 @@ pub struct ErosionImages {
     pub analysis: Handle<Image>, // Combined: R=flow_mag, G=sediment, B=erosion, A=flow_dir_encoded
     pub ao: Handle<Image>,       // Ambient occlusion texture
     pub ao_temp: Handle<Image>,  // Temporary texture for AO blur
+    /// Painted water (R32Float, 0..1, map size): added to the source outflow mask at init.
+    /// Edit it on the CPU and bump [`ResetSim`] to re-erode (see [`brush`]).
+    pub water: Handle<Image>,
 }
 
 /// Creates all erosion render-target images for the given map size and adds them to `images`.
@@ -311,7 +335,25 @@ pub fn create_erosion_images(images: &mut Assets<Image>, size: UVec2) -> Erosion
         analysis: add(images, TextureFormat::Rgba16Float),
         ao: add(images, TextureFormat::R16Float),
         ao_temp: add(images, TextureFormat::R16Float),
+        water: images.add(empty_water_image(size)),
     }
+}
+
+/// A cleared [`ErosionImages::water`] paint map.
+pub fn empty_water_image(size: UVec2) -> Image {
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: size.x,
+            height: size.y,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &0f32.to_le_bytes(),
+        TextureFormat::R32Float,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
+    image
 }
 
 /// Extended material type for terrain rendering
@@ -505,6 +547,13 @@ pub struct ErodeParams {
     pub age_strength: f32,
     /// Reference parm `Normalize_Age_Field`: map the Age view through `v / (1 + v)`.
     pub normalize_age: u32,
+    /// Reference parm `Bedrock_Mode` (with `Use_Bedrock_Map`): 0 = Depth, the map scales the depth
+    /// below the source surface; 1 = Height, the map times `Bedrock_Depth` is the bedrock height.
+    pub bedrock_mode: u32,
+    /// Set per dispatch: where the base map sits inside the padded pyramid grid (`Compute_Padding`).
+    pub pad_offset: UVec2,
+    /// Set per dispatch: padded base size (the finest level's grid).
+    pub padded_size: UVec2,
 }
 
 impl Default for ErodeParams {
@@ -583,6 +632,9 @@ impl Default for ErodeParams {
             granularity_strength: 0.1,
             age_strength: -1.0, // Age_Strength
             normalize_age: 0,   // Normalize_Age_Field
+            bedrock_mode: 0,    // Bedrock_Mode (Depth)
+            pad_offset: UVec2::ZERO,
+            padded_size: UVec2::new(512, 512),
         }
     }
 }
@@ -716,6 +768,7 @@ impl Plugin for ErosionComputePlugin {
 struct ErosionPipeline {
     layout_erosion: BindGroupLayoutDescriptor,
     layout_color: BindGroupLayoutDescriptor,
+    layout_water: BindGroupLayoutDescriptor,
     layout_blit: BindGroupLayoutDescriptor,
     layout_blit_blur: BindGroupLayoutDescriptor,
     layout_blit_level: BindGroupLayoutDescriptor,
@@ -880,6 +933,15 @@ fn init_erosion_pipeline(
         ),
     );
 
+    // Painted water for init (group 1 of init_fbm).
+    let layout_water = BindGroupLayoutDescriptor::new(
+        "ErosionWaterGroup1",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (texture_2d(TextureSampleType::Float { filterable: false }),),
+        ),
+    );
+
     let shader = asset_server.load(EROSION_SHADER);
     let compute =
         |layout: Vec<BindGroupLayoutDescriptor>, shader: &Handle<Shader>, entry: &'static str| {
@@ -890,7 +952,11 @@ fn init_erosion_pipeline(
                 ..default()
             })
         };
-    let pipeline_init = compute(vec![layout_erosion.clone()], &shader, "init_fbm");
+    let pipeline_init = compute(
+        vec![layout_erosion.clone(), layout_water.clone()],
+        &shader,
+        "init_fbm",
+    );
     let pipeline_init_color = compute(
         vec![layout_erosion.clone(), layout_color.clone()],
         &shader,
@@ -950,6 +1016,7 @@ fn init_erosion_pipeline(
     commands.insert_resource(ErosionPipeline {
         layout_erosion,
         layout_color,
+        layout_water,
         layout_blit,
         layout_blit_blur,
         layout_blit_level,
@@ -1037,6 +1104,7 @@ struct ErosionBindGroups {
     upscale_masks: [BindGroup; 2],
     level_blit: BindGroup,
     color: BindGroup,
+    water: BindGroup,
     blit: BindGroup,
     blit_blur: BindGroup,
 }
@@ -1048,7 +1116,8 @@ fn prepare_erosion_buffers(
     queue: Res<RenderQueue>,
     existing: Option<Res<ErosionBuffers>>,
 ) {
-    let texels = (params.map_size.x * params.map_size.y) as usize;
+    let capacity = pyramid_capacity(params.map_size);
+    let texels = (capacity.x * capacity.y) as usize;
     if existing.is_some_and(|b| b.texels == texels) {
         return;
     }
@@ -1086,6 +1155,7 @@ fn prepare_erosion_bind_groups(
         Some(view_analysis),
         Some(view_ao),
         Some(view_ao_temp),
+        Some(view_water),
     ) = (
         gpu_images.get(&images.height),
         gpu_images.get(&images.color),
@@ -1093,6 +1163,7 @@ fn prepare_erosion_bind_groups(
         gpu_images.get(&images.analysis),
         gpu_images.get(&images.ao),
         gpu_images.get(&images.ao_temp),
+        gpu_images.get(&images.water),
     )
     else {
         return;
@@ -1185,6 +1256,11 @@ fn prepare_erosion_bind_groups(
             &layout(&pipeline.layout_color),
             &BindGroupEntries::sequential((&view_color.texture_view,)),
         ),
+        water: render_device.create_bind_group(
+            None,
+            &layout(&pipeline.layout_water),
+            &BindGroupEntries::sequential((&view_water.texture_view,)),
+        ),
         blit: render_device.create_bind_group(
             None,
             &layout(&pipeline.layout_blit),
@@ -1235,8 +1311,14 @@ enum FrameCmd {
         set: usize,
         offset: u32,
         finest: bool,
+        /// Recompute ambient occlusion (finest level only; see [`AO_INTERVAL`]).
+        ao: bool,
     },
 }
+
+/// While the finest level erodes, AO (64 height samples per texel, as costly as an erode
+/// dispatch) is refreshed only every this many displays, plus on the first and the last one.
+const AO_INTERVAL: u32 = 8;
 
 #[derive(Resource, Default)]
 struct ErosionState {
@@ -1246,6 +1328,8 @@ struct ErosionState {
     cascade: Cascade,
     steps: Vec<CascadeStep>,
     frame: Vec<FrameCmd>,
+    /// Finest-level displays since AO was last computed (`None` before the first one).
+    displays_since_ao: Option<u32>,
 }
 
 /// Turns the cascade's next steps into this frame's command list and per-dispatch uniforms.
@@ -1280,6 +1364,7 @@ fn plan_erosion_frame(
     if reset.generation != state.last_reset_gen {
         state.last_reset_gen = reset.generation;
         state.cascade.restart(params.pyramid_levels());
+        state.displays_since_ao = None;
     }
 
     let budget = if sim.paused {
@@ -1307,12 +1392,19 @@ fn plan_erosion_frame(
     };
     let levels = &state.cascade.levels;
     let level_at = |i: usize| levels.get(i).copied().unwrap_or(base_level);
+    let finest_size = levels.last().map_or(params.map_size, |l| l.size);
+    let pad_offset = pyramid_padding(params.map_size, levels);
+    let params = &ErodeParams {
+        pad_offset,
+        padded_size: finest_size,
+        ..params.clone()
+    };
     for step in &state.steps {
         let cmd = match *step {
             CascadeStep::Init => FrameCmd::Init {
                 offset: buffers
                     .params
-                    .push(&level_erode_params(&params, &base_level, 0)),
+                    .push(&level_erode_params(params, &base_level, 0)),
                 size: params.map_size,
             },
             CascadeStep::Seed { src, dst, level } => {
@@ -1336,6 +1428,8 @@ fn plan_erosion_frame(
                     granularity_amount: params.granularity_amount,
                     granularity_scale: params.granularity_scale,
                     granularity_strength: params.granularity_strength,
+                    padded_size: finest_size,
+                    pad_offset,
                 });
                 debug_assert!(first || src == 1 - dst);
                 info!(
@@ -1357,7 +1451,7 @@ fn plan_erosion_frame(
                 level,
                 iteration,
             } => {
-                let lp = level_erode_params(&params, &level_at(level), iteration);
+                let lp = level_erode_params(params, &level_at(level), iteration);
                 FrameCmd::Erode {
                     set,
                     particles: lp.num_particles,
@@ -1369,7 +1463,7 @@ fn plan_erosion_frame(
                 level,
                 iteration,
             } => {
-                let lp = level_erode_params(&params, &level_at(level), iteration);
+                let lp = level_erode_params(params, &level_at(level), iteration);
                 FrameCmd::WriteBack {
                     set,
                     size: lp.map_size,
@@ -1381,14 +1475,24 @@ fn plan_erosion_frame(
     }
     if !state.frame.is_empty() {
         let level = level_at(state.cascade.level);
+        let finest = level.size == finest_size;
+        // Paused steps and the cascade's final frame are the last display for a while: refresh AO.
+        let last = state.cascade.finished || sim.paused;
+        let ao = finest && (last || state.displays_since_ao.is_none_or(|n| n + 1 >= AO_INTERVAL));
+        state.displays_since_ao = match (finest, ao) {
+            (false, _) => None,
+            (true, true) => Some(0),
+            (true, false) => state.displays_since_ao.map(|n| n + 1),
+        };
         state.frame.push(FrameCmd::Display {
             set: state.cascade.current,
-            offset: buffers.params.push(&level_erode_params(&params, &level, 0)),
-            finest: level.size == params.map_size,
+            offset: buffers.params.push(&level_erode_params(params, &level, 0)),
+            finest,
+            ao,
         });
     } else if buffers.params.is_empty() {
         // Keep a valid binding around for bind group creation.
-        buffers.params.push(&params);
+        buffers.params.push(params);
     }
     if buffers.resample_params.is_empty() {
         buffers.resample_params.push(&PyramidResampleParams {
@@ -1404,6 +1508,8 @@ fn plan_erosion_frame(
             granularity_amount: 0.0,
             granularity_scale: 0.0,
             granularity_strength: 0.0,
+            padded_size: UVec2::ONE,
+            pad_offset: UVec2::ZERO,
         });
     }
     buffers.params.write_buffer(&render_device, &queue);
@@ -1454,6 +1560,7 @@ fn erosion_compute(
                 if let Some(p) = get(pipes.pipeline_init) {
                     pass.set_pipeline(p);
                     pass.set_bind_group(0, source, &[offset]);
+                    pass.set_bind_group(1, &groups.water, &[]);
                     pass.dispatch_workgroups(gx, gy, 1);
                 }
                 if let Some(p) = get(pipes.pipeline_init_color) {
@@ -1506,6 +1613,7 @@ fn erosion_compute(
                 set,
                 offset,
                 finest,
+                ao,
             } => {
                 let (gx, gy) = dispatch_grid(params.map_size);
                 let erosion = &groups.erosion[set];
@@ -1519,12 +1627,13 @@ fn erosion_compute(
                     }
                     continue;
                 }
-                for (id, group1) in [
+                let passes = [
                     (pipes.pipeline_blit, &groups.blit),
                     (pipes.pipeline_ao, &groups.blit),
                     (pipes.pipeline_blur_h, &groups.blit_blur),
                     (pipes.pipeline_blur_v, &groups.blit_blur),
-                ] {
+                ];
+                for &(id, group1) in &passes[..if ao { 4 } else { 1 }] {
                     if let Some(p) = get(id) {
                         pass.set_pipeline(p);
                         pass.set_bind_group(0, erosion, &[offset]);
@@ -1584,10 +1693,38 @@ mod tests {
     }
 
     #[test]
-    fn non_power_of_two_sizes_round_up() {
+    fn non_power_of_two_sizes_are_padded() {
+        // 4 steps: padded to a multiple of 16, so each level is an exact halving.
         let levels = pyramid_levels(UVec2::new(500, 300), 8.0, 1.0, 0.0);
-        assert_eq!(levels[0].size, UVec2::new(63, 38));
-        assert_eq!(levels.last().unwrap().size, UVec2::new(500, 300));
+        let sizes: Vec<UVec2> = levels.iter().map(|l| l.size).collect();
+        assert_eq!(
+            sizes,
+            [
+                UVec2::new(64, 38),
+                UVec2::new(128, 76),
+                UVec2::new(256, 152),
+                UVec2::new(512, 304)
+            ]
+        );
+        assert_eq!(levels[0].voxel_size, 8.0);
+        assert_eq!(levels[3].voxel_size, 1.0);
+        assert_eq!(
+            pyramid_padding(UVec2::new(500, 300), &levels),
+            UVec2::new(6, 2)
+        );
+        assert!(
+            pyramid_capacity(UVec2::new(500, 300))
+                .cmpge(UVec2::new(512, 304))
+                .all()
+        );
+    }
+
+    #[test]
+    fn power_of_two_sizes_are_not_padded() {
+        let levels = pyramid_levels(UVec2::splat(512), 8.0, 1.0, 0.0);
+        assert_eq!(levels.last().unwrap().size, UVec2::splat(512));
+        assert_eq!(pyramid_padding(UVec2::splat(512), &levels), UVec2::ZERO);
+        assert_eq!(pyramid_capacity(UVec2::splat(512)), UVec2::splat(512));
     }
 
     #[test]

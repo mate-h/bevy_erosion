@@ -24,6 +24,8 @@ struct PyramidResampleParams {
     granularity_amount: f32,
     granularity_scale: f32,
     granularity_strength: f32,
+    padded_size: vec2<u32>,  // finest level (padded base)
+    pad_offset: vec2<u32>,   // base map offset inside the padded grid (Compute_Padding)
 }
 
 @group(0) @binding(0) var<storage, read> src_height: array<u32>;
@@ -65,6 +67,11 @@ fn bilinear_orig(pos: vec2<f32>) -> f32 {
     return mix(a, b, w.y);
 }
 
+// Level texel-space position → source (base) texel space, undoing Compute_Padding.
+fn level_to_orig(pos: vec2<f32>, size: vec2<u32>) -> vec2<f32> {
+    return pos * vec2<f32>(resample.padded_size) / vec2<f32>(size) - vec2<f32>(resample.pad_offset);
+}
+
 fn bilinear_src(pos: vec2<f32>) -> f32 {
     let p = pos - 0.5;
     let i = vec2<i32>(floor(p));
@@ -82,8 +89,7 @@ fn pyramid_upscale_height(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dst_idx = gid.y * resample.dst_size.x + gid.x;
     let center = vec2<f32>(gid.xy) + 0.5;
     let dst_size = vec2<f32>(resample.dst_size);
-    let orig_size = vec2<f32>(resample.orig_size);
-    let source_h = bilinear_orig(center * orig_size / dst_size);
+    let source_h = bilinear_orig(level_to_orig(center, resample.dst_size));
     var h = source_h;
     var dep = 0.0;
 
@@ -100,7 +106,7 @@ fn pyramid_upscale_height(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let d = vec2<f32>(q) + 0.5 - sp;
                 let w = exp(-0.5 * dot(d, d) / (GAUSS_SIGMA * GAUSS_SIGMA));
                 let qc = clamp(q, vec2<i32>(0), vec2<i32>(resample.src_size) - 1);
-                let q_orig = (vec2<f32>(qc) + 0.5) * orig_size / src_size;
+                let q_orig = level_to_orig(vec2<f32>(qc) + 0.5, resample.src_size);
                 mask += w * (load_src_height(qc) - bilinear_orig(q_orig));
                 dsum += w * f32(src_deposition[clamp_texel(qc, resample.src_size)]) / DEPOSITION_SCALE;
                 wsum += w;
