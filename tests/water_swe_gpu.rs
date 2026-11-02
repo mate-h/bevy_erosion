@@ -1406,3 +1406,47 @@ fn bends_scour_their_outer_banks() {
         );
     }
 }
+
+/// Refine Beds runs its steps with the morphological factor, also while paused: the bed moves
+/// many times more than in the same number of live steps.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn refine_fast_forwards_the_bed() {
+    // Banks below the slumping angle, so only bed load moves the bed.
+    let mut h = Harness::new(WaterSolver::Swe, s_bend);
+    h.water().springs.push(Spring {
+        center: Vec2::new(10.0, N as f32 / 2.0 + 24.0 * (2.0 * PI * 10.0 / 128.0).sin()),
+        radius: 6.0,
+        rate: 0.05,
+    });
+    h.run(6.0);
+    let start = h.read_heights();
+    let steps = BedLoad::default().refine_steps;
+    // Live: the same number of steps (8 per frame at 60 fps).
+    h.water().bed_load.live = true;
+    for _ in 0..steps / 8 {
+        h.frame();
+    }
+    h.water().bed_load.live = false;
+    let live = h.read_heights();
+    h.pause(true);
+    {
+        let mut water = h.water();
+        water.refine_generation = water.refine_generation.wrapping_add(1);
+    }
+    for _ in 0..steps.div_ceil(64) + 2 {
+        h.frame();
+    }
+    let refined = h.read_heights();
+    let moved = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<f32>();
+    let (live_moved, refine_moved) = (moved(&live, &start), moved(&refined, &live));
+    println!(
+        "refine: {steps} live steps moved {live_moved:.3}, {steps} refine steps (factor {}) moved {refine_moved:.3}",
+        BedLoad::default().morph_factor
+    );
+    assert!(refined.iter().all(|v| v.is_finite()), "NaN after refining");
+    assert!(
+        refine_moved > 5.0 * live_moved,
+        "refining did not fast-forward the bed"
+    );
+}

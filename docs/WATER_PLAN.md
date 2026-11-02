@@ -386,8 +386,8 @@ Add four checks:
 `BedLoad::live`). Differences from the plan below:
 - Each face takes its bed load from the upwind cell (first-order upwind Exner); averaging the
   two cells is a central scheme and grows two-texel oscillations.
-- The per-step clamp limits each face's transfer to 2% of the shallower side's depth, which keeps
-  conservation exact.
+- The per-step clamp limits each face's transfer to 10% of the shallower side's depth, which
+  keeps conservation exact.
 
 Measured (`bed_load_on_flumes`, `bed_load_conserves_and_builds_a_delta`, 20–30 s live):
 - closed basin: net bed change 0.12% of the volume moved;
@@ -476,7 +476,17 @@ below is not needed.
   - Blend the depth from the mouth thalweg depth to the lake bowl with the quintic S5 over a
     Foreset Length (terracraft stage 2's foreset ramp).
 
-### 4e. Run modes and UI
+### 4e. Run modes and UI (done)
+
+- Live Bed Load is on by default (Bed Load panel toggle, `BedLoad::live`).
+- Refine Beds (button, M in the demo) runs Refine Steps water steps at the Morph. Factor, 64 per
+  frame, also while paused. It does not restart the KTT cascade: a restart rebuilds the terrain
+  from the source and would throw the refined beds away. `refine_fast_forwards_the_bed`: 400
+  refine steps at factor 20 move 9.6 times the bed of 400 live steps (the per-face clamp, now
+  10% of the shallower depth per step, keeps it below 20).
+- Panel controls: Grain, Bed Load K, Critical Shields, Slope Effect, Helical Strength, Morph.
+  Factor, Refine Steps (Manning n was already there).
+
 
 - **Live Bed Load** (the target default): Exner runs every water step, with `mor_fac` = 1.
   Beds then form while you watch, the way the rain brush cuts channels now.

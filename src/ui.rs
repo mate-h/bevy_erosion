@@ -144,6 +144,13 @@ enum ErosionSliderFieldKind {
     BedRiverDepth,
     BedRiverWidth,
     BedChannelDischarge,
+    BedLoadGrain,
+    BedLoadK,
+    BedLoadCriticalShields,
+    BedLoadSlopeEffect,
+    BedLoadHelical,
+    BedLoadMorphFactor,
+    BedLoadRefineSteps,
 }
 
 impl ErosionSliderFieldKind {
@@ -221,6 +228,13 @@ impl ErosionSliderFieldKind {
             Self::BedRiverDepth => water.bed.river_depth = value,
             Self::BedRiverWidth => water.bed.river_width = value,
             Self::BedChannelDischarge => water.bed.channel_discharge = value,
+            Self::BedLoadGrain => water.bed_load.grain = value,
+            Self::BedLoadK => water.bed_load.k = value,
+            Self::BedLoadCriticalShields => water.bed_load.critical_shields = value,
+            Self::BedLoadSlopeEffect => water.bed_load.slope_effect = value,
+            Self::BedLoadHelical => water.bed_load.helical_strength = value,
+            Self::BedLoadMorphFactor => water.bed_load.morph_factor = value,
+            Self::BedLoadRefineSteps => water.bed_load.refine_steps = value as u32,
         }
     }
 
@@ -248,6 +262,7 @@ impl ErosionSliderFieldKind {
                 | Self::BrushRadius
                 | Self::BedBankWidth
                 | Self::WaterGravity
+                | Self::BedLoadRefineSteps
         )
     }
 }
@@ -279,6 +294,7 @@ enum ToggleKind {
     AdditiveSediment,
     NormalizeAge,
     MomentumFlow,
+    LiveBedLoad,
 }
 
 impl ToggleKind {
@@ -308,6 +324,7 @@ impl ToggleKind {
             Self::AdditiveSediment => params.additive_sediment != 0,
             Self::NormalizeAge => params.normalize_age != 0,
             Self::MomentumFlow => water.solver == WaterSolver::Swe,
+            Self::LiveBedLoad => water.bed_load.live,
         }
     }
 
@@ -345,6 +362,7 @@ impl ToggleKind {
                     WaterSolver::Pipes
                 }
             }
+            Self::LiveBedLoad => water.bed_load.live = on,
         }
     }
 
@@ -686,6 +704,33 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         @slider_row("Strength", 0.0, 1.0, water.bed.strength, ErosionSliderFieldKind::BedStrength)
                         --
                         @slider_row("Bank Width", 1.0, MAX_BANK_WIDTH, water.bed.bank_width, ErosionSliderFieldKind::BedBankWidth)
+                    })
+                    --
+                    @section("Bed Load", true, bsn_list! {
+                        @note_text("Flowing water moves its bed: bars, pools, steps and deltas.")
+                        --
+                        @toggle_row("Live Bed Load", ToggleKind::LiveBedLoad)
+                        --
+                        @FeathersButton {
+                            @caption: bsn! { Text("Refine Beds (M)") ThemedText },
+                        }
+                        on(|_: On<Activate>, mut water: ResMut<WaterControl>| {
+                            water.refine_generation = water.refine_generation.wrapping_add(1);
+                        })
+                        --
+                        @slider_row("Grain", 0.02, 2.0, water.bed_load.grain, ErosionSliderFieldKind::BedLoadGrain)
+                        --
+                        @slider_row("Bed Load K", 0.0, 20.0, water.bed_load.k, ErosionSliderFieldKind::BedLoadK)
+                        --
+                        @slider_row("Critical Shields", 0.0, 0.2, water.bed_load.critical_shields, ErosionSliderFieldKind::BedLoadCriticalShields)
+                        --
+                        @slider_row("Slope Effect", 0.1, 5.0, water.bed_load.slope_effect, ErosionSliderFieldKind::BedLoadSlopeEffect)
+                        --
+                        @slider_row("Helical Strength", 0.0, 60.0, water.bed_load.helical_strength, ErosionSliderFieldKind::BedLoadHelical)
+                        --
+                        @slider_row("Morph. Factor", 1.0, 100.0, water.bed_load.morph_factor, ErosionSliderFieldKind::BedLoadMorphFactor)
+                        --
+                        @slider_row("Refine Steps", 50.0, 4000.0, water.bed_load.refine_steps as f32, ErosionSliderFieldKind::BedLoadRefineSteps)
                     })
                     --
                     @section("Terrain Source", false, bsn_list! {

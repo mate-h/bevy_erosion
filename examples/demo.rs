@@ -298,6 +298,7 @@ fn print_controls() {
     println!("  Alt + click (water body) - place a spring, Alt + Shift + click removes springs");
     println!("  C - clear water and springs   X - reset terrain edits");
     println!("  G - shape lake and river beds under the current water");
+    println!("  M - refine beds: fast-forward bed load under the current flow");
 }
 
 fn spawn_terrain(
@@ -455,6 +456,10 @@ fn handle_brush_input(
     if keys.just_pressed(KeyCode::KeyG) {
         water.shape_generation = water.shape_generation.wrapping_add(1);
         println!("Shaping lake and river beds");
+    }
+    if keys.just_pressed(KeyCode::KeyM) {
+        water.refine_generation = water.refine_generation.wrapping_add(1);
+        println!("Refining beds");
     }
     if keys.just_pressed(KeyCode::KeyB) {
         brush.enabled = !brush.enabled;

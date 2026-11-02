@@ -20,8 +20,8 @@ const CELLS_PER_HEIGHT: f32 = 100.0;
 const WET_DEPTH: f32 = 0.0005;
 const FULL_DEPTH: f32 = 0.004;
 // Most of the shallower side's depth one face may move per step (keeps a large morphological
-// factor from emptying a cell in one step).
-const MAX_FACE_CUT: f32 = 0.02;
+// factor from emptying a cell in one step; four faces can take at most 40%).
+const MAX_FACE_CUT: f32 = 0.1;
 // Largest helical flow deflection of the bed load (radians) and streamline curvature (1/texel).
 const MAX_DEFLECTION: f32 = 0.5;
 const MAX_CURVATURE: f32 = 0.3;
