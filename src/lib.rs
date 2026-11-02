@@ -811,6 +811,10 @@ pub struct BedLoad {
     pub morph_factor: f32,
     /// Water steps one refine runs.
     pub refine_steps: u32,
+    /// How much harder the hardest rock of KTT's softness mask is to move: its critical Shields
+    /// number is (1 + this) times Critical Shields. Bed load also never cuts below KTT's
+    /// bedrock layer (with Use Bedrock on).
+    pub rock_hardness: f32,
 }
 
 impl Default for BedLoad {
@@ -824,6 +828,7 @@ impl Default for BedLoad {
             helical_strength: 20.0,
             morph_factor: 20.0,
             refine_steps: 400,
+            rock_hardness: 4.0,
         }
     }
 }
@@ -1005,6 +1010,8 @@ struct MorphoParams {
     helical_length: f32,
     mor_fac: f32,
     parity: u32,
+    use_bedrock: u32,
+    rock_hardness: f32,
 }
 
 /// Seconds the shared discharge field averages over, so roll waves do not make it flicker.
@@ -1181,6 +1188,7 @@ struct ErosionPipeline {
     /// `water_bed.wgsl`: init, tau, prior, smooth, write, dilate, grade.
     pipelines_water_bed: [CachedComputePipelineId; 7],
     layout_water_morpho: BindGroupLayoutDescriptor,
+    layout_water_bed_load: BindGroupLayoutDescriptor,
     /// `water_morpho.wgsl`: discharge, helical, flux, exner, steer.
     pipelines_water_morpho: [CachedComputePipelineId; 5],
     layout_water_splat: BindGroupLayoutDescriptor,
@@ -1411,6 +1419,24 @@ fn init_erosion_pipeline(
             ),
         ),
     );
+    // The bed load kernels of `water_morpho.wgsl`: KTT's softness and bedrock instead of the
+    // discharge and river momentum.
+    let layout_water_bed_load = BindGroupLayoutDescriptor::new(
+        "WaterBedLoadGroup0",
+        &BindGroupLayoutEntries::with_indices(
+            ShaderStages::COMPUTE,
+            (
+                (0, storage_buffer::<u32>(false)), // work set height (atomic, fixed-point)
+                (1, storage_buffer_read_only::<f32>(false)), // water depth
+                (2, storage_buffer_read_only::<Vec2>(false)), // velocity
+                (5, storage_buffer::<Vec2>(false)), // face bed load
+                (6, storage_buffer::<f32>(false)), // helical intensity and pending bed change
+                (7, uniform_buffer::<MorphoParams>(false)),
+                (8, storage_buffer_read_only::<Vec4>(false)), // work set masks (softness)
+                (9, storage_buffer_read_only::<Vec2>(false)), // work set layers (bedrock)
+            ),
+        ),
+    );
     let layout_water_out = BindGroupLayoutDescriptor::new(
         "WaterGroup1",
         &BindGroupLayoutEntries::sequential(
@@ -1540,11 +1566,12 @@ fn init_erosion_pipeline(
         "morpho_steer",
     ]
     .map(|entry| {
-        compute(
-            vec![layout_water_morpho.clone()],
-            &water_morpho_shader,
-            entry,
-        )
+        let layout = if matches!(entry, "morpho_flux" | "morpho_exner") {
+            &layout_water_bed_load
+        } else {
+            &layout_water_morpho
+        };
+        compute(vec![layout.clone()], &water_morpho_shader, entry)
     });
 
     let water_splat_shader = asset_server.load(WATER_SPLAT_SHADER);
@@ -1556,6 +1583,7 @@ fn init_erosion_pipeline(
         layout_water_splat,
         pipelines_water_splat,
         layout_water_morpho,
+        layout_water_bed_load,
         pipelines_water_morpho,
         layout_water_bed,
         pipelines_water_bed,
@@ -1754,6 +1782,8 @@ impl WaterBuffers {
                 helical_length: HELICAL_LENGTH,
                 mor_fac: 0.0,
                 parity: 0,
+                use_bedrock: 0,
+                rock_hardness: 0.0,
             }),
         };
         b.depth.write_buffer(device, queue);
@@ -1791,8 +1821,10 @@ struct ErosionBindGroups {
     water_out: BindGroup,
     /// Bed reconstruction, indexed by work set.
     water_bed: [BindGroup; 2],
-    /// Discharge and bed load, indexed by work set.
+    /// Discharge, helical flow and steering, indexed by work set.
     water_morpho: [BindGroup; 2],
+    /// Bed load, indexed by work set.
+    water_bed_load: [BindGroup; 2],
     /// Trails and the water, indexed by work set.
     water_splat: [BindGroup; 2],
     blit: BindGroup,
@@ -2018,6 +2050,24 @@ fn prepare_erosion_bind_groups(
                     w.bed_load.binding().unwrap(),
                     w.morpho_state.binding().unwrap(),
                     w.morpho_params.binding().unwrap(),
+                )),
+            )
+        }),
+        water_bed_load: [0, 1].map(|set| {
+            let w = &buffers.water;
+            let set = &buffers.sets[set];
+            render_device.create_bind_group(
+                None,
+                &layout(&pipeline.layout_water_bed_load),
+                &BindGroupEntries::with_indices((
+                    (0, set.height.binding().unwrap()),
+                    (1, w.depth.binding().unwrap()),
+                    (2, w.velocity.binding().unwrap()),
+                    (5, w.bed_load.binding().unwrap()),
+                    (6, w.morpho_state.binding().unwrap()),
+                    (7, w.morpho_params.binding().unwrap()),
+                    (8, set.masks.binding().unwrap()),
+                    (9, set.layers.binding().unwrap()),
                 )),
             )
         }),
@@ -2446,6 +2496,8 @@ fn plan_erosion_frame(
             helical_length: HELICAL_LENGTH,
             mor_fac,
             parity: state.helical_parity,
+            use_bedrock: params.use_bedrock,
+            rock_hardness: bed_load.rock_hardness,
         });
         buffers
             .water
@@ -2739,7 +2791,7 @@ fn erosion_compute(
                         run(&mut pass, p);
                     }
                     if bed_load && let (Some(f), Some(e)) = (p_bed_flux, p_exner) {
-                        pass.set_bind_group(0, &groups.water_morpho[set], &[]);
+                        pass.set_bind_group(0, &groups.water_bed_load[set], &[]);
                         for p in [f, e] {
                             pass.set_pipeline(p);
                             pass.dispatch_workgroups(gx, gy, 1);

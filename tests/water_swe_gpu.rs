@@ -1628,3 +1628,64 @@ fn water_steers_ktt_rivers() {
         "the water did not steer the trails"
     );
 }
+
+/// Live bed load on the steep 20-texel flume, with KTT's params changed by `setup` (the cascade
+/// reruns so the masks and bedrock follow them): the deepest cut and the total bed moved.
+fn flume_cut(slope: f32, setup: impl Fn(&mut ErodeParams), hardness: f32) -> (f32, f32) {
+    let bed = flume(slope, 20.0);
+    let mut h = Harness::new(WaterSolver::Swe, &bed);
+    setup(&mut h.app.world_mut().resource_mut::<ErodeParams>());
+    h.set_bed(&bed);
+    {
+        let mut water = h.water();
+        water.bed_load.rock_hardness = hardness;
+        water.springs.push(Spring {
+            center: Vec2::new(12.0, N as f32 / 2.0),
+            radius: 6.0,
+            rate: 0.05,
+        });
+    }
+    h.run(6.0);
+    let before = h.read_heights();
+    h.water().bed_load.live = std::env::var("TEST_NO_BED_LOAD").is_err();
+    h.run(20.0);
+    let after = h.read_heights();
+    let mid = N / 2;
+    // The deepest cut below the drawn bed (the walls slump into the channel and raise it first),
+    // and the bed moved while bed load ran.
+    let (mut deepest, mut moved) = (0.0f32, 0.0f32);
+    for y in mid - 9..mid + 9 {
+        for x in 24..N - 8 {
+            deepest = deepest.max(bed(x, y) - after[idx(x, y)]);
+            moved += (after[idx(x, y)] - before[idx(x, y)]).abs();
+        }
+    }
+    (deepest, moved)
+}
+
+/// Bed load respects KTT's rock: it never cuts below the bedrock layer, and hard rock in the
+/// softness mask moves less.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn bed_load_respects_rock() {
+    let depth = 0.001;
+    let with_bedrock = |p: &mut ErodeParams| {
+        p.use_bedrock = 1;
+        p.bedrock_depth = depth;
+    };
+    let (free, _) = flume_cut(0.002, |_| {}, 0.0);
+    let (floored, _) = flume_cut(0.002, with_bedrock, 0.0);
+    // A gentler flume, where the flow is near the threshold of motion.
+    let softness = |p: &mut ErodeParams| p.use_softness_mask = 1;
+    let (_, soft) = flume_cut(0.0008, softness, 0.0);
+    let (_, hard) = flume_cut(0.0008, softness, BedLoad::default().rock_hardness);
+    println!(
+        "rock: deepest cut {free:.4} free, {floored:.4} above bedrock {depth} below; bed moved \
+         {soft:.2} with the softness mask at hardness 0, {hard:.2} at hardness {}",
+        BedLoad::default().rock_hardness
+    );
+    assert!(free > 2.0 * depth, "the free bed did not cut deep enough to test the bedrock");
+    // f16 readback resolves about 0.00025 at these heights.
+    assert!(floored < depth + 0.0005, "bed load cut {floored} below the bedrock");
+    assert!(hard < 0.8 * soft, "hard rock moved as much as soft");
+}

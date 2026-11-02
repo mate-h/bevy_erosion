@@ -437,6 +437,20 @@ Verify (as GPU tests in `tests/water_swe_gpu.rs`):
 - no NaNs;
 - a dry map is unchanged.
 
+### 4b+. Rock in the bed (done)
+
+Natural step-pools are anchored by boulders and ledges, so bed load reads KTT's rock:
+- The critical Shields number is (1 + Rock Hardness · (1 − softness)) θ_c, with softness from
+  KTT's softness mask (`masks.x`, 1 where Use Softness Mask is off, so nothing changes there).
+- With Use Bedrock on, a face never takes more than a quarter of the source cell's loose layer
+  above the bedrock per step, and `morpho_exner` restores heights that wet slumping pulled
+  below it (as KTT's `write_back` does).
+- The flux and Exner kernels bind the masks and layers through their own layout, without the
+  discharge and river momentum, to stay within eight storage buffers.
+- `bed_load_respects_rock`: with the bedrock 0.001 under a steep flume, the deepest cut is 0.0012
+  (f16 readback), against 0.0034 without; with the softness mask on a gentle flume, Rock
+  Hardness 4 moves 40% less bed than 0.
+
 ### 4c. Helical flow in bends (done)
 
 `morpho_helical`, once per frame, as planned (λ_s = 20 texels). `bends_scour_their_outer_banks`

@@ -59,6 +59,10 @@ struct MorphoParams {
     mor_fac: f32,
     // Helical slot holding the latest intensity (the other one is written this frame).
     parity: u32,
+    // KTT keeps a bedrock layer that the bed may not be cut below.
+    use_bedrock: u32,
+    // Critical Shields multiplier on the hardest rock (softness mask 0) is 1 + rock_hardness.
+    rock_hardness: f32,
 }
 
 @group(0) @binding(0) var<storage, read_write> height: array<atomic<u32>>;
@@ -77,6 +81,11 @@ struct MorphoParams {
 // (`water_splat.wgsl`).
 @group(0) @binding(6) var<storage, read_write> state: array<f32>;
 @group(0) @binding(7) var<uniform> params: MorphoParams;
+// KTT's per-cell masks (x = softness, 1 where unused) and layers (x = bedrock) of the finest work
+// set. Only the bed load kernels bind these, and they leave out `discharge` and `m`, so each
+// pipeline stays within eight storage buffers.
+@group(0) @binding(8) var<storage, read> masks: array<vec4<f32>>;
+@group(0) @binding(9) var<storage, read> layers: array<vec2<f32>>;
 
 const DIRS = array<vec2<i32>, 4>(vec2<i32>(-1, 0), vec2<i32>(1, 0), vec2<i32>(0, -1), vec2<i32>(0, 1));
 
@@ -227,7 +236,10 @@ fn face_load(a: vec2<i32>, e: vec2<i32>) -> f32 {
     let h_cells = h * CELLS_PER_HEIGHT;
     let n = params.manning_n;
     let theta = n * n * speed * speed / (max(params.grain, 1e-6) * pow(h_cells, 1.0 / 3.0));
-    let excess = theta - params.critical_shields;
+    // Hard rock (KTT's softness mask) takes a stronger flow to move, so steps and pools lock
+    // onto it instead of cutting evenly everywhere.
+    let soft = clamp(masks[gidx(up)].x, 0.0, 1.0);
+    let excess = theta - params.critical_shields * (1.0 + params.rock_hardness * (1.0 - soft));
     if (excess <= 0.0) { return 0.0; }
     let q = params.bed_load_k * pow(excess, 1.5) * w;
 
@@ -254,8 +266,16 @@ fn face_load(a: vec2<i32>, e: vec2<i32>) -> f32 {
     let load = q * dir - pull * across;
 
     let qn = dot(load, vec2<f32>(e));
-    let most = MAX_FACE_CUT * min(ha, hb) * CELLS_PER_HEIGHT
-        / max(params.mor_fac * params.step_seconds, 1e-9);
+    let per_step = max(params.mor_fac * params.step_seconds, 1e-9);
+    var most = MAX_FACE_CUT * min(ha, hb) * CELLS_PER_HEIGHT / per_step;
+    if (params.use_bedrock != 0u) {
+        // The cell the load leaves keeps a quarter of its loose layer above the bedrock per
+        // face, so no step cuts below it (and the load is still conserved).
+        let source = select(b, a, qn > 0.0);
+        let g = gidx(source);
+        let loose = max(terrain(source) - layers[g].x, 0.0);
+        most = min(most, 0.25 * loose * CELLS_PER_HEIGHT / per_step);
+    }
     return clamp(qn, -most, most);
 }
 
@@ -279,11 +299,20 @@ fn morpho_exner(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dz = -params.mor_fac * params.step_seconds * div / CELLS_PER_HEIGHT;
     var pending = state[4u * i + 2u] + dz;
     let quanta = i32(round(pending * HEIGHT_SCALE));
+    let g = gidx(p);
+    var h = i32(atomicLoad(&height[g]));
+    let old = h;
     if (quanta != 0) {
-        let g = gidx(p);
-        let old = i32(atomicLoad(&height[g]));
-        atomicStore(&height[g], u32(max(old + quanta, 0)));
+        h = max(h + quanta, 0);
         pending -= f32(quanta) / HEIGHT_SCALE;
+    }
+    if (params.use_bedrock != 0u) {
+        // Bed load itself stops at the bedrock (`face_load`), but wet slumping can still pull
+        // the face of a step below it; restore it, as KTT's `write_back` does.
+        h = max(h, i32(ceil(layers[g].x * HEIGHT_SCALE)));
+    }
+    if (h != old) {
+        atomicStore(&height[g], u32(h));
     }
     state[4u * i + 2u] = pending;
 }

@@ -152,6 +152,7 @@ enum ErosionSliderFieldKind {
     BedLoadHelical,
     BedLoadMorphFactor,
     BedLoadRefineSteps,
+    BedLoadRockHardness,
 }
 
 impl ErosionSliderFieldKind {
@@ -238,6 +239,7 @@ impl ErosionSliderFieldKind {
             Self::BedLoadHelical => water.bed_load.helical_strength = value,
             Self::BedLoadMorphFactor => water.bed_load.morph_factor = value,
             Self::BedLoadRefineSteps => water.bed_load.refine_steps = value as u32,
+            Self::BedLoadRockHardness => water.bed_load.rock_hardness = value,
         }
     }
 
@@ -728,6 +730,8 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         @slider_row("Bed Load K", 0.0, 20.0, water.bed_load.k, ErosionSliderFieldKind::BedLoadK)
                         --
                         @slider_row("Critical Shields", 0.0, 0.2, water.bed_load.critical_shields, ErosionSliderFieldKind::BedLoadCriticalShields)
+                        --
+                        @slider_row("Rock Hardness", 0.0, 20.0, water.bed_load.rock_hardness, ErosionSliderFieldKind::BedLoadRockHardness)
                         --
                         @slider_row("Slope Effect", 0.1, 5.0, water.bed_load.slope_effect, ErosionSliderFieldKind::BedLoadSlopeEffect)
                         --
