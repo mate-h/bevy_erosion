@@ -389,51 +389,6 @@ fn bilinear_sample_height(pos: vec2<f32>) -> f32 {
     return h00 * (1.0 - w.x) * (1.0 - w.y) + h10 * w.x * (1.0 - w.y) + h01 * (1.0 - w.x) * w.y + h11 * w.x * w.y;
 }
 
-fn bilinear_sample_flow(pos: vec2<f32>) -> f32 {
-    let w = bilinear_grid_weights(pos);
-    let size_x = i32(params.map_size.x);
-    let size_y = i32(params.map_size.y);
-    let ix = i32(w.z);
-    let iy = i32(w.w);
-    let x1 = min(ix + 1, size_x - 1);
-    let y1 = min(iy + 1, size_y - 1);
-    let f00 = f32(atomicLoad(&flow_buffer[u32(iy * size_x + ix)])) / 10000.0;
-    let f10 = f32(atomicLoad(&flow_buffer[u32(iy * size_x + x1)])) / 10000.0;
-    let f01 = f32(atomicLoad(&flow_buffer[u32(y1 * size_x + ix)])) / 10000.0;
-    let f11 = f32(atomicLoad(&flow_buffer[u32(y1 * size_x + x1)])) / 10000.0;
-    return f00 * (1.0 - w.x) * (1.0 - w.y) + f10 * w.x * (1.0 - w.y) + f01 * (1.0 - w.x) * w.y + f11 * w.x * w.y;
-}
-
-fn bilinear_sample_deposition(pos: vec2<f32>) -> f32 {
-    let w = bilinear_grid_weights(pos);
-    let size_x = i32(params.map_size.x);
-    let size_y = i32(params.map_size.y);
-    let ix = i32(w.z);
-    let iy = i32(w.w);
-    let x1 = min(ix + 1, size_x - 1);
-    let y1 = min(iy + 1, size_y - 1);
-    let d00 = max(0.0, f32(atomicLoad(&deposition[u32(iy * size_x + ix)])) / DEPOSITION_SCALE);
-    let d10 = max(0.0, f32(atomicLoad(&deposition[u32(iy * size_x + x1)])) / DEPOSITION_SCALE);
-    let d01 = max(0.0, f32(atomicLoad(&deposition[u32(y1 * size_x + ix)])) / DEPOSITION_SCALE);
-    let d11 = max(0.0, f32(atomicLoad(&deposition[u32(y1 * size_x + x1)])) / DEPOSITION_SCALE);
-    return d00 * (1.0 - w.x) * (1.0 - w.y) + d10 * w.x * (1.0 - w.y) + d01 * (1.0 - w.x) * w.y + d11 * w.x * w.y;
-}
-
-fn bilinear_sample_erosion(pos: vec2<f32>) -> f32 {
-    let w = bilinear_grid_weights(pos);
-    let size_x = i32(params.map_size.x);
-    let size_y = i32(params.map_size.y);
-    let ix = i32(w.z);
-    let iy = i32(w.w);
-    let x1 = min(ix + 1, size_x - 1);
-    let y1 = min(iy + 1, size_y - 1);
-    let e00 = f32(atomicLoad(&erosion_buffer[u32(iy * size_x + ix)])) / 100000.0;
-    let e10 = f32(atomicLoad(&erosion_buffer[u32(iy * size_x + x1)])) / 100000.0;
-    let e01 = f32(atomicLoad(&erosion_buffer[u32(y1 * size_x + ix)])) / 100000.0;
-    let e11 = f32(atomicLoad(&erosion_buffer[u32(y1 * size_x + x1)])) / 100000.0;
-    return e00 * (1.0 - w.x) * (1.0 - w.y) + e10 * w.x * (1.0 - w.y) + e01 * (1.0 - w.x) * w.y + e11 * w.x * w.y;
-}
-
 fn river_momentum_at_idx(idx: u32) -> f32 {
     let x = bitcast<f32>(atomicLoad(&m[2u * idx]));
     if (params.momentum_coherence > 0.0) {
@@ -451,21 +406,6 @@ fn river_momentum(p: vec2<i32>) -> f32 {
 /// so without a threshold the hillslopes count as rivers too.
 fn channel_momentum(m: f32) -> f32 {
     return max(m - params.river_threshold, 0.0);
-}
-
-fn bilinear_sample_river_momentum(pos: vec2<f32>) -> f32 {
-    let w = bilinear_grid_weights(pos);
-    let size_x = i32(params.map_size.x);
-    let size_y = i32(params.map_size.y);
-    let ix = i32(w.z);
-    let iy = i32(w.w);
-    let x1 = min(ix + 1, size_x - 1);
-    let y1 = min(iy + 1, size_y - 1);
-    let m00 = river_momentum(vec2<i32>(ix, iy));
-    let m10 = river_momentum(vec2<i32>(x1, iy));
-    let m01 = river_momentum(vec2<i32>(ix, y1));
-    let m11 = river_momentum(vec2<i32>(x1, y1));
-    return m00 * (1.0 - w.x) * (1.0 - w.y) + m10 * w.x * (1.0 - w.y) + m01 * (1.0 - w.x) * w.y + m11 * w.x * w.y;
 }
 
 fn safe_normalize(v: vec2<f32>) -> vec2<f32> {
@@ -1076,74 +1016,6 @@ fn age_display(age: f32) -> f32 {
         v = v / (1.0 + v);
     }
     return v;
-}
-
-fn bilinear_sample_age(pos: vec2<f32>) -> f32 {
-    let w = bilinear_grid_weights(pos);
-    let size = vec2<i32>(params.map_size);
-    let ix = i32(w.z);
-    let iy = i32(w.w);
-    let ix1 = min(ix + 1, size.x - 1);
-    let iy1 = min(iy + 1, size.y - 1);
-    let a00 = layers[u32(iy * size.x + ix)].y;
-    let a10 = layers[u32(iy * size.x + ix1)].y;
-    let a01 = layers[u32(iy1 * size.x + ix)].y;
-    let a11 = layers[u32(iy1 * size.x + ix1)].y;
-    return a00 * (1.0 - w.x) * (1.0 - w.y) + a10 * w.x * (1.0 - w.y) + a01 * (1.0 - w.x) * w.y + a11 * w.x * w.y;
-}
-
-struct BlitDisplayParams {
-    display_size: vec2<u32>,
-    _pad: vec2<u32>,
-}
-
-@group(2) @binding(0) var<uniform> blit_display: BlitDisplayParams;
-
-// Map a full-res display pixel center into coarse-grid coordinates (same space as erosion `pos`).
-fn display_to_coarse_pos(gid: vec2<u32>) -> vec2<f32> {
-    return (vec2<f32>(gid + params.pad_offset) + 0.5)
-        * vec2<f32>(params.map_size.xy)
-        / vec2<f32>(params.padded_size.xy);
-}
-
-@compute @workgroup_size(8, 8, 1)
-fn blit_level_to_display(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= blit_display.display_size.x || gid.y >= blit_display.display_size.y) {
-        return;
-    }
-    let px = i32(gid.x);
-    let py = i32(gid.y);
-    let pos = display_to_coarse_pos(gid.xy);
-    let dpos = vec2<f32>(params.map_size.xy) / vec2<f32>(params.padded_size.xy);
-
-    let h = bilinear_sample_height(pos);
-    let age = age_display(bilinear_sample_age(pos));
-    var rivers = 0.0;
-    if (params.do_rivers != 0u) {
-        rivers = bilinear_sample_river_momentum(pos) * 0.02;
-    }
-    textureStore(display_out, vec2<i32>(px, py), vec4<f32>(h, age, rivers, 1.0));
-
-    let h_l = bilinear_sample_height(pos - vec2(dpos.x, 0.0));
-    let h_r = bilinear_sample_height(pos + vec2(dpos.x, 0.0));
-    let h_d = bilinear_sample_height(pos - vec2(0.0, dpos.y));
-    let h_u = bilinear_sample_height(pos + vec2(0.0, dpos.y));
-    let dx = h_r - h_l;
-    let dy = h_u - h_d;
-    let n = normalize(vec3<f32>(-dx, 1.0, -dy));
-    let enc = n * 0.5 + vec3<f32>(0.5, 0.5, 0.5);
-    textureStore(normal_out, vec2<i32>(px, py), vec4<f32>(enc, 1.0));
-
-    let flow_mag = bilinear_sample_flow(pos);
-    let sediment = bilinear_sample_deposition(pos);
-    let erosion = bilinear_sample_erosion(pos);
-    let curvature_raw = h_l + h_r + h_d + h_u - 4.0 * h;
-    let curvature = curvature_raw * 50.0 + 0.5;
-    textureStore(
-        analysis_out,
-        vec2<i32>(px, py),
-        vec4<f32>(flow_mag, sediment, erosion, curvature),
-    );
 }
 
 // Hammersley low-discrepancy sequence for uniform sampling

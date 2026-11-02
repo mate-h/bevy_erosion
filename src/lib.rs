@@ -51,6 +51,18 @@ const ERODE_ITERS_PER_WRITEBACK: u32 = 200;
 /// [`ERODE_ITERS_PER_WRITEBACK`]; we split it so uplift and river channeling show and feed back
 /// while a level runs, each `writeBack` scaled by its share of the level.
 const WRITEBACK_INTERVAL: u32 = 20;
+/// Least cost of one erode pass, in finest-level passes: small dispatches still pay their fixed
+/// overhead, so a coarse pass is never counted as free.
+const MIN_PASS_COST: f32 = 1.0 / 16.0;
+
+impl PyramidLevel {
+    /// Work of one erode pass on this level, in passes of the finest level. A level at voxel size
+    /// v has 1/v² as many trails, each 1/v as long, but a small dispatch keeps less of the GPU
+    /// busy: measured, a pass at v = 2 takes about 0.4 of a finest pass, near 1/v^1.5.
+    fn pass_cost(&self) -> f32 {
+        self.voxel_size.max(1.0).powf(-1.5).max(MIN_PASS_COST)
+    }
+}
 const TERRAIN_SHADER: &str = "terrain_extended.wesl";
 /// Smallest grid the cascade will seed from (caps the level count on small maps).
 const PYRAMID_MIN_SIZE: u32 = 4;
@@ -171,12 +183,6 @@ pub struct PyramidResampleParams {
     pub pad_offset: UVec2,
 }
 
-#[derive(Clone, Copy, ShaderType)]
-pub struct BlitDisplayParams {
-    pub display_size: UVec2,
-    pub _pad: UVec2,
-}
-
 /// One unit of GPU work produced by [`Cascade::advance`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CascadeStep {
@@ -232,11 +238,12 @@ impl Cascade {
 
     /// Emits the next erosion iterations (plus the init / seed / writeBack work around them).
     ///
-    /// Coarse levels are cheap and run to completion in one call; `budget` only limits the erosion
-    /// iterations of the finest level. A `budget` of 0 (paused) emits nothing past init.
+    /// `budget` is the work of that many finest-level passes, and coarse passes count their share
+    /// of it ([`PyramidLevel::pass_cost`]), so a restart spreads the coarse levels over a few frames
+    /// instead of stalling one. A `budget` of 0 (paused) emits nothing past init.
     pub fn advance(
         &mut self,
-        mut budget: u32,
+        budget: u32,
         ridge_enabled: bool,
         continue_after_cascade: bool,
         out: &mut Vec<CascadeStep>,
@@ -253,9 +260,8 @@ impl Cascade {
                 level: 0,
             });
         }
-        // Only finest-level iterations consume the budget, so it reaches 0 there (or starts at 0).
-        while budget > 0 && !self.finished {
-            let finest = self.level + 1 == self.levels.len();
+        let mut work = budget as f32;
+        while work > 0.0 && !self.finished {
             let level = self.levels[self.level];
             let iteration = self.iteration_base + self.batch_iter;
             if ridge_enabled || iteration % 2 == 1 {
@@ -266,9 +272,7 @@ impl Cascade {
                 });
             }
             self.batch_iter += 1;
-            if finest {
-                budget -= 1;
-            }
+            work -= level.pass_cost();
             if self.batch_iter < level.iterations {
                 if self.batch_iter % WRITEBACK_INTERVAL == 0 {
                     out.push(CascadeStep::WriteBack {
@@ -1206,7 +1210,6 @@ struct ErosionPipeline {
     layout_water_bed: BindGroupLayoutDescriptor,
     layout_blit: BindGroupLayoutDescriptor,
     layout_blit_blur: BindGroupLayoutDescriptor,
-    layout_blit_level: BindGroupLayoutDescriptor,
     layout_upscale_height: BindGroupLayoutDescriptor,
     layout_upscale_rivers: BindGroupLayoutDescriptor,
     layout_upscale_masks: BindGroupLayoutDescriptor,
@@ -1215,7 +1218,6 @@ struct ErosionPipeline {
     pipeline_erode: CachedComputePipelineId,
     pipeline_write_back: CachedComputePipelineId,
     pipeline_blit: CachedComputePipelineId,
-    pipeline_blit_level: CachedComputePipelineId,
     pipeline_upscale_height: CachedComputePipelineId,
     pipeline_upscale_rivers: CachedComputePipelineId,
     pipeline_upscale_masks: CachedComputePipelineId,
@@ -1238,14 +1240,13 @@ struct ErosionPipeline {
 
 impl ErosionPipeline {
     /// Pipelines the cascade needs before it can start.
-    fn required(&self) -> [CachedComputePipelineId; 9] {
+    fn required(&self) -> [CachedComputePipelineId; 8] {
         [
             self.pipeline_init,
             self.pipeline_init_color,
             self.pipeline_erode,
             self.pipeline_write_back,
             self.pipeline_blit,
-            self.pipeline_blit_level,
             self.pipeline_upscale_height,
             self.pipeline_upscale_rivers,
             self.pipeline_upscale_masks,
@@ -1303,14 +1304,6 @@ fn init_erosion_pipeline(
                 texture_storage_2d(TextureFormat::R16Float, StorageTextureAccess::ReadWrite), // AO
                 texture_storage_2d(TextureFormat::R16Float, StorageTextureAccess::ReadWrite), // AO temp
             ),
-        ),
-    );
-
-    let layout_blit_level = BindGroupLayoutDescriptor::new(
-        "ErosionBlitLevelGroup2",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (uniform_buffer::<BlitDisplayParams>(false),),
         ),
     );
 
@@ -1524,15 +1517,6 @@ fn init_erosion_pipeline(
         &shader,
         "blit_to_texture",
     );
-    let pipeline_blit_level = compute(
-        vec![
-            layout_erosion.clone(),
-            layout_blit.clone(),
-            layout_blit_level.clone(),
-        ],
-        &shader,
-        "blit_level_to_display",
-    );
     let pipeline_upscale_height = compute(
         vec![layout_upscale_height.clone()],
         &asset_server.load(PYRAMID_RESAMPLE_SHADER),
@@ -1633,7 +1617,6 @@ fn init_erosion_pipeline(
         layout_water_out,
         layout_blit,
         layout_blit_blur,
-        layout_blit_level,
         layout_upscale_height,
         layout_upscale_rivers,
         layout_upscale_masks,
@@ -1642,7 +1625,6 @@ fn init_erosion_pipeline(
         pipeline_erode,
         pipeline_write_back,
         pipeline_blit,
-        pipeline_blit_level,
         pipeline_upscale_height,
         pipeline_upscale_rivers,
         pipeline_upscale_masks,
@@ -1704,7 +1686,6 @@ struct ErosionBuffers {
     params: DynamicUniformBuffer<ErodeParams>,
     /// One entry per level transition this frame (dynamic offset per `Seed`).
     resample_params: DynamicUniformBuffer<PyramidResampleParams>,
-    blit_display: UniformBuffer<BlitDisplayParams>,
     water: WaterBuffers,
     /// Water and sediment trails hand to the water on the finest level (`erosion.wgsl` `splat`).
     splat: StorageBuffer<Vec<u32>>,
@@ -1853,7 +1834,6 @@ struct ErosionBindGroups {
     upscale_height: [BindGroup; 2],
     upscale_rivers: [BindGroup; 2],
     upscale_masks: [BindGroup; 2],
-    level_blit: BindGroup,
     color: BindGroup,
     terrain_edit: BindGroup,
     /// Water solver, indexed by work set.
@@ -1883,17 +1863,11 @@ fn prepare_erosion_buffers(
     if existing.is_some_and(|b| b.texels == texels) {
         return;
     }
-    let mut blit_display = UniformBuffer::from(BlitDisplayParams {
-        display_size: params.map_size,
-        _pad: UVec2::ZERO,
-    });
-    blit_display.write_buffer(&render_device, &queue);
     commands.insert_resource(ErosionBuffers {
         texels,
         sets: std::array::from_fn(|_| FieldSet::new(texels, &render_device, &queue)),
         params: DynamicUniformBuffer::default(),
         resample_params: DynamicUniformBuffer::default(),
-        blit_display,
         water: WaterBuffers::new(params.map_size, &render_device, &queue),
         splat: {
             let mut splat = StorageBuffer::from(vec![0u32; 2 * texels]);
@@ -2024,11 +1998,6 @@ fn prepare_erosion_bind_groups(
         upscale_height: [upscale_height(0), upscale_height(1)],
         upscale_rivers: [upscale_rivers(0), upscale_rivers(1)],
         upscale_masks: [upscale_masks(0), upscale_masks(1)],
-        level_blit: render_device.create_bind_group(
-            None,
-            &layout(&pipeline.layout_blit_level),
-            &BindGroupEntries::sequential((&buffers.blit_display,)),
-        ),
         color: render_device.create_bind_group(
             None,
             &layout(&pipeline.layout_color),
@@ -2211,8 +2180,7 @@ enum FrameCmd {
     Display {
         set: usize,
         offset: u32,
-        finest: bool,
-        /// Recompute ambient occlusion (finest level only; see [`AO_INTERVAL`]).
+        /// Recompute ambient occlusion (see [`AO_INTERVAL`]).
         ao: bool,
     },
 }
@@ -2620,24 +2588,25 @@ fn plan_erosion_frame(
         .water
         .bed_params
         .write_buffer(&render_device, &queue);
-    if !state.frame.is_empty() {
-        let level = level_at(state.cascade.level);
-        let finest = level.size == finest_size;
+    let level = level_at(state.cascade.level);
+    let finest = level.size == finest_size;
+    // Only the finest level is drawn: while a restart runs the coarse levels, the screen keeps the
+    // last finest result.
+    if !state.frame.is_empty() && finest {
         // Paused steps and the frame the cascade finishes are the last display for a while:
         // refresh AO. (Later frames still display while rain or water keeps changing heights.)
         let just_finished = state.cascade.finished && !state.was_finished;
         let last = just_finished || sim.paused;
-        let ao = finest && (last || state.displays_since_ao.is_none_or(|n| n + 1 >= AO_INTERVAL));
-        state.displays_since_ao = match (finest, ao) {
-            (false, _) => None,
-            (true, true) => Some(0),
-            (true, false) => state.displays_since_ao.map(|n| n + 1),
+        let ao = last || state.displays_since_ao.is_none_or(|n| n + 1 >= AO_INTERVAL);
+        state.displays_since_ao = if ao {
+            Some(0)
+        } else {
+            state.displays_since_ao.map(|n| n + 1)
         };
         state.was_finished = state.cascade.finished;
         state.frame.push(FrameCmd::Display {
             set: state.cascade.current,
             offset: buffers.params.push(&level_erode_params(params, &level, 0)),
-            finest,
             ao,
         });
     } else if buffers.params.is_empty() {
@@ -2910,24 +2879,9 @@ fn erosion_compute(
                     pass.dispatch_workgroups(gx, gy, 1);
                 }
             }
-            FrameCmd::Display {
-                set,
-                offset,
-                finest,
-                ao,
-            } => {
+            FrameCmd::Display { set, offset, ao } => {
                 let (gx, gy) = dispatch_grid(params.map_size);
                 let erosion = &groups.erosion[set];
-                if !finest {
-                    if let Some(p) = get(pipes.pipeline_blit_level) {
-                        pass.set_pipeline(p);
-                        pass.set_bind_group(0, erosion, &[offset]);
-                        pass.set_bind_group(1, &groups.blit, &[]);
-                        pass.set_bind_group(2, &groups.level_blit, &[]);
-                        pass.dispatch_workgroups(gx, gy, 1);
-                    }
-                    continue;
-                }
                 let passes = [
                     (pipes.pipeline_blit, &groups.blit),
                     (pipes.pipeline_ao, &groups.blit),
@@ -3113,14 +3067,18 @@ mod tests {
     }
 
     #[test]
-    fn budget_only_limits_finest_level() {
+    fn budget_spreads_every_level() {
         let mut cascade = Cascade::default();
-        cascade.restart(pyramid_levels(UVec2::splat(512), 8.0, 1.0, 0.0));
-        let erodes_at = |steps: &[CascadeStep], lvl: usize| {
+        let levels = pyramid_levels(UVec2::splat(512), 8.0, 1.0, 0.0);
+        cascade.restart(levels.clone());
+        let work = |steps: &[CascadeStep]| -> f32 {
             steps
                 .iter()
-                .filter(|s| matches!(s, CascadeStep::Erode { level, .. } if *level == lvl))
-                .count()
+                .filter_map(|s| match s {
+                    CascadeStep::Erode { level, .. } => Some(levels[*level].pass_cost()),
+                    _ => None,
+                })
+                .sum()
         };
 
         // Paused: only init and the first seed.
@@ -3128,15 +3086,19 @@ mod tests {
         cascade.advance(0, true, false, &mut paused);
         assert_eq!(paused.len(), 2);
 
-        // One call runs every coarse level, then `budget` finest iterations.
+        // Every frame does about `budget` finest passes of work, coarse levels included, until
+        // the finest level runs exactly `budget` passes a frame.
+        let mut frames = 0;
+        while cascade.level + 1 < levels.len() {
+            let mut steps = Vec::new();
+            cascade.advance(7, true, false, &mut steps);
+            assert!(work(&steps) < 7.0 + 1.0, "frame {frames} did {} passes of work", work(&steps));
+            frames += 1;
+        }
+        assert!(frames > 1, "the coarse levels ran in one frame");
         let mut steps = Vec::new();
         cascade.advance(7, true, false, &mut steps);
-        assert_eq!(
-            (0..4).map(|l| erodes_at(&steps, l)).collect::<Vec<_>>(),
-            vec![200, 200, 200, 7]
-        );
-        assert_eq!(cascade.level, 3);
-        assert_eq!(cascade.batch_iter, 7);
+        assert_eq!(work(&steps), 7.0);
     }
 
     #[test]
