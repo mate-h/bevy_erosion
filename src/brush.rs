@@ -158,7 +158,7 @@ impl Default for WaterBrush {
 }
 
 /// The displaced terrain mesh: a `size` plane centered on its transform, with
-/// `height × height_scale` added along local +Y (see `terrain_extended.wgsl`).
+/// `height × height_scale` added along local +Y (see `terrain_extended.wesl`).
 #[derive(Component, Clone, Copy, Debug)]
 pub struct TerrainSurface {
     pub size: Vec2,

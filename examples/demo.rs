@@ -1,10 +1,11 @@
 use bevy::{
     core_pipeline::tonemapping::Tonemapping,
+    curve::cubic_splines::LinearSpline,
     light::{
         Atmosphere, AtmosphereEnvironmentMapLight, atmosphere::ScatteringMedium, light_consts::lux,
     },
     material::OpaqueRendererMethod,
-    math::{cubic_splines::LinearSpline, vec2},
+    math::vec2,
     pbr::{AtmosphereSettings, ExtendedMaterial, MaterialPlugin, StandardMaterial},
     post_process::{
         auto_exposure::{AutoExposure, AutoExposureCompensationCurve, AutoExposurePlugin},

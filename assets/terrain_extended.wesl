@@ -1,38 +1,38 @@
-#import bevy_pbr::{
+import bevy_pbr::render::{
     mesh_functions,
     view_transformations::{position_world_to_clip, position_world_to_view},
     forward_io::{VertexOutput, FragmentOutput},
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing, alpha_discard},
     mesh_view_bindings::view,
-}
+};
 
 // Extension bind group uses MATERIAL_BIND_GROUP with slots starting at 100
 // Height has sampler for smooth interpolation in vertex shader
-@group(#{MATERIAL_BIND_GROUP}) @binding(100) var height_tex: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(101) var height_sampler: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(100) var height_tex: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(101) var height_sampler: sampler;
 // Color and analysis textures use texelFetch (no samplers) to reduce sampler count
-@group(#{MATERIAL_BIND_GROUP}) @binding(102) var color_tex: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(103) var analysis_tex: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(102) var color_tex: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(103) var analysis_tex: texture_2d<f32>;
 // AO texture with sampler for smooth interpolation
-@group(#{MATERIAL_BIND_GROUP}) @binding(104) var ao_tex: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(105) var ao_sampler: sampler;
+@group(constants::MATERIAL_BIND_GROUP) @binding(104) var ao_tex: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(105) var ao_sampler: sampler;
 
 struct TerrainParams {
     height_scale: f32,
 }
-@group(#{MATERIAL_BIND_GROUP}) @binding(106) var<uniform> terrain_params: TerrainParams;
+@group(constants::MATERIAL_BIND_GROUP) @binding(106) var<uniform> terrain_params: TerrainParams;
 
 struct PreviewParams {
     mode: u32,  // 0=PBR, 1=Flow, 2=Sediment, 3=Erosion, 4=Height, 5=ViewSpaceNormals, 6=Curvature, 7=Age
 }
-@group(#{MATERIAL_BIND_GROUP}) @binding(107) var<uniform> preview_params: PreviewParams;
+@group(constants::MATERIAL_BIND_GROUP) @binding(107) var<uniform> preview_params: PreviewParams;
 // Water solver output: R = depth, G = speed, B = suspended sediment.
-@group(#{MATERIAL_BIND_GROUP}) @binding(108) var water_tex: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(108) var water_tex: texture_2d<f32>;
 struct SeaParams {
     level: f32, // 0 = no ocean
 }
-@group(#{MATERIAL_BIND_GROUP}) @binding(109) var<uniform> sea: SeaParams;
+@group(constants::MATERIAL_BIND_GROUP) @binding(109) var<uniform> sea: SeaParams;
 
 // Water depth above the terrain at `uv`: lakes and rivers from the solver, plus the ocean.
 fn water_depth_at(uv: vec2<f32>, ground: f32) -> f32 {
@@ -229,7 +229,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         color = vec4<f32>(mix(color.rgb, water_color, wet), color.a);
         pbr_input.material.perceptual_roughness = mix(pbr_input.material.perceptual_roughness, 0.06, wet);
         // Full PBR lighting for default mode
-        pbr_input.material.base_color = alpha_discard(pbr_input.material, color);
+        pbr_input.material.base_color = alpha_discard(pbr_input.material.flags, pbr_input.material.alpha_cutoff, color);
         // Apply AO to diffuse_occlusion
         pbr_input.diffuse_occlusion = vec3<f32>(ao_value);
         out.color = apply_pbr_lighting(pbr_input);

@@ -15,8 +15,8 @@ use bevy::{
     text::FontWeight,
     ui::Checked,
     ui_widgets::{
-        Activate, Button, Checkbox, SliderPrecision, SliderStep, ValueChange, checkbox_self_update,
-        slider_self_update,
+        Activate, Button, Checkbox, SliderPrecision, SliderStep, SliderValue, ValueChange,
+        checkbox_self_update, slider_self_update,
     },
 };
 
@@ -316,298 +316,355 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
             font_size: FontSize::Px(FONT_SIZE),
             weight: FontWeight::NORMAL,
         }
-        on(|_: On<Pointer<Over>>, mut blocked: ResMut<OrbitInputBlocked>| {
+        on(|_: On<PointerOver>, mut blocked: ResMut<OrbitInputBlocked>| {
             blocked.0 = true;
         })
-        on(|_: On<Pointer<Out>>, mut blocked: ResMut<OrbitInputBlocked>| {
+        on(|_: On<PointerOut>, mut blocked: ResMut<OrbitInputBlocked>| {
             blocked.0 = false;
         })
         Children [
-            header_controls(),
-            section_label("Water"),
-            (
-                @FeathersCheckbox {
-                    @caption: bsn! { (Text("Water Brush (B)") ThemedText) },
-                }
-                WaterBrushCheckbox
-                on(checkbox_self_update)
-                on(|change: On<ValueChange<bool>>, mut brush: ResMut<WaterBrush>| {
-                    brush.enabled = change.value;
-                })
-            ),
-            (
-                Node {
-                    display: Display::Flex,
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    min_height: px(SLIDER_HEIGHT),
-                }
+            @header_controls()
+            --
+            @section_label("Water")
+            --
+            @FeathersCheckbox {
+                @caption: bsn! { Text("Water Brush (B)") ThemedText },
+            }
+            WaterBrushCheckbox
+            on(checkbox_self_update)
+            on(|change: On<ValueChange<bool>>, mut brush: ResMut<WaterBrush>| {
+                brush.enabled = change.value;
+            })
+            --
+            Node {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                min_height: px(SLIDER_HEIGHT),
+            }
+            ThemedText
+            Children [
+                Text("Brush: Rain (off)")
                 ThemedText
-                Children [(
-                    Text("Brush: Rain (off)")
-                    ThemedText
-                    BrushModeText
-                )]
-            ),
-            button_row(
-                brush_mode_button("Rain", BrushMode::Rain),
-                brush_mode_button("Terrain", BrushMode::Terrain(TerrainTool::Raise)),
-                brush_mode_button("Water Body", BrushMode::WaterBody),
-            ),
-            (
-                Node {
-                    display: Display::Flex,
-                    flex_direction: FlexDirection::Row,
-                    column_gap: px(ROW_GAP),
+                BrushModeText
+            ]
+            --
+            Node {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                column_gap: px(ROW_GAP),
+            }
+            ThemedText
+            Children [
+                @brush_mode_button("Rain", BrushMode::Rain)
+                --
+                @brush_mode_button("Terrain", BrushMode::Terrain(TerrainTool::Raise))
+                --
+                @brush_mode_button("Water Body", BrushMode::WaterBody)
+            ]
+            --
+            Node {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                column_gap: px(ROW_GAP),
+            }
+            ThemedText
+            Children [
+                @brush_mode_button("Raise", BrushMode::Terrain(TerrainTool::Raise))
+                --
+                @brush_mode_button("Lower", BrushMode::Terrain(TerrainTool::Lower))
+                --
+                @brush_mode_button("Flatten", BrushMode::Terrain(TerrainTool::Flatten))
+                --
+                @brush_mode_button("Smooth", BrushMode::Terrain(TerrainTool::Smooth))
+            ]
+            --
+            @slider_row("Brush Radius", 2.0, 128.0, WaterBrush::default().radius, ErosionSliderFieldKind::BrushRadius)
+            --
+            @slider_row("Brush Strength", 0.01, 5.0, WaterBrush::default().strength, ErosionSliderFieldKind::BrushStrength)
+            --
+            @slider_row("Water Erosion", 0.0, 0.01, WaterControl::default().sediment_capacity, ErosionSliderFieldKind::WaterErosion)
+            --
+            @slider_row("Evaporation", 0.0, 0.0002, WaterControl::default().evaporation, ErosionSliderFieldKind::WaterEvaporation)
+            --
+            Node {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                column_gap: px(ROW_GAP),
+            }
+            ThemedText
+            Children [
+                @FeathersButton {
+                    @caption: bsn! { Text("Clear Water (C)") ThemedText },
                 }
-                ThemedText
-                Children [
-                    brush_mode_button("Raise", BrushMode::Terrain(TerrainTool::Raise)),
-                    brush_mode_button("Lower", BrushMode::Terrain(TerrainTool::Lower)),
-                    brush_mode_button("Flatten", BrushMode::Terrain(TerrainTool::Flatten)),
-                    brush_mode_button("Smooth", BrushMode::Terrain(TerrainTool::Smooth)),
-                ]
-            ),
-            slider_row("Brush Radius", 2.0, 128.0, WaterBrush::default().radius, ErosionSliderFieldKind::BrushRadius),
-            slider_row("Brush Strength", 0.01, 5.0, WaterBrush::default().strength, ErosionSliderFieldKind::BrushStrength),
-            slider_row("Water Erosion", 0.0, 0.01, WaterControl::default().sediment_capacity, ErosionSliderFieldKind::WaterErosion),
-            slider_row("Evaporation", 0.0, 0.0002, WaterControl::default().evaporation, ErosionSliderFieldKind::WaterEvaporation),
-            (
-                Node {
-                    display: Display::Flex,
-                    flex_direction: FlexDirection::Row,
-                    column_gap: px(ROW_GAP),
-                }
-                ThemedText
-                Children [
-                    (
-                        @FeathersButton {
-                            @caption: bsn! { (Text("Clear Water (C)") ThemedText) },
-                        }
-                        on(|_: On<Activate>, mut brush: ResMut<WaterBrush>| {
-                            brush.clear_water = true;
-                        })
-                    ),
-                    (
-                        @FeathersButton {
-                            @caption: bsn! { (Text("Reset Terrain Edits") ThemedText) },
-                        }
-                        on(|_: On<Activate>, mut brush: ResMut<WaterBrush>| {
-                            brush.clear_terrain = true;
-                        })
-                    ),
-                ]
-            ),
-            section_label("Noise"),
-            slider_row("Noise Freq", 0.001, 0.05, params.noise_frequency, ErosionSliderFieldKind::NoiseFrequency),
-            slider_row("Noise Scale", 0.5, 5.0, params.noise_scale, ErosionSliderFieldKind::NoiseScale),
-            section_label("Main"),
-            slider_row("Erosion Strength", 0.0, 1.0, params.erosion_strength, ErosionSliderFieldKind::ErosionStrength),
-            slider_row("Rock Softness", 0.0, 1.0, params.rock_softness, ErosionSliderFieldKind::RockSoftness),
-            slider_row("Erosion Amount", 0.0, 1.0, params.erosion_amount, ErosionSliderFieldKind::ErosionAmount),
-            slider_row("Reference Detail Scale", 0.25, 4.0, params.detail_scale, ErosionSliderFieldKind::ReferenceDetailScale),
-            section_label("Pyramid"),
-            pyramid_info_row(params.pyramid_levels().len()),
-            slider_row("Feature Size", 0.5, 64.0, params.feature_size, ErosionSliderFieldKind::FeatureSize),
-            slider_row("Detail Smoothing", 0.0, 4.0, params.source_detail_smoothing, ErosionSliderFieldKind::SourceDetailSmoothing),
-            slider_row("Geological Age", 0.0, 50.0, params.geological_age, ErosionSliderFieldKind::GeologicalAge),
-            slider_row("Granularity Amount", 0.0, 10.0, params.granularity_amount, ErosionSliderFieldKind::GranularityAmount),
-            slider_row("Granularity Scale", 0.0, 2.0, params.granularity_scale, ErosionSliderFieldKind::GranularityScale),
-            slider_row("Granularity Strength", 0.0, 1.0, params.granularity_strength, ErosionSliderFieldKind::GranularityStrength),
-            slider_row_int("Iterations / Frame", 1.0, 64.0, sim.iterations_per_frame as f32, ErosionSliderFieldKind::IterationsPerFrame),
-            (
-                @FeathersCheckbox {
-                    @caption: bsn! { (Text("Continue At Finest") ThemedText) },
-                }
-                on(checkbox_self_update)
-                on(|change: On<ValueChange<bool>>, mut sim: ResMut<SimControl>| {
-                    sim.continue_after_cascade = change.value;
+                on(|_: On<Activate>, mut brush: ResMut<WaterBrush>| {
+                    brush.clear_water = true;
                 })
-            ),
-            section_label("Angles (°)"),
-            slider_row("Wear Angle", 0.0, 90.0, params.wear_angle, ErosionSliderFieldKind::WearAngle),
-            slider_row("Talus Angle", 0.0, 90.0, params.talus_angle, ErosionSliderFieldKind::TalusAngle),
-            slider_row("Max Deposit Angle", 0.0, 90.0, params.max_deposit_angle, ErosionSliderFieldKind::MaxDepositAngle),
-            slider_row("Erosion Cutoff Angle", 0.0, 90.0, params.erosion_cutoff_angle, ErosionSliderFieldKind::ErosionCutoffAngle),
-            section_label("Ridge Erosion"),
-            (
-                @FeathersCheckbox {
-                    @caption: bsn! { (Text("Do Ridge Erosion") ThemedText) },
+                --
+                @FeathersButton {
+                    @caption: bsn! { Text("Reset Terrain Edits") ThemedText },
                 }
-                EnableRidgeCheckbox
-                on(checkbox_self_update)
-                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>| {
-                    params.compute_ridge_erosion = u32::from(change.value);
+                on(|_: On<Activate>, mut brush: ResMut<WaterBrush>| {
+                    brush.clear_terrain = true;
                 })
-            ),
-            slider_row("Ridge Erosion Steps", 1.0, 100.0, params.ridge_erosion_steps as f32, ErosionSliderFieldKind::RidgeErosionSteps),
-            slider_row("Ridge Erosion Amount", 0.0, 2.0, params.ridge_erosion_amount, ErosionSliderFieldKind::RidgeErosionAmount),
-            slider_row("Ridge Softening Amount", 0.0, 5.0, params.ridge_softening_amount, ErosionSliderFieldKind::RidgeSofteningAmount),
-            section_label("Flow"),
-            slider_row("Flow Length", 16.0, 512.0, params.flow_length, ErosionSliderFieldKind::FlowLength),
-            slider_row("Flow Volume", 0.0, 2.0, params.flow_volume, ErosionSliderFieldKind::FlowVolume),
-            slider_row("Sediment Friction", 0.0, 1.0, params.friction, ErosionSliderFieldKind::SedimentFriction),
-            slider_row("Rock Friction", 0.0, 1.0, params.rock_friction, ErosionSliderFieldKind::RockFriction),
-            slider_row("Velocity Randomness", 0.0, 1.0, params.velocity_randomness, ErosionSliderFieldKind::VelocityRandomness),
-            slider_row("Velocity Rand. Refine", 0.0, 1.0, params.velocity_randomness_refinement, ErosionSliderFieldKind::VelocityRandomnessRefinement),
-            section_label("Sediment"),
-            slider_row("Sediment Compaction", 0.0, 1.0, params.sediment_compaction, ErosionSliderFieldKind::SedimentCompaction),
-            slider_row("Compaction Threshold", 0.0, 1.0, params.compaction_threshold, ErosionSliderFieldKind::CompactionThreshold),
-            slider_row("Suspended Sediment", 0.0, 1.0, params.suspended_load, ErosionSliderFieldKind::SuspendedSediment),
-            section_label("Effects"),
-            slider_row("Channeling", 0.0, 1.0, params.channeling, ErosionSliderFieldKind::Channeling),
-            slider_row("Channeling Character", 0.0, 2.0, params.channeling_character, ErosionSliderFieldKind::ChannelingCharacter),
-            slider_row("Sediment Removal", 0.0, 1.0, params.sediment_removal, ErosionSliderFieldKind::SedimentRemoval),
-            slider_row("Removal Character", 0.0, 2.0, params.removal_character, ErosionSliderFieldKind::RemovalCharacter),
-            slider_row("Uplift Amount", 0.0, 0.01, params.uplift, ErosionSliderFieldKind::UpliftAmount),
-            section_label("Rivers"),
-            (
-                @FeathersCheckbox {
-                    @caption: bsn! { (Text("Do Rivers") ThemedText) },
-                }
-                EnableRiversCheckbox
-                on(checkbox_self_update)
-                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
-                    params.do_rivers = u32::from(change.value);
-                    reset.generation = reset.generation.wrapping_add(1);
-                })
-            ),
-            slider_row("River Scale", 0.0, 1.0, params.river_scale, ErosionSliderFieldKind::RiverScale),
-            slider_row("River Character", 0.0, 2.0, params.river_character, ErosionSliderFieldKind::RiverCharacter),
-            slider_row("River Volume", 0.0, 2.0, params.river_volume, ErosionSliderFieldKind::RiverVolume),
-            slider_row("River Friction Reduction", 0.0, 2.0, params.river_friction_reduction, ErosionSliderFieldKind::RiverFrictionReduction),
-            slider_row("River Channeling", 0.0, 1.0, params.river_channeling, ErosionSliderFieldKind::RiverChanneling),
-            (
-                @FeathersCheckbox {
-                    @caption: bsn! { (Text("Clamp River Channeling") ThemedText) },
-                }
-                ClampRiverChannelingCheckbox
-                on(checkbox_self_update)
-                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>| {
-                    params.clamp_river_channeling = u32::from(change.value);
-                })
-            ),
-            slider_row("Meander Longevity", 0.0, 1.0, params.meander_longevity, ErosionSliderFieldKind::MeanderLongevity),
-            slider_row("Momentum Coherence", 0.0, 10.0, params.momentum_coherence, ErosionSliderFieldKind::MomentumCoherence),
-            slider_row("Uplift River Carving", 0.0, 2.0, params.uplift_river_carving, ErosionSliderFieldKind::UpliftRiverCarving),
-            section_label("Hydro Conditioning"),
-            (
-                @FeathersCheckbox {
-                    @caption: bsn! { (Text("Use Hydro Conditioning") ThemedText) },
-                }
-                HydroConditioningCheckbox
-                on(checkbox_self_update)
-                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>| {
-                    params.use_hydro_conditioning = u32::from(change.value);
-                })
-            ),
-            slider_row("Search Distance", 1.0, 64.0, params.hydro_conditioning_search_distance, ErosionSliderFieldKind::HydroSearchDistance),
-            section_label("Masks"),
-            (
-                @FeathersCheckbox {
-                    @caption: bsn! { (Text("Use Softness Mask") ThemedText) },
-                }
-                on(checkbox_self_update)
-                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
-                    params.use_softness_mask = u32::from(change.value);
-                    reset.generation = reset.generation.wrapping_add(1);
-                })
-            ),
-            slider_row("Mask Noise Freq", 0.001, 0.05, params.mask_frequency, ErosionSliderFieldKind::MaskFrequency),
-            (
-                @FeathersCheckbox {
-                    @caption: bsn! { (Text("Use Erosion Mask") ThemedText) },
-                }
-                on(checkbox_self_update)
-                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
-                    params.use_erosion_mask = u32::from(change.value);
-                    reset.generation = reset.generation.wrapping_add(1);
-                })
-            ),
-            (
-                @FeathersCheckbox {
-                    @caption: bsn! { (Text("Use Uplift Map") ThemedText) },
-                }
-                on(checkbox_self_update)
-                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
-                    params.use_uplift_map = u32::from(change.value);
-                    reset.generation = reset.generation.wrapping_add(1);
-                })
-            ),
-            (
-                @FeathersCheckbox {
-                    @caption: bsn! { (Text("Use Outflow") ThemedText) },
-                }
-                on(checkbox_self_update)
-                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
-                    params.use_outflow = u32::from(change.value);
-                    reset.generation = reset.generation.wrapping_add(1);
-                })
-            ),
-            (
-                @FeathersCheckbox {
-                    @caption: bsn! { (Text("Accumulate Outflow") ThemedText) },
-                }
-                on(checkbox_self_update)
-                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>| {
-                    params.outflow_integration = u32::from(change.value);
-                })
-            ),
-            slider_row("Sea Level", 0.0, 1.5, params.outflow_sea_level, ErosionSliderFieldKind::OutflowSeaLevel),
-            slider_row("Border Width", 0.0, 64.0, params.outflow_border, ErosionSliderFieldKind::OutflowBorder),
-            section_label("Bedrock"),
-            (
-                @FeathersCheckbox {
-                    @caption: bsn! { (Text("Use Bedrock") ThemedText) },
-                }
-                on(checkbox_self_update)
-                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
-                    params.use_bedrock = u32::from(change.value);
-                    reset.generation = reset.generation.wrapping_add(1);
-                })
-            ),
-            (
-                @FeathersCheckbox {
-                    @caption: bsn! { (Text("Use Bedrock Map") ThemedText) },
-                }
-                on(checkbox_self_update)
-                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
-                    params.use_bedrock_map = u32::from(change.value);
-                    reset.generation = reset.generation.wrapping_add(1);
-                })
-            ),
-            (
-                @FeathersCheckbox {
-                    @caption: bsn! { (Text("Bedrock Map Is Height") ThemedText) },
-                }
-                on(checkbox_self_update)
-                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
-                    params.bedrock_mode = u32::from(change.value);
-                    reset.generation = reset.generation.wrapping_add(1);
-                })
-            ),
-            (
-                @FeathersCheckbox {
-                    @caption: bsn! { (Text("Additive Sediment") ThemedText) },
-                }
-                on(checkbox_self_update)
-                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
-                    params.additive_sediment = u32::from(change.value);
-                    reset.generation = reset.generation.wrapping_add(1);
-                })
-            ),
-            slider_row("Bedrock Depth", 0.0, 1.5, params.bedrock_depth, ErosionSliderFieldKind::BedrockDepth),
-            section_label("Age"),
-            slider_row("Age Strength", -4.0, 2.0, params.age_strength, ErosionSliderFieldKind::AgeStrength),
-            (
-                @FeathersCheckbox {
-                    @caption: bsn! { (Text("Normalize Age") ThemedText) },
-                }
-                on(checkbox_self_update)
-                on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>| {
-                    params.normalize_age = u32::from(change.value);
-                })
-            ),
+            ]
+            --
+            @section_label("Noise")
+            --
+            @slider_row("Noise Freq", 0.001, 0.05, params.noise_frequency, ErosionSliderFieldKind::NoiseFrequency)
+            --
+            @slider_row("Noise Scale", 0.5, 5.0, params.noise_scale, ErosionSliderFieldKind::NoiseScale)
+            --
+            @section_label("Main")
+            --
+            @slider_row("Erosion Strength", 0.0, 1.0, params.erosion_strength, ErosionSliderFieldKind::ErosionStrength)
+            --
+            @slider_row("Rock Softness", 0.0, 1.0, params.rock_softness, ErosionSliderFieldKind::RockSoftness)
+            --
+            @slider_row("Erosion Amount", 0.0, 1.0, params.erosion_amount, ErosionSliderFieldKind::ErosionAmount)
+            --
+            @slider_row("Reference Detail Scale", 0.25, 4.0, params.detail_scale, ErosionSliderFieldKind::ReferenceDetailScale)
+            --
+            @section_label("Pyramid")
+            --
+            @pyramid_info_row(params.pyramid_levels().len())
+            --
+            @slider_row("Feature Size", 0.5, 64.0, params.feature_size, ErosionSliderFieldKind::FeatureSize)
+            --
+            @slider_row("Detail Smoothing", 0.0, 4.0, params.source_detail_smoothing, ErosionSliderFieldKind::SourceDetailSmoothing)
+            --
+            @slider_row("Geological Age", 0.0, 50.0, params.geological_age, ErosionSliderFieldKind::GeologicalAge)
+            --
+            @slider_row("Granularity Amount", 0.0, 10.0, params.granularity_amount, ErosionSliderFieldKind::GranularityAmount)
+            --
+            @slider_row("Granularity Scale", 0.0, 2.0, params.granularity_scale, ErosionSliderFieldKind::GranularityScale)
+            --
+            @slider_row("Granularity Strength", 0.0, 1.0, params.granularity_strength, ErosionSliderFieldKind::GranularityStrength)
+            --
+            @slider_row_int("Iterations / Frame", 1.0, 64.0, sim.iterations_per_frame as f32, ErosionSliderFieldKind::IterationsPerFrame)
+            --
+            @FeathersCheckbox {
+                @caption: bsn! { Text("Continue At Finest") ThemedText },
+            }
+            on(checkbox_self_update)
+            on(|change: On<ValueChange<bool>>, mut sim: ResMut<SimControl>| {
+                sim.continue_after_cascade = change.value;
+            })
+            --
+            @section_label("Angles (°)")
+            --
+            @slider_row("Wear Angle", 0.0, 90.0, params.wear_angle, ErosionSliderFieldKind::WearAngle)
+            --
+            @slider_row("Talus Angle", 0.0, 90.0, params.talus_angle, ErosionSliderFieldKind::TalusAngle)
+            --
+            @slider_row("Max Deposit Angle", 0.0, 90.0, params.max_deposit_angle, ErosionSliderFieldKind::MaxDepositAngle)
+            --
+            @slider_row("Erosion Cutoff Angle", 0.0, 90.0, params.erosion_cutoff_angle, ErosionSliderFieldKind::ErosionCutoffAngle)
+            --
+            @section_label("Ridge Erosion")
+            --
+            @FeathersCheckbox {
+                @caption: bsn! { Text("Do Ridge Erosion") ThemedText },
+            }
+            EnableRidgeCheckbox
+            on(checkbox_self_update)
+            on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>| {
+                params.compute_ridge_erosion = u32::from(change.value);
+            })
+            --
+            @slider_row("Ridge Erosion Steps", 1.0, 100.0, params.ridge_erosion_steps as f32, ErosionSliderFieldKind::RidgeErosionSteps)
+            --
+            @slider_row("Ridge Erosion Amount", 0.0, 2.0, params.ridge_erosion_amount, ErosionSliderFieldKind::RidgeErosionAmount)
+            --
+            @slider_row("Ridge Softening Amount", 0.0, 5.0, params.ridge_softening_amount, ErosionSliderFieldKind::RidgeSofteningAmount)
+            --
+            @section_label("Flow")
+            --
+            @slider_row("Flow Length", 16.0, 512.0, params.flow_length, ErosionSliderFieldKind::FlowLength)
+            --
+            @slider_row("Flow Volume", 0.0, 2.0, params.flow_volume, ErosionSliderFieldKind::FlowVolume)
+            --
+            @slider_row("Sediment Friction", 0.0, 1.0, params.friction, ErosionSliderFieldKind::SedimentFriction)
+            --
+            @slider_row("Rock Friction", 0.0, 1.0, params.rock_friction, ErosionSliderFieldKind::RockFriction)
+            --
+            @slider_row("Velocity Randomness", 0.0, 1.0, params.velocity_randomness, ErosionSliderFieldKind::VelocityRandomness)
+            --
+            @slider_row("Velocity Rand. Refine", 0.0, 1.0, params.velocity_randomness_refinement, ErosionSliderFieldKind::VelocityRandomnessRefinement)
+            --
+            @section_label("Sediment")
+            --
+            @slider_row("Sediment Compaction", 0.0, 1.0, params.sediment_compaction, ErosionSliderFieldKind::SedimentCompaction)
+            --
+            @slider_row("Compaction Threshold", 0.0, 1.0, params.compaction_threshold, ErosionSliderFieldKind::CompactionThreshold)
+            --
+            @slider_row("Suspended Sediment", 0.0, 1.0, params.suspended_load, ErosionSliderFieldKind::SuspendedSediment)
+            --
+            @section_label("Effects")
+            --
+            @slider_row("Channeling", 0.0, 1.0, params.channeling, ErosionSliderFieldKind::Channeling)
+            --
+            @slider_row("Channeling Character", 0.0, 2.0, params.channeling_character, ErosionSliderFieldKind::ChannelingCharacter)
+            --
+            @slider_row("Sediment Removal", 0.0, 1.0, params.sediment_removal, ErosionSliderFieldKind::SedimentRemoval)
+            --
+            @slider_row("Removal Character", 0.0, 2.0, params.removal_character, ErosionSliderFieldKind::RemovalCharacter)
+            --
+            @slider_row("Uplift Amount", 0.0, 0.01, params.uplift, ErosionSliderFieldKind::UpliftAmount)
+            --
+            @section_label("Rivers")
+            --
+            @FeathersCheckbox {
+                @caption: bsn! { Text("Do Rivers") ThemedText },
+            }
+            EnableRiversCheckbox
+            on(checkbox_self_update)
+            on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
+                params.do_rivers = u32::from(change.value);
+                reset.generation = reset.generation.wrapping_add(1);
+            })
+            --
+            @slider_row("River Scale", 0.0, 1.0, params.river_scale, ErosionSliderFieldKind::RiverScale)
+            --
+            @slider_row("River Character", 0.0, 2.0, params.river_character, ErosionSliderFieldKind::RiverCharacter)
+            --
+            @slider_row("River Volume", 0.0, 2.0, params.river_volume, ErosionSliderFieldKind::RiverVolume)
+            --
+            @slider_row("River Friction Reduction", 0.0, 2.0, params.river_friction_reduction, ErosionSliderFieldKind::RiverFrictionReduction)
+            --
+            @slider_row("River Channeling", 0.0, 1.0, params.river_channeling, ErosionSliderFieldKind::RiverChanneling)
+            --
+            @FeathersCheckbox {
+                @caption: bsn! { Text("Clamp River Channeling") ThemedText },
+            }
+            ClampRiverChannelingCheckbox
+            on(checkbox_self_update)
+            on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>| {
+                params.clamp_river_channeling = u32::from(change.value);
+            })
+            --
+            @slider_row("Meander Longevity", 0.0, 1.0, params.meander_longevity, ErosionSliderFieldKind::MeanderLongevity)
+            --
+            @slider_row("Momentum Coherence", 0.0, 10.0, params.momentum_coherence, ErosionSliderFieldKind::MomentumCoherence)
+            --
+            @slider_row("Uplift River Carving", 0.0, 2.0, params.uplift_river_carving, ErosionSliderFieldKind::UpliftRiverCarving)
+            --
+            @section_label("Hydro Conditioning")
+            --
+            @FeathersCheckbox {
+                @caption: bsn! { Text("Use Hydro Conditioning") ThemedText },
+            }
+            HydroConditioningCheckbox
+            on(checkbox_self_update)
+            on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>| {
+                params.use_hydro_conditioning = u32::from(change.value);
+            })
+            --
+            @slider_row("Search Distance", 1.0, 64.0, params.hydro_conditioning_search_distance, ErosionSliderFieldKind::HydroSearchDistance)
+            --
+            @section_label("Masks")
+            --
+            @FeathersCheckbox {
+                @caption: bsn! { Text("Use Softness Mask") ThemedText },
+            }
+            on(checkbox_self_update)
+            on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
+                params.use_softness_mask = u32::from(change.value);
+                reset.generation = reset.generation.wrapping_add(1);
+            })
+            --
+            @slider_row("Mask Noise Freq", 0.001, 0.05, params.mask_frequency, ErosionSliderFieldKind::MaskFrequency)
+            --
+            @FeathersCheckbox {
+                @caption: bsn! { Text("Use Erosion Mask") ThemedText },
+            }
+            on(checkbox_self_update)
+            on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
+                params.use_erosion_mask = u32::from(change.value);
+                reset.generation = reset.generation.wrapping_add(1);
+            })
+            --
+            @FeathersCheckbox {
+                @caption: bsn! { Text("Use Uplift Map") ThemedText },
+            }
+            on(checkbox_self_update)
+            on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
+                params.use_uplift_map = u32::from(change.value);
+                reset.generation = reset.generation.wrapping_add(1);
+            })
+            --
+            @FeathersCheckbox {
+                @caption: bsn! { Text("Use Outflow") ThemedText },
+            }
+            on(checkbox_self_update)
+            on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
+                params.use_outflow = u32::from(change.value);
+                reset.generation = reset.generation.wrapping_add(1);
+            })
+            --
+            @FeathersCheckbox {
+                @caption: bsn! { Text("Accumulate Outflow") ThemedText },
+            }
+            on(checkbox_self_update)
+            on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>| {
+                params.outflow_integration = u32::from(change.value);
+            })
+            --
+            @slider_row("Sea Level", 0.0, 1.5, params.outflow_sea_level, ErosionSliderFieldKind::OutflowSeaLevel)
+            --
+            @slider_row("Border Width", 0.0, 64.0, params.outflow_border, ErosionSliderFieldKind::OutflowBorder)
+            --
+            @section_label("Bedrock")
+            --
+            @FeathersCheckbox {
+                @caption: bsn! { Text("Use Bedrock") ThemedText },
+            }
+            on(checkbox_self_update)
+            on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
+                params.use_bedrock = u32::from(change.value);
+                reset.generation = reset.generation.wrapping_add(1);
+            })
+            --
+            @FeathersCheckbox {
+                @caption: bsn! { Text("Use Bedrock Map") ThemedText },
+            }
+            on(checkbox_self_update)
+            on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
+                params.use_bedrock_map = u32::from(change.value);
+                reset.generation = reset.generation.wrapping_add(1);
+            })
+            --
+            @FeathersCheckbox {
+                @caption: bsn! { Text("Bedrock Map Is Height") ThemedText },
+            }
+            on(checkbox_self_update)
+            on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
+                params.bedrock_mode = u32::from(change.value);
+                reset.generation = reset.generation.wrapping_add(1);
+            })
+            --
+            @FeathersCheckbox {
+                @caption: bsn! { Text("Additive Sediment") ThemedText },
+            }
+            on(checkbox_self_update)
+            on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>, mut reset: ResMut<ResetSim>| {
+                params.additive_sediment = u32::from(change.value);
+                reset.generation = reset.generation.wrapping_add(1);
+            })
+            --
+            @slider_row("Bedrock Depth", 0.0, 1.5, params.bedrock_depth, ErosionSliderFieldKind::BedrockDepth)
+            --
+            @section_label("Age")
+            --
+            @slider_row("Age Strength", -4.0, 2.0, params.age_strength, ErosionSliderFieldKind::AgeStrength)
+            --
+            @FeathersCheckbox {
+                @caption: bsn! { Text("Normalize Age") ThemedText },
+            }
+            on(checkbox_self_update)
+            on(|change: On<ValueChange<bool>>, mut params: ResMut<ErodeParams>| {
+                params.normalize_age = u32::from(change.value);
+            })
         ]
     }
 }
@@ -621,46 +678,41 @@ fn header_controls() -> impl Scene {
         }
         ThemedText
         Children [
-            (Text("Erosion Parameters") ThemedText),
-            (
-                Node {
-                    display: Display::Flex,
-                    flex_direction: FlexDirection::Row,
-                    column_gap: px(ROW_GAP),
-                    align_items: AlignItems::Center,
+            Text("Erosion Parameters") ThemedText
+            --
+            Node {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                column_gap: px(ROW_GAP),
+                align_items: AlignItems::Center,
+            }
+            ThemedText
+            Children [
+                @FeathersButton {
+                    @caption: bsn! { Text("Reset") ThemedText },
+                    @variant: ButtonVariant::Primary,
                 }
-                ThemedText
-                Children [
-                    (
-                        @FeathersButton {
-                            @caption: bsn! { (Text("Reset") ThemedText) },
-                            @variant: ButtonVariant::Primary,
-                        }
-                        on(|_: On<Activate>, mut reset: ResMut<ResetSim>| {
-                            reset.generation = reset.generation.wrapping_add(1);
-                        })
-                    ),
-                    (
-                        @FeathersCheckbox {
-                            @caption: bsn! { (Text("Pause") ThemedText) },
-                        }
-                        on(checkbox_self_update)
-                        on(|change: On<ValueChange<bool>>, mut sim: ResMut<SimControl>| {
-                            sim.paused = change.value;
-                        })
-                    ),
-                    (
-                        @FeathersButton {
-                            @caption: bsn! { (Text("Step") ThemedText) },
-                        }
-                        on(|_: On<Activate>, mut sim: ResMut<SimControl>| {
-                            if sim.paused {
-                                sim.step_counter = sim.step_counter.wrapping_add(1);
-                            }
-                        })
-                    ),
-                ]
-            ),
+                on(|_: On<Activate>, mut reset: ResMut<ResetSim>| {
+                    reset.generation = reset.generation.wrapping_add(1);
+                })
+                --
+                @FeathersCheckbox {
+                    @caption: bsn! { Text("Pause") ThemedText },
+                }
+                on(checkbox_self_update)
+                on(|change: On<ValueChange<bool>>, mut sim: ResMut<SimControl>| {
+                    sim.paused = change.value;
+                })
+                --
+                @FeathersButton {
+                    @caption: bsn! { Text("Step") ThemedText },
+                }
+                on(|_: On<Activate>, mut sim: ResMut<SimControl>| {
+                    if sim.paused {
+                        sim.step_counter = sim.step_counter.wrapping_add(1);
+                    }
+                })
+            ]
         ]
     }
 }
@@ -674,47 +726,32 @@ fn pyramid_info_row(level_count: usize) -> impl Scene {
         }
         ThemedText
         Children [
-            (
-                Node {
-                    display: Display::Flex,
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    min_height: px(SLIDER_HEIGHT),
-                }
+            Node {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                min_height: px(SLIDER_HEIGHT),
+            }
+            ThemedText
+            Children [
+                Text(format!("Pyramid Levels: {level_count}"))
                 ThemedText
-                Children [(
-                    Text(format!("Pyramid Levels: {level_count}"))
-                    ThemedText
-                    PyramidLevelCountText
-                )]
-            ),
-            (
-                Node {
-                    display: Display::Flex,
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    min_height: px(SLIDER_HEIGHT),
-                }
+                PyramidLevelCountText
+            ]
+            --
+            Node {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                min_height: px(SLIDER_HEIGHT),
+            }
+            ThemedText
+            Children [
+                Text("Level –")
                 ThemedText
-                Children [(
-                    Text("Level –")
-                    ThemedText
-                    PyramidStatusText
-                )]
-            ),
+                PyramidStatusText
+            ]
         ]
-    }
-}
-
-fn button_row(a: impl Scene, b: impl Scene, c: impl Scene) -> impl Scene {
-    bsn! {
-        Node {
-            display: Display::Flex,
-            flex_direction: FlexDirection::Row,
-            column_gap: px(ROW_GAP),
-        }
-        ThemedText
-        Children [a, b, c]
     }
 }
 
@@ -723,7 +760,7 @@ fn brush_mode_button(label: &str, mode: BrushMode) -> impl Scene {
     let label = label.to_string();
     bsn! {
         @FeathersButton {
-            @caption: bsn! { (template_value(Text::new(label.clone())) ThemedText) },
+            @caption: bsn! { Text({label.clone()}) ThemedText },
         }
         on(move |_: On<Activate>, mut brush: ResMut<WaterBrush>| {
             brush.mode = mode;
@@ -763,39 +800,36 @@ fn slider_row_int(
         }
         ThemedText
         Children [
-            (
-                Node {
-                    display: Display::Flex,
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    min_width: px(110.0),
+            Node {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                min_width: px(110.0),
+            }
+            ThemedText
+            Text(label)
+            --
+            Node {
+                flex_grow: 1.0,
+                min_width: px(60.0),
+            }
+            Children [
+                @FeathersSlider {
+                    @min: min,
+                    @max: max,
                 }
-                ThemedText
-                template_value(Text::new(label))
-            ),
-            (
-                Node {
-                    flex_grow: 1.0,
-                    min_width: px(60.0),
-                }
-                Children [(
-                    @FeathersSlider {
-                        @value: value,
-                        @min: min,
-                        @max: max,
+                SliderValue(value)
+                SliderStep(1.0)
+                SliderPrecision(0)
+                ErosionSliderField
+                on(slider_self_update)
+                on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut brush: ResMut<WaterBrush>, mut water: ResMut<WaterControl>, mut reset: ResMut<ResetSim>| {
+                    field.apply(&mut params, &mut sim, &mut brush, &mut water, change.value);
+                    if field.resets_sim() {
+                        reset.generation = reset.generation.wrapping_add(1);
                     }
-                    SliderStep(1.0)
-                    SliderPrecision(0)
-                    ErosionSliderField
-                    on(slider_self_update)
-                    on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut brush: ResMut<WaterBrush>, mut water: ResMut<WaterControl>, mut reset: ResMut<ResetSim>| {
-                        field.apply(&mut params, &mut sim, &mut brush, &mut water, change.value);
-                        if field.resets_sim() {
-                            reset.generation = reset.generation.wrapping_add(1);
-                        }
-                    })
-                )]
-            ),
+                })
+            ]
         ]
     }
 }
@@ -836,19 +870,17 @@ fn update_pyramid_ui_labels(
 }
 
 fn section_label(text: &str) -> impl Scene {
-    let text = Text::new(text.to_string());
+    let text = text.to_string();
     bsn! {
-        (
-            Node {
-                display: Display::Flex,
-                flex_direction: FlexDirection::Row,
-                align_items: AlignItems::Center,
-                margin: UiRect::top(px(4.0)),
-                width: percent(100),
-            }
-            ThemedText
-            template_value(text)
-        )
+        Node {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            margin: UiRect::top(px(4.0)),
+            width: percent(100),
+        }
+        ThemedText
+        Text(text)
     }
 }
 
@@ -870,39 +902,36 @@ fn slider_row(
         }
         ThemedText
         Children [
-            (
-                Node {
-                    display: Display::Flex,
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    min_width: px(110.0),
+            Node {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                min_width: px(110.0),
+            }
+            ThemedText
+            Text(label)
+            --
+            Node {
+                flex_grow: 1.0,
+                min_width: px(60.0),
+            }
+            Children [
+                @FeathersSlider {
+                    @min: min,
+                    @max: max,
                 }
-                ThemedText
-                template_value(Text::new(label))
-            ),
-            (
-                Node {
-                    flex_grow: 1.0,
-                    min_width: px(60.0),
-                }
-                Children [(
-                    @FeathersSlider {
-                        @value: value,
-                        @min: min,
-                        @max: max,
+                SliderValue(value)
+                SliderStep(0.01)
+                SliderPrecision(3)
+                ErosionSliderField
+                on(slider_self_update)
+                on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut brush: ResMut<WaterBrush>, mut water: ResMut<WaterControl>, mut reset: ResMut<ResetSim>| {
+                    field.apply(&mut params, &mut sim, &mut brush, &mut water, change.value);
+                    if field.resets_sim() {
+                        reset.generation = reset.generation.wrapping_add(1);
                     }
-                    SliderStep(0.01)
-                    SliderPrecision(3)
-                    ErosionSliderField
-                    on(slider_self_update)
-                    on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut brush: ResMut<WaterBrush>, mut water: ResMut<WaterControl>, mut reset: ResMut<ResetSim>| {
-                        field.apply(&mut params, &mut sim, &mut brush, &mut water, change.value);
-                        if field.resets_sim() {
-                            reset.generation = reset.generation.wrapping_add(1);
-                        }
-                    })
-                )]
-            ),
+                })
+            ]
         ]
     }
 }
