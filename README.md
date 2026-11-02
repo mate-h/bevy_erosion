@@ -2,11 +2,17 @@
 
 Real-time GPU-accelerated hydraulic erosion simulation built with Bevy.
 
-<img width="976" height="591" alt="Frame" src="https://github.com/user-attachments/assets/cbdb4531-e8a0-4593-ac26-2c54796bab51" />
+![Eroded terrain with the parameter panel](media/screenshot.jpg)
 
 Based on the Smooth Fluvial Erosion algorithm from Kruger Terrain Tools Houdini Asset.
 
 https://samk9632.gumroad.com/l/KTTforHoudini
+
+## Bevy compatibility
+
+| bevy | bevy_erosion |
+|------|--------------|
+| 0.20 | main         |
 
 ## Features
 
@@ -18,7 +24,9 @@ https://samk9632.gumroad.com/l/KTTforHoudini
   - Erosion intensity visualization
   - Height contours
   - View-space normals
-- **Interactive controls** for real-time simulation
+  - Curvature and age maps
+- **Coarse-to-fine pyramid**: erodes at low resolution first, then refines level by level up to the full map
+- **Interactive controls** for real-time simulation, plus a parameter panel built with Bevy Feathers (`ui` feature, on by default)
 - **Brushes**: rain erosion trails onto the terrain, sculpt the source terrain (raise, lower, flatten, smooth), or pour water that pools into lakes and runs off as rivers (shallow-water solver coupled to the erosion)
 - **Ocean**: optional sea level that renders flat and drains water
 
@@ -47,11 +55,19 @@ https://samk9632.gumroad.com/l/KTTforHoudini
 ## Running
 
 ```bash
-cargo run --release
+cargo run --release --example demo
+```
+
+Without the parameter panel:
+
+```bash
+cargo run --release --example demo --no-default-features
 ```
 
 For development use the file watcher feature for hot-reloading shaders:
 
 ```bash
-cargo run --features=bevy/file_watcher
+cargo run --example demo --features=bevy/file_watcher
 ```
+
+Shaders live in `assets/`. The compute passes are plain WGSL; the terrain material (`terrain_extended.wesl`) is WESL, since it imports `bevy_pbr` modules.
