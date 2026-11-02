@@ -85,6 +85,11 @@ struct ErodeParams {
     // Compute_Padding: this level's grid covers the padded base; the source sits at `pad_offset`.
     pad_offset: vec2<u32>,
     padded_size: vec2<u32>,
+    // Bevy-only rain brush: when spawn_count > 0, this dispatch starts exactly spawn_count trails
+    // at random points of the disc (level texels) instead of KTT's map-wide trail density.
+    spawn_center: vec2<f32>,
+    spawn_radius: f32,
+    spawn_count: u32,
 }
 
 @group(0) @binding(1) var<uniform> params: ErodeParams;
@@ -458,8 +463,9 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dx_scaled = dx / detail_scale;
     let iteration = params.iteration;
 
+    let brush = params.spawn_count > 0u;
     // Age grows on every cell each dispatch; trails decay it where they change the height.
-    if (particle_id < total_pixels) {
+    if (!brush && particle_id < total_pixels) {
         layers[particle_id].y += dx_scaled;
     }
 
@@ -477,6 +483,9 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (params.compute_ridge_erosion != 0u && detail_bias < 0.5) {
         num_trails *= params.ridge_erosion_amount;
     }
+    if (brush) {
+        num_trails = f32(params.spawn_count);
+    }
     if (f32(particle_id) >= num_trails) {
         return;
     }
@@ -492,7 +501,18 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     max_deposit_angle = tan(max_deposit_angle);
 
     var p = random22(vec2<f32>(f32(gidx), f32(gidy) - f32(iteration) * 5.643));
-    p *= vec2<f32>(f32(res_x), f32(res_y));
+    if (brush) {
+        // Uniform point in the brush disc.
+        let r = params.spawn_radius * sqrt(p.x);
+        let a = p.y * 6.28318530718;
+        p = clamp(
+            params.spawn_center + vec2<f32>(cos(a), sin(a)) * r,
+            vec2<f32>(0.0),
+            vec2<f32>(f32(res_x - 1), f32(res_y - 1)),
+        );
+    } else {
+        p *= vec2<f32>(f32(res_x), f32(res_y));
+    }
     var v = vec2<f32>(0.0, 0.0);
 
     let dirs = array<vec2<i32>, 4>(

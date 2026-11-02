@@ -19,7 +19,7 @@ https://samk9632.gumroad.com/l/KTTforHoudini
   - Height contours
   - View-space normals
 - **Interactive controls** for real-time simulation
-- **Water brush**: paint lakes and seas onto the terrain; erosion drains into them
+- **Water brush**: rain erosion trails onto the terrain under the cursor, or paint seas that erosion drains into
 
 ## Controls
 
@@ -36,9 +36,10 @@ https://samk9632.gumroad.com/l/KTTforHoudini
 | `6` | View-space normals preview |
 | `7` | Curvature map preview |
 | `8` | Age map preview |
-| `B` | Toggle the water brush (left drag paints, Shift + drag erases, right drag orbits) |
+| `B` | Toggle the water brush (left drag rains erosion trails, right drag orbits) |
+| `V` | Switch the brush between rain and sea (Shift + drag erases sea) |
 | `[` / `]` | Shrink / grow the water brush |
-| `C` | Clear painted water |
+| `C` | Clear painted sea |
 
 ## Running
 

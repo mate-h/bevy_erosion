@@ -554,6 +554,12 @@ pub struct ErodeParams {
     pub pad_offset: UVec2,
     /// Set per dispatch: padded base size (the finest level's grid).
     pub padded_size: UVec2,
+    /// Set per dispatch: rain brush disc center in level texels (see [`BrushStroke`]).
+    pub spawn_center: Vec2,
+    /// Set per dispatch: rain brush disc radius in level texels.
+    pub spawn_radius: f32,
+    /// Set per dispatch: trails to start in the brush disc; 0 = KTT's map-wide trail density.
+    pub spawn_count: u32,
 }
 
 impl Default for ErodeParams {
@@ -635,6 +641,9 @@ impl Default for ErodeParams {
             bedrock_mode: 0,    // Bedrock_Mode (Depth)
             pad_offset: UVec2::ZERO,
             padded_size: UVec2::new(512, 512),
+            spawn_center: Vec2::ZERO,
+            spawn_radius: 0.0,
+            spawn_count: 0,
         }
     }
 }
@@ -649,6 +658,21 @@ impl ErodeParams {
             self.geological_age,
         )
     }
+}
+
+/// Rain brush input for this frame: while `active`, extra erode dispatches start their trails in
+/// a disc on the finest level, carving the current terrain without restarting the cascade.
+#[derive(Resource, Clone, ExtractResource, Default, Debug)]
+pub struct BrushStroke {
+    pub active: bool,
+    /// Disc center in map texels.
+    pub center: Vec2,
+    /// Disc radius in map texels.
+    pub radius: f32,
+    /// Trails per dispatch.
+    pub particles: u32,
+    /// Erode dispatches per frame (alternating ridge / flow like the cascade).
+    pub passes: u32,
 }
 
 /// Resource to trigger simulation reset
@@ -729,6 +753,7 @@ fn setup_erosion_resources(
     commands.insert_resource(config.to_erode_params(0));
     commands.insert_resource(ResetSim::default());
     commands.insert_resource(SimControl::default());
+    commands.insert_resource(BrushStroke::default());
 }
 
 impl Plugin for ErosionComputePlugin {
@@ -741,6 +766,7 @@ impl Plugin for ErosionComputePlugin {
                 ExtractResourcePlugin::<ErodeParams>::default(),
                 ExtractResourcePlugin::<ResetSim>::default(),
                 ExtractResourcePlugin::<SimControl>::default(),
+                ExtractResourcePlugin::<BrushStroke>::default(),
             ))
             .add_systems(Startup, setup_erosion_resources);
 
@@ -1328,6 +1354,8 @@ struct ErosionState {
     cascade: Cascade,
     steps: Vec<CascadeStep>,
     frame: Vec<FrameCmd>,
+    /// Iteration counter for rain brush dispatches (randomness and ridge/flow alternation).
+    brush_iteration: u32,
     /// Finest-level displays since AO was last computed (`None` before the first one).
     displays_since_ao: Option<u32>,
 }
@@ -1339,6 +1367,7 @@ fn plan_erosion_frame(
     reset: Res<ResetSim>,
     sim: Res<SimControl>,
     params: Res<ErodeParams>,
+    stroke: Res<BrushStroke>,
     progress: Res<PyramidProgress>,
     mut buffers: ResMut<ErosionBuffers>,
     mut state: ResMut<ErosionState>,
@@ -1472,6 +1501,25 @@ fn plan_erosion_frame(
             }
         };
         state.frame.push(cmd);
+    }
+    // Rain brush: extra dispatches on the finest level once the coarse levels are done.
+    let finest_ready = state.ready && state.cascade.level + 1 == levels.len();
+    if stroke.active && stroke.particles > 0 && finest_ready {
+        let finest = level_at(state.cascade.level);
+        for _ in 0..stroke.passes {
+            let lp = ErodeParams {
+                spawn_center: stroke.center + pad_offset.as_vec2(),
+                spawn_radius: stroke.radius,
+                spawn_count: stroke.particles,
+                ..level_erode_params(params, &finest, state.brush_iteration)
+            };
+            state.brush_iteration = state.brush_iteration.wrapping_add(1);
+            state.frame.push(FrameCmd::Erode {
+                set: state.cascade.current,
+                particles: stroke.particles,
+                offset: buffers.params.push(&lp),
+            });
+        }
     }
     if !state.frame.is_empty() {
         let level = level_at(state.cascade.level);

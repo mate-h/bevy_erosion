@@ -16,7 +16,7 @@ use bevy::{
 use bevy_erosion::ui::ErosionParamsPlugin;
 use bevy_erosion::{
     ErosionConfig,
-    brush::{TerrainSurface, WaterBrush, WaterBrushPlugin},
+    brush::{BrushMode, TerrainSurface, WaterBrush, WaterBrushPlugin},
     camera::{OrbitCameraPlugin, OrbitController},
     sun::{Sun, SunController, SunPlugin},
     *,
@@ -88,9 +88,10 @@ fn print_controls() {
     println!("  6 - View-space normals preview");
     println!("  7 - Curvature map preview");
     println!("  8 - Age map preview");
-    println!("  B - toggle water brush (left drag paints, Shift erases, right drag orbits)");
+    println!("  B - toggle water brush (left drag rains erosion trails, right drag orbits)");
+    println!("  V - switch the brush between rain and sea (Shift + drag erases sea)");
     println!("  [ / ] - water brush radius");
-    println!("  C - clear painted water");
+    println!("  C - clear painted sea");
 }
 
 fn spawn_terrain(
@@ -231,6 +232,13 @@ fn handle_brush_input(keys: Res<ButtonInput<KeyCode>>, mut brush: ResMut<WaterBr
     if keys.just_pressed(KeyCode::KeyB) {
         brush.enabled = !brush.enabled;
         println!("Water brush: {}", if brush.enabled { "on" } else { "off" });
+    }
+    if keys.just_pressed(KeyCode::KeyV) {
+        brush.mode = match brush.mode {
+            BrushMode::Rain => BrushMode::Sea,
+            BrushMode::Sea => BrushMode::Rain,
+        };
+        println!("Water brush mode: {:?}", brush.mode);
     }
     if keys.just_pressed(KeyCode::KeyC) {
         brush.clear_requested = true;

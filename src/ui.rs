@@ -21,7 +21,10 @@ use bevy::{
 };
 
 use crate::camera::OrbitInputBlocked;
-use crate::{ErodeParams, PyramidProgress, ResetSim, SimControl, brush::WaterBrush};
+use crate::{
+    ErodeParams, PyramidProgress, ResetSim, SimControl,
+    brush::{BrushMode, WaterBrush},
+};
 
 /// Marker for the erosion params panel root.
 #[derive(Component, Clone, Default)]
@@ -311,7 +314,7 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
             section_label("Water"),
             (
                 @FeathersCheckbox {
-                    @caption: bsn! { (Text("Paint Water (B)") ThemedText) },
+                    @caption: bsn! { (Text("Water Brush (B)") ThemedText) },
                 }
                 WaterBrushCheckbox
                 on(checkbox_self_update)
@@ -319,11 +322,20 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                     brush.enabled = change.value;
                 })
             ),
+            (
+                @FeathersCheckbox {
+                    @caption: bsn! { (Text("Paint Sea Instead Of Rain") ThemedText) },
+                }
+                on(checkbox_self_update)
+                on(|change: On<ValueChange<bool>>, mut brush: ResMut<WaterBrush>| {
+                    brush.mode = if change.value { BrushMode::Sea } else { BrushMode::Rain };
+                })
+            ),
             slider_row("Brush Radius", 2.0, 128.0, WaterBrush::default().radius, ErosionSliderFieldKind::BrushRadius),
             slider_row("Brush Strength", 0.01, 1.0, WaterBrush::default().strength, ErosionSliderFieldKind::BrushStrength),
             (
                 @FeathersButton {
-                    @caption: bsn! { (Text("Clear Water (C)") ThemedText) },
+                    @caption: bsn! { (Text("Clear Sea (C)") ThemedText) },
                 }
                 on(|_: On<Activate>, mut brush: ResMut<WaterBrush>| {
                     brush.clear_requested = true;

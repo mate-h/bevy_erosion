@@ -1,12 +1,16 @@
-//! Interactive water placement: paint [`ErosionImages::water`] on the terrain with the mouse.
+//! Interactive water placement on the terrain with the mouse, in two modes:
 //!
-//! Painted water feeds the KTT `__Outflow` mask: erosion drains into it and its cells keep the
-//! source terrain. Every stroke restarts the cascade, whose coarse levels finish in one frame.
+//! * [`BrushMode::Rain`] releases erosion trails under the brush ([`BrushStroke`]); they flow
+//!   downhill and carve the current terrain live, on top of whatever the cascade produced.
+//! * [`BrushMode::Sea`] paints [`ErosionImages::water`] into the KTT `__Outflow` mask: erosion
+//!   drains into it and its cells keep the source terrain. Every stroke restarts the cascade,
+//!   whose coarse levels finish in one frame.
 //!
 //! Put [`TerrainSurface`] on the displaced terrain mesh so clicks can be ray-cast against it.
 
 use crate::{
-    ErosionConfig, ErosionImages, ResetSim, camera::OrbitController, camera::OrbitInputBlocked,
+    BrushStroke, ErosionConfig, ErosionImages, ResetSim, camera::OrbitController,
+    camera::OrbitInputBlocked,
 };
 use bevy::{
     prelude::*,
@@ -35,13 +39,29 @@ impl Plugin for WaterBrushPlugin {
     }
 }
 
+/// Rain trails per brush texel per dispatch at strength 1 (KTT's map-wide density is 0.01 at the
+/// default Erosion_Amount).
+const RAIN_DENSITY: f32 = 0.1;
+/// Rain dispatches per frame while the button is held.
+const RAIN_PASSES: u32 = 8;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BrushMode {
+    /// Release erosion trails under the brush.
+    #[default]
+    Rain,
+    /// Paint outflow (sea / lake) that erosion drains into; restarts the cascade.
+    Sea,
+}
+
 #[derive(Resource, Clone, Debug)]
 pub struct WaterBrush {
     /// Paint on left click (orbit moves to the right button while enabled).
     pub enabled: bool,
+    pub mode: BrushMode,
     /// Brush radius in map texels.
     pub radius: f32,
-    /// Water added per frame at the brush center (0..1).
+    /// Rain: trail density (× [`RAIN_DENSITY`]). Sea: water added per frame at the center (0..1).
     pub strength: f32,
     /// Set to clear all painted water on the next frame.
     pub clear_requested: bool,
@@ -51,6 +71,7 @@ impl Default for WaterBrush {
     fn default() -> Self {
         Self {
             enabled: false,
+            mode: BrushMode::Rain,
             radius: 12.0,
             strength: 0.35,
             clear_requested: false,
@@ -254,9 +275,11 @@ fn ray_hit(
     None
 }
 
-/// Left drag paints water, Shift + left drag erases; each painted frame restarts the erosion.
+/// Left drag rains (or paints sea, Shift + left drag erases sea and restarts the erosion).
+#[allow(clippy::too_many_arguments)]
 fn paint_water(
     mut brush: ResMut<WaterBrush>,
+    mut stroke: ResMut<BrushStroke>,
     hit: Res<BrushHit>,
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -270,7 +293,17 @@ fn paint_water(
     };
     let clear = std::mem::take(&mut brush.clear_requested);
     let painting = brush.enabled && !blocked.0 && buttons.pressed(MouseButton::Left);
-    if !clear && !(painting && hit.world.is_some()) {
+    let rain = painting && hit.world.is_some() && brush.mode == BrushMode::Rain;
+    let area = std::f32::consts::PI * brush.radius * brush.radius;
+    *stroke = BrushStroke {
+        active: rain,
+        center: hit.texel,
+        radius: brush.radius,
+        particles: (brush.strength * RAIN_DENSITY * area).ceil() as u32,
+        passes: RAIN_PASSES,
+    };
+    let sea = painting && hit.world.is_some() && brush.mode == BrushMode::Sea;
+    if !clear && !sea {
         return;
     }
     let Some(mut image) = images.get_mut(&erosion_images.water) else {
