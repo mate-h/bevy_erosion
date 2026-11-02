@@ -1034,9 +1034,9 @@ struct ErosionPipeline {
     pipeline_ao: CachedComputePipelineId,
     pipeline_blur_h: CachedComputePipelineId,
     pipeline_blur_v: CachedComputePipelineId,
-    /// `water.wgsl`: clear, flux, depth, erode, advect, copy, and the bevy_fft solver's export,
-    /// gather and import.
-    pipelines_water: [CachedComputePipelineId; 9],
+    /// `water.wgsl`: clear, flux, depth, erode, advect, copy, the bevy_fft solver's export,
+    /// gather and import, and apply (the staged erosion).
+    pipelines_water: [CachedComputePipelineId; 10],
     /// `water_bed.wgsl`: init, tau, prior, smooth, write, dilate, grade.
     pipelines_water_bed: [CachedComputePipelineId; 7],
 }
@@ -1329,6 +1329,7 @@ fn init_erosion_pipeline(
         "swe_export",
         "swe_gather",
         "swe_import",
+        "water_apply",
     ]
     .map(|entry| {
         compute(
@@ -2330,9 +2331,16 @@ fn erosion_compute(
                     p_export,
                     p_gather,
                     p_import,
+                    p_apply,
                 ] = pipes.pipelines_water.map(get);
-                let (Some(p_flux), Some(p_depth), Some(p_erode), Some(p_advect), Some(p_copy)) =
-                    (p_flux, p_depth, p_erode, p_advect, p_copy)
+                let (
+                    Some(p_flux),
+                    Some(p_depth),
+                    Some(p_erode),
+                    Some(p_apply),
+                    Some(p_advect),
+                    Some(p_copy),
+                ) = (p_flux, p_depth, p_erode, p_apply, p_advect, p_copy)
                 else {
                     continue;
                 };
@@ -2367,7 +2375,7 @@ fn erosion_compute(
                         run(&mut pass, p_flux);
                         run(&mut pass, p_depth);
                     }
-                    for p in [p_erode, p_advect, p_copy] {
+                    for p in [p_erode, p_apply, p_advect, p_copy] {
                         run(&mut pass, p);
                     }
                 }

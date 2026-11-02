@@ -195,6 +195,9 @@ fn water_depth(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // Sediment capacity C = K * tilt * speed (Mei et al.): dissolve below capacity, deposit above.
+// Every cell reads its neighbours' heights, so the height change is staged in `sediment_tmp` and
+// applied by `water_apply`: writing it here would race the neighbours' reads and cut a
+// workgroup-aligned speckle into broad sheets of runoff.
 @compute @workgroup_size(8, 8, 1)
 fn water_erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec2<i32>(gid.xy);
@@ -208,7 +211,10 @@ fn water_erode(@builtin(global_invocation_id) gid: vec3<u32>) {
         nb[k] = clamp(p + DIRS[k], vec2<i32>(0), vec2<i32>(params.size) - 1);
         near_water = near_water || depth[widx(nb[k])] >= WET_DEPTH;
     }
-    if (!near_water && s == 0.0) { return; }
+    if (!near_water && s == 0.0) {
+        sediment_tmp[i] = 0.0;
+        return;
+    }
 
     let ground = terrain(p);
     let hl = terrain(nb[0]);
@@ -237,9 +243,19 @@ fn water_erode(@builtin(global_invocation_id) gid: vec3<u32>) {
             dh += SLUMP_RATE * sign(diff) * max(abs(diff) - WET_TALUS, 0.0) * 0.25;
         }
     }
-    let new_ground = max(ground + dh, 0.0);
-    atomicStore(&height[gidx(p)], u32(new_ground * HEIGHT_SCALE));
+    sediment_tmp[i] = max(ground + dh, 0.0) - ground;
     sediment[i] = max(s - from_sediment, 0.0);
+}
+
+// Apply the height change `water_erode` staged in `sediment_tmp`.
+@compute @workgroup_size(8, 8, 1)
+fn water_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = vec2<i32>(gid.xy);
+    if (!inside(p)) { return; }
+    let dh = sediment_tmp[widx(p)];
+    if (dh == 0.0) { return; }
+    let h = max(terrain(p) + dh, 0.0);
+    atomicStore(&height[gidx(p)], u32(round(h * HEIGHT_SCALE)));
 }
 
 fn sample_sediment(pos: vec2<f32>) -> f32 {

@@ -180,7 +180,7 @@ fn bed_write(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ground = terrain(p);
     let eta = ground + depth[i];
     let bed = max(mix(ground, min(ground, eta - bed_depth[i]), params.strength), 0.0);
-    atomicStore(&height[gidx(p)], u32(bed * HEIGHT_SCALE));
+    atomicStore(&height[gidx(p)], u32(round(bed * HEIGHT_SCALE)));
     depth[i] = max(eta - bed, 0.0);
 }
 
@@ -235,5 +235,5 @@ fn bed_grade(@builtin(global_invocation_id) gid: vec3<u32>) {
     let z_max = shore.x + params.bank_rise + params.bank_slope * shore.y;
     let graded = min(ground, mix(z_max, ground, s5(shore.y / params.bank_width)));
     let z = mix(ground, graded, params.strength);
-    atomicStore(&height[gidx(p)], u32(max(z, 0.0) * HEIGHT_SCALE));
+    atomicStore(&height[gidx(p)], u32(round(max(z, 0.0) * HEIGHT_SCALE)));
 }

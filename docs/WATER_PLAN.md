@@ -281,6 +281,22 @@ Results at the defaults:
   - it settles flat (RMS 0.0003–0.0004).
   A seiche of a few hundredths of a cell lingers for several seconds at this low friction.
 
+Fixed: runoff cut stripes into slopes. Until now `water_erode` wrote every wet cell's height
+back each step as `u32(h · HEIGHT_SCALE)`. That truncates, and the round trip through f32 drops
+a unit for some exact heights and not others. Wet cells sank by up to 1e-6 per step (about
+0.005 over 10 s), in bands that follow the contours. SWE spreads thin sheets over whole
+flanks, so the bands showed as regular stripes wherever water was poured on a ridge.
+
+Two changes:
+- `water_erode` now stages the height change in `sediment_tmp`, and `water_apply` writes it
+  rounded, only where it changed. That also stops the kernel reading neighbour heights that
+  other threads are writing.
+- `water_bed.wgsl` rounds its writes too.
+
+On a smooth ridge the cut went from RMS 0.00069 (contour stripes plus a pit under the pour) to
+0.00003; `ridge_runoff_leaves_the_flanks_alone` keeps it there. `natural_ridge_pour_images`
+writes the depth, speed, bed and cut around a pour on the default terrain to `TEST_IMAGE_DIR`.
+
 Known in bevy_fft:
 - `integrateHeight` and `overshootReduce` update depth in place while reading their neighbours'
   depth. That is a data race, but it made no measurable difference here.

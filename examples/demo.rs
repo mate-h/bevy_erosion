@@ -6,7 +6,8 @@
 //! `EROSION_BENCH_SECONDS=<n>` logs the mean frame time after the cascade settles and quits after
 //! n seconds; `EROSION_BENCH_SPRING=1` places a spring at the map centre so the water solver runs,
 //! `EROSION_BENCH_PIPES=1` switches it to the pipe model, and `EROSION_NO_ENV_FREEZE=1` keeps
-//! re-filtering the environment map every frame. `EROSION_BENCH_SCREENSHOT=<path>` saves the
+//! re-filtering the environment map every frame. `EROSION_BENCH_POUR=x,y` places a spring at
+//! texel (x, y) and moves the camera close to it. `EROSION_BENCH_SCREENSHOT=<path>` saves the
 //! window just before the bench quits.
 
 use bevy::{
@@ -192,6 +193,7 @@ fn log_frame_times(
     mut bench: Local<Option<f32>>,
     mut shot_taken: Local<bool>,
     mut commands: Commands,
+    mut cameras: Query<&mut OrbitController>,
 ) {
     let bench_len = bench_seconds();
     if !(simple_mode() || bench_len.is_some()) || !progress.get().finished {
@@ -209,6 +211,23 @@ fn log_frame_times(
                 radius: 12.0,
                 rate: 0.007,
             });
+        }
+        // `x,y` in texels: pour there and look at it from close by.
+        if let Ok(pour) = std::env::var("EROSION_BENCH_POUR")
+            && let Some((x, y)) = pour.split_once(',')
+            && let (Ok(x), Ok(y)) = (x.parse::<f32>(), y.parse::<f32>())
+        {
+            water.springs.push(Spring {
+                center: Vec2::new(x, y),
+                radius: 8.0,
+                rate: 0.05,
+            });
+            let size = progress.get().size.as_vec2();
+            let half = size.x * 0.25;
+            for mut orbit in &mut cameras {
+                orbit.target = Vec3::new(x / size.x * 2.0 * half - half, 20.0, y / size.y * 2.0 * half - half);
+                orbit.distance = 45.0;
+            }
         }
     }
     let dt = time.delta_secs();
