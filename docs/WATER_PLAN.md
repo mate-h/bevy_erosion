@@ -213,7 +213,9 @@ Done when:
 
 bevy_erosion depends on bevy_fft as a git dependency on `water-foundations`, pinned in
 `Cargo.lock`. `WaterControl::solver` picks `Swe` (default) or `Pipes`; the panel shows it as
-"Momentum Flow (SWE)", with "Bed Friction (Manning n)" below it.
+"Momentum Flow (SWE)". Below it are two sliders:
+- "Bed Friction (Manning n)", 0.002–0.1;
+- "Gravity (cells/s²)", 250–8000.
 
 What differs from the plan below:
 - **Kernels.** `swe_export`, `swe_gather` and `swe_import` live in `water.wgsl`, sharing its
@@ -228,10 +230,16 @@ What differs from the plan below:
 - **Hand-over:** `swe_import` hands this crate's depth to the solver when it takes over from the
   pipes and after Shape Beds.
 - **Settings:**
-  - `SWE_GRAVITY` = 2000 cells/s², with heights × 100 in cells;
-  - Manning n defaults to 0.05. Manning speed does not depend on g, so n sets how fast water
-    runs: 0.01 is about 30 texels/s on the probe slope, 0.05 about 13;
+  - gravity defaults to 2000 cells/s², with heights × 100 in cells;
+  - Manning n defaults to 0.01;
   - the overshoot limiter is off, because it does not conserve water.
+- **What sets the speed:**
+  - Manning n sets how fast water runs. Friction-limited speed is h^(2/3) S^(1/2) / n and does
+    not depend on g. At 0.05, a 0.3-cell sheet on a 0.1 slope moved about 3 texels/s, which
+    looked stalled on a 512² map.
+  - Gravity sets how fast waves travel and lakes level.
+  - The solver's depth limiter (β·dx / (g·Δt), about 0.5 cells at these settings) did not turn
+    out to be the brake. In a frictionless dam break the front reaches 38 texels at g = 2000.
 
 Verified headlessly with a spring of rate 0.007 and radius 12 at the map centre, with
 evaporation and erosion off:
@@ -251,10 +259,27 @@ Cost:
 In the demo a spring now forms a pool that spills down a channel. The pipes instead throw the
 water off the slope at their 1 texel per step speed cap.
 
-Not done yet:
-- the dam break, Manning flume and lake-jet checks;
-- moving the bed under a lake;
-- tuning the default n against the look of the pipes.
+GPU checks in `tests/water_swe_gpu.rs`:
+- **Setup.** Each test draws an analytic bed through the terrain edit layer, with the KTT
+  erosion off, and checks the bed survives to within 0.001.
+- **Running them.** They are ignored by default:
+  `cargo test --release --test water_swe_gpu -- --ignored --test-threads=1 --nocapture`.
+  `TEST_GRAVITY` and `TEST_MANNING` override the defaults.
+
+Results at the defaults:
+- **Dam break.** A mound poured on a flat bed spreads to 25 texels (pour radius 16) in 0.5 s. It
+  stays mirror and diagonal symmetric to within 0.08% of its peak, with volume 8.039 of 8.042.
+- **Manning flume.** Steady rain on a 0.1 slope gives 0.977 of the Manning speed and 0.993 of the
+  steady Manning depth mid-plane.
+- **Lake jet.** A channel runs into a filled basin. Two channel widths into the lake, SWE keeps
+  about 8–12 texels/s (70–100% of the channel speed); the pipes keep 2.8–5.3 (5–10%). The still
+  lake beside the jet moves at about 2 texels/s.
+- **Bed under a lake.** Raising a bowl's floor by up to 0.02 re-runs the cascade under a settled
+  lake:
+  - the volume stays (785.10 → 785.08);
+  - the surface rises 0.0010 for 0.0010 expected;
+  - it settles flat (RMS 0.0003–0.0004).
+  A seiche of a few hundredths of a cell lingers for several seconds at this low friction.
 
 Known in bevy_fft:
 - `integrateHeight` and `overshootReduce` update depth in place while reading their neighbours'

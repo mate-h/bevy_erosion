@@ -731,6 +731,10 @@ pub struct WaterControl {
     pub solver: WaterSolver,
     /// Manning roughness for [`WaterSolver::Swe`] (0 = no bed friction).
     pub manning_n: f32,
+    /// Gravity for [`WaterSolver::Swe`] in cells per second², with heights in cells (×100).
+    /// Higher levels lakes faster; the solver's depth limiter caps the depth that carries flux at
+    /// about 2 / (g · step) cells, so lower lets deep water flow.
+    pub gravity: f32,
     /// Seconds since the last frame (set from [`Time`]); the solver catches up by this much.
     pub dt: f32,
     /// Bed reconstruction settings (see [`BedShaping`]).
@@ -812,7 +816,8 @@ impl Default for WaterControl {
             evaporation: 0.01,
             sediment_capacity: 0.0005,
             solver: WaterSolver::default(),
-            manning_n: 0.05,
+            manning_n: 0.01,
+            gravity: 2000.0,
             dt: 0.0,
             bed: BedShaping::default(),
             shape_generation: 0,
@@ -850,10 +855,6 @@ const MAX_WATER_SOURCES: usize = MAX_SPRINGS + 1;
 pub const WATER_STEP: f32 = 1.0 / 480.0;
 /// Most solver steps per frame; below 15 fps the water slows down instead of stalling the GPU.
 const MAX_WATER_STEPS: u32 = 32;
-/// Gravity for [`WaterSolver::Swe`] in cells per second², with heights in cells
-/// (`CELLS_PER_HEIGHT` in `water.wgsl`). The wave speed `sqrt(g h)` stays under half a cell per
-/// step for depths up to about 0.1 height units.
-const SWE_GRAVITY: f32 = 2000.0;
 
 /// Uniform for `water.wgsl`.
 #[derive(Clone, Copy, ShaderType)]
@@ -2114,7 +2115,7 @@ fn plan_erosion_frame(
                 &ShallowWaterSettings {
                     dt: WATER_STEP,
                     cell_size: 1.0,
-                    gravity: SWE_GRAVITY,
+                    gravity: water.gravity.max(1.0),
                     manning_n: water.manning_n,
                     evaporation: -(1.0 - water.evaporation.clamp(0.0, 0.999)).ln(),
                     overshoot_limiter: false,

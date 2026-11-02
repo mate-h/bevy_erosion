@@ -135,6 +135,7 @@ enum ErosionSliderFieldKind {
     WaterEvaporation,
     WaterRainfall,
     WaterManning,
+    WaterGravity,
     BedMaxDepth,
     BedShoreSlope,
     BedProfile,
@@ -208,6 +209,7 @@ impl ErosionSliderFieldKind {
             // Shown in ‰ of the map height per second.
             Self::WaterRainfall => water.rainfall = value / 1000.0,
             Self::WaterManning => water.manning_n = value,
+            Self::WaterGravity => water.gravity = value,
             Self::BedMaxDepth => water.bed.max_depth = value,
             Self::BedShoreSlope => water.bed.shore_slope = value,
             Self::BedProfile => water.bed.profile = value,
@@ -239,6 +241,7 @@ impl ErosionSliderFieldKind {
                 | Self::IterationsPerFrame
                 | Self::BrushRadius
                 | Self::BedBankWidth
+                | Self::WaterGravity
         )
     }
 }
@@ -627,7 +630,9 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         --
                         @toggle_row("Momentum Flow (SWE)", ToggleKind::MomentumFlow)
                         --
-                        @slider_row("Bed Friction (Manning n)", 0.0, 0.2, water.manning_n, ErosionSliderFieldKind::WaterManning)
+                        @slider_row("Bed Friction (Manning n)", 0.002, 0.1, water.manning_n, ErosionSliderFieldKind::WaterManning)
+                        --
+                        @slider_row("Gravity (cells/s²)", 250.0, 8000.0, water.gravity, ErosionSliderFieldKind::WaterGravity)
                         --
                         @note_text("Springs: 0")
                         SpringCountText
