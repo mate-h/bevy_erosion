@@ -16,6 +16,7 @@ use bevy::{
 use bevy_erosion::ui::ErosionParamsPlugin;
 use bevy_erosion::{
     ErosionConfig,
+    brush::{BrushMode, TerrainSurface, WaterBrush, WaterBrushPlugin},
     camera::{OrbitCameraPlugin, OrbitController},
     sun::{Sun, SunController, SunPlugin},
     *,
@@ -40,6 +41,7 @@ fn main() {
             OrbitCameraPlugin,
             SunPlugin,
             AutoExposurePlugin,
+            WaterBrushPlugin,
             #[cfg(feature = "ui")]
             ErosionParamsPlugin,
         ))
@@ -51,6 +53,8 @@ fn main() {
                 handle_reset_input,
                 handle_sim_input,
                 handle_preview_mode_input,
+                handle_brush_input,
+                sync_sea_level,
             ),
         )
         .run();
@@ -84,6 +88,12 @@ fn print_controls() {
     println!("  5 - Height map preview");
     println!("  6 - View-space normals preview");
     println!("  7 - Curvature map preview");
+    println!("  8 - Age map preview");
+    println!("  B - toggle the brush (left drag paints, Shift + drag erases, right drag orbits)");
+    println!("  V - cycle brush: rain / terrain / water body");
+    println!("  T - cycle terrain tool: raise / lower / flatten / smooth");
+    println!("  [ / ] - brush radius");
+    println!("  C - clear water   X - reset terrain edits");
 }
 
 fn spawn_terrain(
@@ -106,6 +116,7 @@ fn spawn_terrain(
             .size(half_size, half_size),
     );
     let mesh_handle = meshes.add(plane);
+    let height_scale = 50.0;
 
     let mat_handle = materials.add(ExtendedMaterial {
         base: StandardMaterial {
@@ -120,8 +131,10 @@ fn spawn_terrain(
             color_tex: erosion_images.color.clone(),
             analysis_tex: erosion_images.analysis.clone(),
             ao_tex: erosion_images.ao.clone(),
-            height_scale: 50.0,
+            height_scale,
             preview_mode: 0, // Default to PBR
+            water_tex: erosion_images.water.clone(),
+            sea_level: 0.0,
         },
     });
 
@@ -129,6 +142,10 @@ fn spawn_terrain(
         Mesh3d(mesh_handle),
         MeshMaterial3d(mat_handle),
         Transform::from_xyz(0.0, 0.0, 0.0),
+        TerrainSurface {
+            size: Vec2::splat(half_size),
+            height_scale,
+        },
     ));
 
     let earth_medium = scattering_mediums.add(ScatteringMedium::earth(256, 256));
@@ -215,6 +232,53 @@ fn handle_sim_input(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<SimControl>
     }
 }
 
+fn handle_brush_input(keys: Res<ButtonInput<KeyCode>>, mut brush: ResMut<WaterBrush>) {
+    if keys.just_pressed(KeyCode::KeyB) {
+        brush.enabled = !brush.enabled;
+        println!("Water brush: {}", if brush.enabled { "on" } else { "off" });
+    }
+    if keys.just_pressed(KeyCode::KeyV) {
+        brush.mode = brush.mode.next();
+        println!("Brush: {}", brush.mode.label());
+    }
+    if keys.just_pressed(KeyCode::KeyT) {
+        brush.mode = match brush.mode {
+            BrushMode::Terrain(tool) => BrushMode::Terrain(tool.next()),
+            _ => BrushMode::Terrain(Default::default()),
+        };
+        println!("Brush: {}", brush.mode.label());
+    }
+    if keys.just_pressed(KeyCode::KeyC) {
+        brush.clear_water = true;
+    }
+    if keys.just_pressed(KeyCode::KeyX) {
+        brush.clear_terrain = true;
+    }
+    if keys.just_pressed(KeyCode::BracketLeft) {
+        brush.radius = (brush.radius / 1.25).max(2.0);
+    }
+    if keys.just_pressed(KeyCode::BracketRight) {
+        brush.radius = (brush.radius * 1.25).min(128.0);
+    }
+}
+
+/// The ocean renders flat at the sea level while procedural outflow is on.
+fn sync_sea_level(params: Res<ErodeParams>, mut materials: ResMut<Assets<TerrainMaterial>>) {
+    if !params.is_changed() {
+        return;
+    }
+    let level = if params.use_outflow != 0 {
+        params.outflow_sea_level
+    } else {
+        0.0
+    };
+    for (_, mat) in materials.iter_mut() {
+        if mat.extension.sea_level != level {
+            mat.extension.sea_level = level;
+        }
+    }
+}
+
 fn handle_preview_mode_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut preview_mode: ResMut<CurrentPreviewMode>,
@@ -246,6 +310,8 @@ fn handle_preview_mode_input(
         Some(PreviewMode::Normals)
     } else if keys.just_pressed(KeyCode::Digit7) {
         Some(PreviewMode::Curvature)
+    } else if keys.just_pressed(KeyCode::Digit8) {
+        Some(PreviewMode::Age)
     } else {
         None
     };
@@ -265,6 +331,7 @@ fn handle_preview_mode_input(
                     PreviewMode::Height => 4,
                     PreviewMode::Normals => 5,
                     PreviewMode::Curvature => 6,
+                    PreviewMode::Age => 7,
                 };
             }
 
