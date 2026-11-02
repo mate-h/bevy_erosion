@@ -7,8 +7,9 @@
 //! n seconds; `EROSION_BENCH_SPRING=1` places a spring at the map centre so the water solver runs,
 //! `EROSION_BENCH_PIPES=1` switches it to the pipe model, and `EROSION_NO_ENV_FREEZE=1` keeps
 //! re-filtering the environment map every frame. `EROSION_BENCH_POUR=x,y` places a spring at
-//! texel (x, y) and moves the camera close to it. `EROSION_BENCH_SCREENSHOT=<path>` saves the
-//! window just before the bench quits.
+//! texel (x, y) and moves the camera close to it (`EROSION_BENCH_DISTANCE`, `_PITCH` and `_YAW`,
+//! in degrees, frame it). `EROSION_BENCH_SCREENSHOT=<path>` hides the settings panel and saves
+//! the window just before the bench quits.
 
 use bevy::{
     core_pipeline::tonemapping::Tonemapping,
@@ -194,6 +195,7 @@ fn log_frame_times(
     mut shot_taken: Local<bool>,
     mut commands: Commands,
     mut cameras: Query<&mut OrbitController>,
+    mut panels: Query<&mut Visibility, (With<Node>, Without<ChildOf>)>,
 ) {
     let bench_len = bench_seconds();
     if !(simple_mode() || bench_len.is_some()) || !progress.get().finished {
@@ -224,9 +226,18 @@ fn log_frame_times(
             });
             let size = progress.get().size.as_vec2();
             let half = size.x * 0.25;
+            let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok());
             for mut orbit in &mut cameras {
                 orbit.target = Vec3::new(x / size.x * 2.0 * half - half, 20.0, y / size.y * 2.0 * half - half);
-                orbit.distance = 45.0;
+                orbit.distance = env("EROSION_BENCH_DISTANCE").unwrap_or(45.0);
+                if let Some(pitch) = env("EROSION_BENCH_PITCH") {
+                    orbit.pitch = pitch.to_radians();
+                    orbit.target_pitch = orbit.pitch;
+                }
+                if let Some(yaw) = env("EROSION_BENCH_YAW") {
+                    orbit.yaw = yaw.to_radians();
+                    orbit.target_yaw = orbit.yaw;
+                }
             }
         }
     }
@@ -251,6 +262,10 @@ fn log_frame_times(
             && !*shot_taken
         {
             *shot_taken = true;
+            // The settings panel would cover part of the shot.
+            for mut visibility in &mut panels {
+                *visibility = Visibility::Hidden;
+            }
             commands
                 .spawn(Screenshot::primary_window())
                 .observe(save_to_disk(path));
