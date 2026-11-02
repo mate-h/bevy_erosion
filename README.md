@@ -28,7 +28,7 @@ https://samk9632.gumroad.com/l/KTTforHoudini
   - River momentum, with Do Rivers on
 - **Coarse-to-fine pyramid**: erodes at low resolution first, then refines level by level up to the full map
 - **Interactive controls** for real-time simulation, plus a parameter panel built with Bevy Feathers (`ui` feature, on by default)
-- **Brushes**: rain erosion trails onto the terrain, sculpt the source terrain (raise, lower, flatten, smooth), or pour water that pools into lakes and runs off as rivers (shallow-water solver coupled to the erosion)
+- **Brushes**: rain erosion trails onto the terrain, sculpt the source terrain (raise, lower, flatten, smooth), pour water that pools into lakes and runs off as rivers (shallow-water solver coupled to the erosion), or click to place a river with a carved bed
 - **Ocean**: optional sea level that renders flat and drains water
 
 ## Controls
@@ -49,13 +49,37 @@ https://samk9632.gumroad.com/l/KTTforHoudini
 | `9` | Simple shading (no atmosphere or water optics) |
 | `0` | River momentum preview (Do Rivers) |
 | `B` | Toggle the brush (left drag paints, Shift + drag erases, right drag orbits) |
-| `V` | Cycle brush: rain / terrain / water body |
+| `V` | Cycle brush: rain / terrain / water body / river |
 | `T` | Cycle terrain tool: raise / lower / flatten / smooth |
 | `[` / `]` | Shrink / grow the brush |
 | `C` | Clear water |
 | `X` | Reset terrain edits |
 
-## Rivers
+## River brush
+
+With the River brush, a click on the terrain places a river. A preview line shows where it will
+run before you click.
+
+- **Route:** from the click it runs down the eroded terrain's valleys until it reaches the sea,
+  standing water, another river or the map edge. It fills any hollow on the way and leaves over
+  its lowest rim.
+- **Bed:** cut into the terrain, with its width and depth set by the discharge (Shape Beds'
+  River Depth, River Width, profile and bank grading). Steep reaches get step-pools, gentler
+  ones riffle-pools, and bends get point bars.
+- **Water:** a spring at the source keeps it flowing.
+
+| Setting | Effect |
+|---|---|
+| Discharge | Size of the next river placed |
+| Armour | How much of the bed the water may rework. 1 keeps every step up and every pool open; 0 lets the water erosion, slumping and bed load wear the steps down and fill the pools. |
+| Bed Detail | Strength of the steps, pools and point bars |
+| Breach Depth | Highest rise the bed cuts through; behind a higher one the water fills a lake and spills over |
+
+Shift + click removes the rivers starting under the brush, and Clear Rivers removes them all.
+Rivers survive reruns of the cascade: once it finishes, each one is carved again into the new
+terrain along the same path.
+
+## KTT rivers
 
 **Do Rivers** turns on KTT's river momentum: every trail leaves momentum behind it, and where it
 builds up, trails drop less of their load and the bed is cut further. Changing any erosion

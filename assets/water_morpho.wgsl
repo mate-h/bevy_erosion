@@ -86,6 +86,9 @@ struct MorphoParams {
 // pipeline stays within eight storage buffers.
 @group(0) @binding(8) var<storage, read> masks: array<vec4<f32>>;
 @group(0) @binding(9) var<storage, read> layers: array<vec2<f32>>;
+// Armour band around the river brush's beds (`river.wgsl`), per texel: x = floor, y = ceiling;
+// (0, 0) holds nothing.
+@group(0) @binding(10) var<storage, read> river_band: array<vec2<f32>>;
 
 const DIRS = array<vec2<i32>, 4>(vec2<i32>(-1, 0), vec2<i32>(1, 0), vec2<i32>(0, -1), vec2<i32>(0, 1));
 
@@ -276,6 +279,20 @@ fn face_load(a: vec2<i32>, e: vec2<i32>) -> f32 {
         let loose = max(terrain(source) - layers[g].x, 0.0);
         most = min(most, 0.25 * loose * CELLS_PER_HEIGHT / per_step);
     }
+    // The same for the armour band of a brushed river bed: the cell the load leaves keeps above
+    // its floor, and the cell it enters stays below its ceiling.
+    let source = select(b, a, qn > 0.0);
+    let target_cell = select(a, b, qn > 0.0);
+    let leaving = river_band[widx(source)];
+    if (leaving.y > 0.0) {
+        let loose = max(terrain(source) - leaving.x, 0.0);
+        most = min(most, 0.25 * loose * CELLS_PER_HEIGHT / per_step);
+    }
+    let entering = river_band[widx(target_cell)];
+    if (entering.y > 0.0) {
+        let room = max(entering.y - terrain(target_cell), 0.0);
+        most = min(most, 0.25 * room * CELLS_PER_HEIGHT / per_step);
+    }
     return clamp(qn, -most, most);
 }
 
@@ -310,6 +327,12 @@ fn morpho_exner(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Bed load itself stops at the bedrock (`face_load`), but wet slumping can still pull
         // the face of a step below it; restore it, as KTT's `write_back` does.
         h = max(h, i32(ceil(layers[g].x * HEIGHT_SCALE)));
+    }
+    let band = river_band[i];
+    if (band.y > 0.0) {
+        // Likewise for the armour band, but never past where the bed already was.
+        h = max(h, min(i32(ceil(band.x * HEIGHT_SCALE)), old));
+        h = min(h, max(i32(floor(band.y * HEIGHT_SCALE)), old));
     }
     if (h != old) {
         atomicStore(&height[g], u32(h));

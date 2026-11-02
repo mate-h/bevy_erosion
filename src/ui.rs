@@ -158,6 +158,10 @@ enum ErosionSliderFieldKind {
     BedLoadMorphFactor,
     BedLoadRefineSteps,
     BedLoadRockHardness,
+    RiverBrushDischarge,
+    RiverBrushArmour,
+    RiverBrushDetail,
+    RiverBrushBreach,
 }
 
 impl ErosionSliderFieldKind {
@@ -222,6 +226,10 @@ impl ErosionSliderFieldKind {
             Self::GranularityStrength => params.granularity_strength = value,
             Self::AgeStrength => params.age_strength = value,
             Self::BrushRadius => brush.radius = value,
+            Self::RiverBrushDischarge => brush.river.discharge = value,
+            Self::RiverBrushArmour => brush.river.armour = value,
+            Self::RiverBrushDetail => brush.river.bed_detail = value,
+            Self::RiverBrushBreach => brush.river.breach_depth = value / 100.0,
             Self::BrushStrength => brush.strength = value,
             Self::WaterErosion => water.sediment_capacity = value,
             // Shown in % per second.
@@ -282,6 +290,9 @@ impl ErosionSliderFieldKind {
                 | Self::BedLoadMorphFactor
                 | Self::BedLoadRefineSteps
                 | Self::BedLoadRockHardness
+                // New rivers take the discharge; armour re-sends the existing beds.
+                | Self::RiverBrushDischarge
+                | Self::RiverBrushArmour
         )
     }
 
@@ -537,6 +548,7 @@ fn update_brush_ui(
             BrushMode::Rain => "Drag: rain erodes under the brush",
             BrushMode::Terrain(_) => "Drag: edit · Shift+drag: undo edits",
             BrushMode::WaterBody => "Drag: pour · Shift: remove · Alt+click: spring",
+            BrushMode::River => "Click: river from here · Shift+click: remove",
         }
     };
     for mut text in &mut hints {
@@ -657,6 +669,8 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                             @brush_mode_button("Terrain", BrushMode::Terrain(TerrainTool::Raise))
                             --
                             @brush_mode_button("Water", BrushMode::WaterBody)
+                            --
+                            @brush_mode_button("River", BrushMode::River)
                         })
                         --
                         Node {
@@ -682,6 +696,27 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         @slider_row("Radius (texels)", 2.0, 128.0, brush.radius, ErosionSliderFieldKind::BrushRadius)
                         --
                         @slider_row("Strength", 0.01, 5.0, brush.strength, ErosionSliderFieldKind::BrushStrength)
+                    })
+                    --
+                    @section("River Brush", true, bsn_list! {
+                        @note_text("Click the terrain: a river routes itself downhill from there, with a carved bed and a spring.")
+                        --
+                        @slider_row("Discharge", 0.1, 8.0, brush.river.discharge, ErosionSliderFieldKind::RiverBrushDischarge)
+                        --
+                        @slider_row("Armour", 0.0, 1.0, brush.river.armour, ErosionSliderFieldKind::RiverBrushArmour)
+                        --
+                        @slider_row("Bed Detail", 0.0, 2.0, brush.river.bed_detail, ErosionSliderFieldKind::RiverBrushDetail)
+                        --
+                        @slider_row("Breach Depth (cells)", 0.0, 10.0, brush.river.breach_depth * 100.0, ErosionSliderFieldKind::RiverBrushBreach)
+                        --
+                        @button_row(bsn_list! {
+                            @FeathersButton {
+                                @caption: bsn! { Text("Clear Rivers") ThemedText },
+                            }
+                            on(|_: On<Activate>, mut brush: ResMut<WaterBrush>| {
+                                brush.clear_rivers = true;
+                            })
+                        })
                     })
                     --
                     @section("Water", true, bsn_list! {

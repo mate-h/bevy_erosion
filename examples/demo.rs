@@ -7,9 +7,9 @@
 //! n seconds; `EROSION_BENCH_SPRING=1` places a spring at the map centre so the water solver runs,
 //! `EROSION_BENCH_PIPES=1` switches it to the pipe model, and `EROSION_NO_ENV_FREEZE=1` keeps
 //! re-filtering the environment map every frame. `EROSION_BENCH_POUR=x,y` places a spring at
-//! texel (x, y) and moves the camera close to it (or to `EROSION_BENCH_TARGET=x,y`;
+//! texel (x, y) and moves the camera close to it or to the river's source (or to `EROSION_BENCH_TARGET=x,y`;
 //! `EROSION_BENCH_DISTANCE`, `_PITCH` and `_YAW`,
-//! in degrees, frame it), and `EROSION_BENCH_RAIN=<‰/s>` rains on the whole map. `EROSION_BENCH_SCREENSHOT=<path>` hides the settings panel (kept with `EROSION_BENCH_PANEL=1`) and saves
+//! in degrees, frame it), and `EROSION_BENCH_RAIN=<‰/s>` rains on the whole map, `EROSION_BENCH_RIVER=x,y` places a river from texel (x, y). `EROSION_BENCH_SCREENSHOT=<path>` hides the settings panel (kept with `EROSION_BENCH_PANEL=1`) and saves
 //! the window just before the bench quits.
 
 use bevy::{
@@ -197,6 +197,7 @@ fn log_frame_times(
     time: Res<Time<Real>>,
     progress: Res<PyramidProgress>,
     mut water: ResMut<WaterControl>,
+    mut brush: ResMut<WaterBrush>,
     mut exit: MessageWriter<AppExit>,
     mut window: Local<(f32, u32)>,
     mut bench: Local<Option<f32>>,
@@ -229,27 +230,34 @@ fn log_frame_times(
         {
             water.rainfall = rain / 1000.0;
         }
-        if let Ok(pour) = std::env::var("EROSION_BENCH_POUR")
-            && let Some((x, y)) = pour.split_once(',')
-            && let (Ok(x), Ok(y)) = (x.parse::<f32>(), y.parse::<f32>())
-        {
+        let texel = |name: &str| {
+            let v = std::env::var(name).ok()?;
+            let (x, y) = v.split_once(',')?;
+            Some(Vec2::new(x.parse().ok()?, y.parse().ok()?))
+        };
+        // Place a river from there, as the river brush does.
+        let river = texel("EROSION_BENCH_RIVER");
+        if let Some(at) = river {
+            brush.enabled = true;
+            brush.mode = BrushMode::River;
+            brush.place_river_at = Some(at);
+        }
+        let pour = texel("EROSION_BENCH_POUR");
+        if let Some(at) = pour {
             water.springs.push(Spring {
-                center: Vec2::new(x, y),
+                center: at,
                 radius: 8.0,
                 rate: 0.05,
             });
+        }
+        // Look at the pour or the river's source from close by.
+        if let Some(focus) = texel("EROSION_BENCH_TARGET").or(pour).or(river) {
             let size = progress.get().size.as_vec2();
             let half = size.x * 0.25;
             let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok());
-            let (tx, ty) = std::env::var("EROSION_BENCH_TARGET")
-                .ok()
-                .and_then(|t| {
-                    let (a, b) = t.split_once(',')?;
-                    Some((a.parse::<f32>().ok()?, b.parse::<f32>().ok()?))
-                })
-                .unwrap_or((x, y));
             for mut orbit in &mut cameras {
-                orbit.target = Vec3::new(tx / size.x * 2.0 * half - half, 20.0, ty / size.y * 2.0 * half - half);
+                let xz = focus / size * 2.0 * half - half;
+                orbit.target = Vec3::new(xz.x, 20.0, xz.y);
                 orbit.distance = env("EROSION_BENCH_DISTANCE").unwrap_or(45.0);
                 if let Some(pitch) = env("EROSION_BENCH_PITCH") {
                     orbit.pitch = pitch.to_radians();

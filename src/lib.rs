@@ -32,6 +32,7 @@ use std::{
 
 pub mod brush;
 pub mod camera;
+pub mod river;
 pub mod sun;
 
 #[cfg(feature = "ui")]
@@ -45,6 +46,7 @@ const WATER_SHADER: &str = "water.wgsl";
 const WATER_BED_SHADER: &str = "water_bed.wgsl";
 const WATER_MORPHO_SHADER: &str = "water_morpho.wgsl";
 const WATER_SPLAT_SHADER: &str = "water_splat.wgsl";
+const RIVER_SHADER: &str = "river.wgsl";
 /// Erode dispatches per `writeBack` at geological age 0 (`Compute_Erosion.iterations`).
 const ERODE_ITERS_PER_WRITEBACK: u32 = 200;
 /// Erode dispatches between our `writeBack`s. KTT runs one per level, after every batch of
@@ -1152,6 +1154,7 @@ fn setup_erosion_resources(
     commands.insert_resource(SimControl::default());
     commands.insert_resource(BrushStroke::default());
     commands.insert_resource(WaterControl::default());
+    commands.insert_resource(river::RiverBed::default());
 }
 
 fn update_water_time(time: Res<Time>, water: Option<ResMut<WaterControl>>) {
@@ -1173,6 +1176,7 @@ impl Plugin for ErosionComputePlugin {
                 ExtractResourcePlugin::<SimControl>::default(),
                 ExtractResourcePlugin::<BrushStroke>::default(),
                 ExtractResourcePlugin::<WaterControl>::default(),
+                ExtractResourcePlugin::<river::RiverBed>::default(),
             ))
             .add_systems(Startup, setup_erosion_resources)
             .add_systems(PostUpdate, update_water_time);
@@ -1236,6 +1240,9 @@ struct ErosionPipeline {
     layout_water_splat: BindGroupLayoutDescriptor,
     /// `water_splat.wgsl`: splat, record.
     pipelines_water_splat: [CachedComputePipelineId; 2],
+    layout_river: BindGroupLayoutDescriptor,
+    /// `river.wgsl`: carve, armour.
+    pipelines_river: [CachedComputePipelineId; 2],
 }
 
 impl ErosionPipeline {
@@ -1467,6 +1474,7 @@ fn init_erosion_pipeline(
                 (7, uniform_buffer::<MorphoParams>(false)),
                 (8, storage_buffer_read_only::<Vec4>(false)), // work set masks (softness)
                 (9, storage_buffer_read_only::<Vec2>(false)), // work set layers (bedrock)
+                (10, storage_buffer_read_only::<Vec2>(false)), // river armour band
             ),
         ),
     );
@@ -1602,7 +1610,28 @@ fn init_erosion_pipeline(
     let pipelines_water_splat = ["water_splat", "water_record"]
         .map(|entry| compute(vec![layout_water_splat.clone()], &water_splat_shader, entry));
 
+    // River brush beds and their armour (`river.wgsl`).
+    let layout_river = BindGroupLayoutDescriptor::new(
+        "RiverGroup0",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                storage_buffer::<u32>(false), // work set height (atomic, fixed-point)
+                storage_buffer_read_only::<Vec4>(false), // river raster
+                storage_buffer::<Vec2>(false), // armour band
+                storage_buffer::<f32>(false), // suspended sediment
+                storage_buffer::<f32>(false), // staged erosion (`water_erode`)
+                uniform_buffer::<WaterParams>(false),
+            ),
+        ),
+    );
+    let river_shader = asset_server.load(RIVER_SHADER);
+    let pipelines_river = ["river_carve", "river_armour"]
+        .map(|entry| compute(vec![layout_river.clone()], &river_shader, entry));
+
     commands.insert_resource(ErosionPipeline {
+        layout_river,
+        pipelines_river,
         layout_erosion,
         layout_water_splat,
         pipelines_water_splat,
@@ -1711,6 +1740,10 @@ struct WaterBuffers {
     /// Per cell: helical intensity (two slots) and the bed change not yet written.
     morpho_state: StorageBuffer<Vec<f32>>,
     morpho_params: UniformBuffer<MorphoParams>,
+    /// River brush raster ([`river::RiverCell`] per texel) and the armour band (floor, ceiling)
+    /// it leaves.
+    river: StorageBuffer<Vec<Vec4>>,
+    river_band: StorageBuffer<Vec<Vec2>>,
 }
 
 /// bevy_fft solver grid and its inputs at base map size ([`WaterSolver::Swe`]).
@@ -1806,6 +1839,8 @@ impl WaterBuffers {
                 use_bedrock: 0,
                 rock_hardness: 0.0,
             }),
+            river: StorageBuffer::from(vec![Vec4::new(river::NO_RIVER, 1.0, 0.0, 0.0); n]),
+            river_band: StorageBuffer::from(vec![Vec2::ZERO; n]),
         };
         b.depth.write_buffer(device, queue);
         b.flux.write_buffer(device, queue);
@@ -1822,6 +1857,8 @@ impl WaterBuffers {
         b.bed_load.write_buffer(device, queue);
         b.morpho_state.write_buffer(device, queue);
         b.morpho_params.write_buffer(device, queue);
+        b.river.write_buffer(device, queue);
+        b.river_band.write_buffer(device, queue);
         b
     }
 }
@@ -1847,6 +1884,8 @@ struct ErosionBindGroups {
     water_bed_load: [BindGroup; 2],
     /// Trails and the water, indexed by work set.
     water_splat: [BindGroup; 2],
+    /// River brush beds, indexed by work set.
+    river: [BindGroup; 2],
     blit: BindGroup,
     blit_blur: BindGroup,
 }
@@ -2077,6 +2116,7 @@ fn prepare_erosion_bind_groups(
                     (7, w.morpho_params.binding().unwrap()),
                     (8, set.masks.binding().unwrap()),
                     (9, set.layers.binding().unwrap()),
+                    (10, w.river_band.binding().unwrap()),
                 )),
             )
         }),
@@ -2096,6 +2136,21 @@ fn prepare_erosion_bind_groups(
                     w.morpho_state.binding().unwrap(),
                     w.params.binding().unwrap(),
                     &w.swe.textures.bed_water,
+                )),
+            )
+        }),
+        river: [0, 1].map(|set| {
+            let w = &buffers.water;
+            render_device.create_bind_group(
+                None,
+                &layout(&pipeline.layout_river),
+                &BindGroupEntries::sequential((
+                    buffers.sets[set].height.binding().unwrap(),
+                    w.river.binding().unwrap(),
+                    w.river_band.binding().unwrap(),
+                    w.sediment.binding().unwrap(),
+                    w.sediment_tmp.binding().unwrap(),
+                    w.params.binding().unwrap(),
                 )),
             )
         }),
@@ -2177,6 +2232,10 @@ enum FrameCmd {
         dilate_steps: u32,
         swe: bool,
     },
+    /// Carve the river brush's beds into the work set (`river_carve`).
+    RiverCarve {
+        set: usize,
+    },
     Display {
         set: usize,
         offset: u32,
@@ -2216,6 +2275,8 @@ struct ErosionState {
     was_finished: bool,
     /// Finest-level displays since AO was last computed (`None` before the first one).
     displays_since_ao: Option<u32>,
+    /// [`river::RiverBed::generation`] last uploaded and carved.
+    last_river: u32,
 }
 
 /// Turns the cascade's next steps into this frame's command list and per-dispatch uniforms.
@@ -2233,6 +2294,7 @@ fn plan_erosion_frame(
     render_device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     swe_pipelines: Option<Res<ShallowWaterPipelines>>,
+    river_bed: Option<Res<river::RiverBed>>,
 ) {
     let state = &mut *state;
     state.frame.clear();
@@ -2584,6 +2646,21 @@ fn plan_erosion_frame(
         // The pipes' depth now differs from the solver's: hand it over when it takes back over.
         state.last_swe &= swe;
     }
+    // River brush: carve once the cascade has finished (or while it keeps eroding the finest
+    // level), so the trails do not wear the beds away.
+    if let Some(bed) = river_bed
+        && bed.generation != state.last_river
+        && bed.cells.len() == buffers.water.river.get().len()
+        && finest_ready
+        && (state.cascade.finished || sim.continue_after_cascade)
+    {
+        state.last_river = bed.generation;
+        buffers.water.river.set(bed.cells.as_ref().clone());
+        buffers.water.river.write_buffer(&render_device, &queue);
+        state.frame.push(FrameCmd::RiverCarve {
+            set: state.cascade.current,
+        });
+    }
     buffers
         .water
         .bed_params
@@ -2743,6 +2820,7 @@ fn erosion_compute(
                 let [p_discharge, p_helical, p_bed_flux, p_exner, p_steer] =
                     pipes.pipelines_water_morpho.map(get);
                 let [p_splat, p_record] = pipes.pipelines_water_splat.map(get);
+                let p_armour = get(pipes.pipelines_river[1]);
                 if let Some(p) = p_splat {
                     pass.set_bind_group(0, &groups.water_splat[set], &[]);
                     pass.set_pipeline(p);
@@ -2802,7 +2880,13 @@ fn erosion_compute(
                         run(&mut pass, p_flux);
                         run(&mut pass, p_depth);
                     }
-                    for p in [p_erode, p_apply, p_advect, p_copy] {
+                    run(&mut pass, p_erode);
+                    if let Some(p) = p_armour {
+                        pass.set_bind_group(0, &groups.river[set], &[]);
+                        pass.set_pipeline(p);
+                        pass.dispatch_workgroups(gx, gy, 1);
+                    }
+                    for p in [p_apply, p_advect, p_copy] {
                         run(&mut pass, p);
                     }
                     if bed_load && let (Some(f), Some(e)) = (p_bed_flux, p_exner) {
@@ -2876,6 +2960,14 @@ fn erosion_compute(
                     pass.set_pipeline(p);
                     pass.set_bind_group(0, &groups.water[set], &[]);
                     pass.set_bind_group(1, &groups.water_out, &[]);
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
+            }
+            FrameCmd::RiverCarve { set } => {
+                if let Some(p) = get(pipes.pipelines_river[0]) {
+                    let (gx, gy) = dispatch_grid(params.map_size);
+                    pass.set_pipeline(p);
+                    pass.set_bind_group(0, &groups.river[set], &[]);
                     pass.dispatch_workgroups(gx, gy, 1);
                 }
             }

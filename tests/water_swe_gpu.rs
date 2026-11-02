@@ -2253,3 +2253,118 @@ fn validate_ktt_rivers() {
         report(&format!("rivers_{scale}"), true, scale, &heights);
     }
 }
+
+/// River brush: a river placed on the default terrain from its highest point carves a bed with
+/// steps and pools, and its armour keeps them under the flowing water and live bed load.
+/// Reports the small-scale relief of the bed along the path (its steps and pools) as carved and
+/// after `TEST_FLOW_SECONDS` of flow, with and without armour.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn river_brush_keeps_its_steps() {
+    use bevy_erosion::river::{self, RiverBed, RiverSettings};
+    let seconds = std::env::var("TEST_FLOW_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15.0);
+    // Small-scale relief along a profile: RMS of what a 15-sample running mean leaves.
+    let detail = |z: &[f32]| {
+        let r = 7usize;
+        let n = z.len();
+        let sum: f32 = (r..n - r)
+            .map(|i| {
+                let mean = z[i - r..=i + r].iter().sum::<f32>() / (2 * r + 1) as f32;
+                (z[i] - mean).powi(2)
+            })
+            .sum();
+        (sum / (n - 2 * r) as f32).sqrt() * CELLS_PER_HEIGHT
+    };
+    let mut results = Vec::new();
+    for armour in [1.0f32, 0.0] {
+        let mut h = Harness::natural(WaterSolver::Swe);
+        {
+            let mut water = h.water();
+            water.bed_load.live = true;
+            water.sediment_capacity = WaterControl::default().sediment_capacity;
+        }
+        let heights = h.read_heights();
+        // Source: the highest texel away from the border.
+        let m = 32;
+        let (mut best, mut source) = (0.0f32, Vec2::ZERO);
+        for y in m..N - m {
+            for x in m..N - m {
+                if heights[idx(x, y)] > best {
+                    best = heights[idx(x, y)];
+                    source = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+                }
+            }
+        }
+        if let Ok(dir) = std::env::var("TEST_IMAGE_DIR") {
+            let bytes: Vec<u8> = heights.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(format!("{dir}/river_heights.f32"), bytes).unwrap();
+        }
+        let settings = RiverSettings { armour, ..default() };
+        let bed = h.water().bed;
+        let size = UVec2::splat(N);
+        let placed = river::place(&heights, &[], &[], size, source, 0.0, &settings, &(&bed).into(), 1)
+            .expect("no route from the summit");
+        let spring = river::spring_for(&placed, &bed);
+        let cells = river::rasterize(std::slice::from_ref(&placed), &(&bed).into(), &settings, size);
+        h.water().springs.push(spring);
+        {
+            let mut out = h.app.world_mut().resource_mut::<RiverBed>();
+            out.cells = std::sync::Arc::new(cells);
+            out.generation += 1;
+        }
+        h.run(0.2);
+        let along = |heights: &[f32]| -> Vec<f32> {
+            placed.path.iter().map(|p| river::bilinear(heights, size, *p)).collect()
+        };
+        let carved = h.read_heights();
+        let cut: f32 = placed
+            .path
+            .iter()
+            .map(|p| river::bilinear(&heights, size, *p) - river::bilinear(&carved, size, *p))
+            .sum::<f32>()
+            / placed.path.len() as f32
+            * CELLS_PER_HEIGHT;
+        let before = detail(&along(&carved));
+        let image = |name: &str, heights: &[f32]| {
+            if let Ok(dir) = std::env::var("TEST_IMAGE_DIR") {
+                write_bmp(&format!("{dir}/river_{name}.bmp"), &hillshade(heights), N as usize, N as usize, 0.0, 1.0, 3);
+                let profile = along(heights);
+                let csv: Vec<String> = profile.iter().map(|v| format!("{}", v * CELLS_PER_HEIGHT)).collect();
+                std::fs::write(format!("{dir}/river_{name}_profile.csv"), csv.join("\n")).unwrap();
+            }
+        };
+        image(&format!("carved_armour{armour}"), &carved);
+        h.run(seconds);
+        let flowed = h.read_heights();
+        image(&format!("flowed_armour{armour}"), &flowed);
+        let after = detail(&along(&flowed));
+        // The spring's water runs down the carved channel.
+        let water = h.read_water();
+        let wet = placed
+            .path
+            .iter()
+            .filter(|p| water[idx(p.x as u32, p.y as u32)].depth > 0.0005)
+            .count() as f32
+            / placed.path.len() as f32;
+        assert!(wet > 0.5, "only {wet:.2} of the channel is wet");
+        println!(
+            "armour {armour}: path {} texels, mean cut {cut:.2} cells, bed detail {before:.3} → {after:.3} cells, {:.0}% wet",
+            placed.path.len(),
+            wet * 100.0
+        );
+        assert!(cut > 0.3, "the bed was not carved ({cut} cells)");
+        results.push((before, after));
+    }
+    let (armoured, bare) = (results[0], results[1]);
+    assert!(
+        armoured.1 > 0.8 * armoured.0,
+        "the armoured bed lost its steps: {armoured:?}"
+    );
+    assert!(
+        armoured.1 / armoured.0 > bare.1 / bare.0,
+        "armour kept no more detail than a bare bed: {armoured:?} against {bare:?}"
+    );
+}
