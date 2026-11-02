@@ -936,7 +936,7 @@ dependencies = [
 [[package]]
 name = "bevy_fft"
 version = "0.2.0"
-source = "git+https://github.com/mate-h/bevy_fft?branch=water-foundations#56b96f57d3e305ebcd65fae880cff788a4bbd065"
+source = "git+https://github.com/mate-h/bevy_fft?branch=water-foundations#96cf5968649b1f955fc585a8d375c4fd6e6f51a6"
 dependencies = [
  "bevy",
  "bytemuck",

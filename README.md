@@ -29,7 +29,8 @@ https://samk9632.gumroad.com/l/KTTforHoudini
 - **Coarse-to-fine pyramid**: erodes at low resolution first, then refines level by level up to the full map
 - **Interactive controls** for real-time simulation, plus a parameter panel built with Bevy Feathers (`ui` feature, on by default)
 - **Brushes**: rain erosion trails onto the terrain, sculpt the source terrain (raise, lower, flatten, smooth), pour water that pools into lakes and runs off as rivers (shallow-water solver coupled to the erosion), or click to place a river with a carved bed
-- **Ocean**: optional sea level that renders flat and drains water
+- **Water rendering**: lakes, rivers and the ocean are drawn by bevy_fft's water surface (refraction, foam) from a `WaterHeightfield` over the solver
+- **Ocean**: optional sea level that drains water
 
 ## Controls
 

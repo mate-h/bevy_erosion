@@ -20,6 +20,8 @@ const HEIGHT_SCALE: f32 = 1000000.0;
 const PIPE_GRAVITY: f32 = 0.2;
 // Depth below which a cell counts as dry.
 const WET_DEPTH: f32 = 0.0005;
+// How far below the terrain `water_surface` puts dry cells (height units).
+const DRY_SINK: f32 = 0.02;
 // Depth at which a cell is full outflow and flow reaches full sediment capacity.
 const FULL_DEPTH: f32 = 0.004;
 const DISSOLVE_RATE: f32 = 0.3;
@@ -80,6 +82,9 @@ struct WaterParams {
 // second).
 @group(1) @binding(3) var swe_water: texture_storage_2d<rgba32float, read_write>;
 @group(1) @binding(4) var swe_velocity: texture_2d<f32>;
+// Surface and velocity for bevy_fft's renderer (`water_surface`).
+@group(1) @binding(5) var surface_out: texture_storage_2d<rgba32float, write>;
+@group(1) @binding(6) var surface_velocity_out: texture_storage_2d<rgba32float, write>;
 
 fn inside(p: vec2<i32>) -> bool {
     return all(p >= vec2<i32>(0)) && all(p < vec2<i32>(params.size));
@@ -363,4 +368,25 @@ fn swe_import(@builtin(global_invocation_id) gid: vec3<u32>) {
     var w = textureLoad(swe_water, p);
     w.y = depth[widx(p)] * CELLS_PER_HEIGHT;
     textureStore(swe_water, p, w);
+}
+
+// Bed and water depth (the ocean included) in height units, and the velocity in texels per
+// second, for bevy_fft's `WaterHeightfield`, which draws the water surface.
+@compute @workgroup_size(8, 8, 1)
+fn water_surface(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = vec2<i32>(gid.xy);
+    if (!inside(p)) { return; }
+    let i = widx(p);
+    let ground = terrain(p);
+    var d = depth[i];
+    var v = velocity[i] / params.step_seconds;
+    if (is_ocean(ground)) {
+        d = max(d, params.sea_level - ground);
+        v = vec2<f32>(0.0);
+    }
+    // Dry cells sit below the terrain, so the water surface dives under its banks and the
+    // terrain hides it (and depth-tests it away) instead of covering dry ground.
+    let bed = select(ground, ground - DRY_SINK, d < WET_DEPTH);
+    textureStore(surface_out, p, vec4<f32>(bed, d, 0.0, 0.0));
+    textureStore(surface_velocity_out, p, vec4<f32>(v, 0.0, 0.0));
 }

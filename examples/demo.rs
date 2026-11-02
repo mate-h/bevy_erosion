@@ -1,7 +1,10 @@
 //! Erosion demo.
 //!
+//! The water is drawn by bevy_fft's water surface from a `WaterHeightfield` over the erosion's
+//! water (see `bevy_erosion::water_heightfield`).
+//!
 //! `--simple` (or `EROSION_SIMPLE=1`) renders Lambert-shaded terrain with a flat water tint and
-//! no atmosphere, environment map, bloom, auto exposure or shadows, with vsync off, and logs the
+//! no water surface, atmosphere, environment map, bloom, auto exposure or shadows, with vsync off, and logs the
 //! mean frame time every few seconds, so the frame is mostly the simulations.
 //! `EROSION_BENCH_SECONDS=<n>` logs the mean frame time after the cascade settles and quits after
 //! n seconds; `EROSION_BENCH_SPRING=1` places a spring at the map centre so the water solver runs,
@@ -12,6 +15,7 @@
 //! in degrees, frame it), and `EROSION_BENCH_RAIN=<‰/s>` rains on the whole map, `EROSION_BENCH_RIVER=x,y` places a river from texel (x, y). `EROSION_BENCH_SCREENSHOT=<path>` hides the settings panel (kept with `EROSION_BENCH_PANEL=1`) and saves
 //! the window just before the bench quits.
 
+use bevy::camera::visibility::NoFrustumCulling;
 use bevy::{
     core_pipeline::tonemapping::Tonemapping,
     curve::cubic_splines::LinearSpline,
@@ -36,22 +40,30 @@ use bevy::{
 };
 #[cfg(feature = "ui")]
 use bevy_erosion::ui::ErosionParamsPlugin;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU32, Ordering},
-};
 use bevy_erosion::{
     ErosionConfig,
     brush::{BrushMode, TerrainSurface, WaterBrush, WaterBrushPlugin},
     camera::{OrbitCameraPlugin, OrbitController},
     sun::{Sun, SunController, SunPlugin},
-    *,
+    water_heightfield, *,
+};
+use bevy_fft::water::{
+    JerlovWaterType, WaterLodClear, WaterLodSettings, WaterOpticsUniform, WaterPlugin,
+    WaterSurfaceExtension, WaterSurfaceMaterial, WaterSurfaceTag, WaterSurfaceUniform,
+    WaterTransmission,
+};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU32, Ordering},
 };
 
 /// Map size (width and height). Customize this to change erosion resolution.
 const MAP_SIZE: UVec2 = UVec2::new(512, 512);
 // Controls how much to under-expose (in F-stops). Negative values = under-expose, positive = over-expose
 const UNDER_EXPOSURE_AMOUNT: f32 = -2.0;
+/// Water shallower than this (world units) is not drawn, so the terrain shows on dry ground and
+/// under thin films: `WET_DEPTH` in `water.wgsl` (0.0005 height units) at the terrain's height scale.
+const DRY_DEPTH: f32 = 0.025;
 /// Render-ready frames the atmosphere environment map gets to bake before it is frozen.
 const ENV_MAP_BAKE_FRAMES: u32 = 6;
 
@@ -68,7 +80,10 @@ fn bench_seconds() -> Option<f32> {
 
 /// `EROSION_SEED=<n>` starts on another landscape (the Seed slider under Terrain Source).
 fn seed_from_env(mut params: ResMut<ErodeParams>) {
-    if let Some(seed) = std::env::var("EROSION_SEED").ok().and_then(|v| v.parse().ok()) {
+    if let Some(seed) = std::env::var("EROSION_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
         params.noise_seed = seed;
     }
 }
@@ -119,6 +134,17 @@ fn main() {
                 log_frame_times,
             ),
         );
+    if !simple {
+        // No FFT ocean underneath, so the water LOD data starts each frame empty. Five slices of
+        // 1/8 m texels reach 512 m, the whole map from anywhere on it; the foam sim costs per slice.
+        app.add_plugins(WaterPlugin)
+            .insert_resource(WaterLodClear)
+            .insert_resource(WaterLodSettings {
+                slice_count: 5,
+                resolution: 256,
+                base_texel_size: 1.0 / 8.0,
+            });
+    }
     app.sub_app_mut(RenderApp)
         .insert_resource(ready_frames)
         .add_systems(Render, count_ready_render_frames);
@@ -348,10 +374,12 @@ fn print_controls() {
     println!("  M - refine beds: fast-forward bed load under the current flow");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_terrain(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
+    mut water_materials: ResMut<Assets<WaterSurfaceMaterial>>,
     mut compensation_curves: ResMut<Assets<AutoExposureCompensationCurve>>,
     mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
     erosion_images: Res<ErosionImages>,
@@ -389,6 +417,47 @@ fn spawn_terrain(
             sea_level: 0.0,
         },
     });
+
+    if !simple_mode() {
+        commands.spawn(water_heightfield(
+            &erosion_images,
+            config.map_size,
+            half_size,
+            height_scale,
+        ));
+        // The surface samples the water LOD data by world position, so it reuses the terrain's
+        // grid. Its bounds are flat, so it is never frustum culled.
+        commands.spawn((
+            Mesh3d(mesh_handle.clone()),
+            MeshMaterial3d(water_materials.add(WaterSurfaceMaterial {
+                base: StandardMaterial {
+                    base_color: Color::WHITE,
+                    specular_transmission: 1.0,
+                    ior: 1.333,
+                    reflectance: 0.356,
+                    perceptual_roughness: 0.08,
+                    metallic: 0.0,
+                    opaque_render_method: OpaqueRendererMethod::Forward,
+                    ..default()
+                },
+                extension: WaterSurfaceExtension {
+                    optics: WaterOpticsUniform {
+                        enabled: 1,
+                        ..WaterOpticsUniform::jerlov(JerlovWaterType::Coastal3)
+                    },
+                    settings: WaterSurfaceUniform {
+                        dry_depth: DRY_DEPTH,
+                        ..WaterSurfaceExtension::default().settings
+                    },
+                    ..default()
+                },
+            })),
+            Transform::default(),
+            WaterSurfaceTag,
+            NoFrustumCulling,
+            bevy::light::NotShadowCaster,
+        ));
+    }
 
     commands.spawn((
         Mesh3d(mesh_handle),
@@ -437,9 +506,16 @@ fn spawn_terrain(
         },
     ));
     if simple_mode() {
-        camera.insert((Tonemapping::None, Bloom { intensity: 0.0, ..Bloom::NATURAL }));
+        camera.insert((
+            Tonemapping::None,
+            Bloom {
+                intensity: 0.0,
+                ..Bloom::NATURAL
+            },
+        ));
     } else {
         camera.insert((
+            WaterTransmission,
             AtmosphereSettings::default(),
             AtmosphereEnvironmentMapLight::default(),
             Tonemapping::AcesFitted,

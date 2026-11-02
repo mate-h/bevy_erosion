@@ -66,6 +66,7 @@ impl PyramidLevel {
     }
 }
 const TERRAIN_SHADER: &str = "terrain_extended.wesl";
+const TERRAIN_PREPASS_SHADER: &str = "terrain_prepass.wesl";
 /// Smallest grid the cascade will seed from (caps the level count on small maps).
 const PYRAMID_MIN_SIZE: u32 = 4;
 
@@ -344,6 +345,13 @@ pub struct ErosionImages {
     pub ao_temp: Handle<Image>,  // Temporary texture for AO blur
     /// Water solver output (Rgba16Float, map size): R = depth, G = speed, B = carried sediment.
     pub water: Handle<Image>,
+    /// Water surface for bevy_fft's [`WaterHeightfield`](bevy_fft::water::WaterHeightfield)
+    /// (Rgba32Float, map size): R = bed (dry cells sunk below the terrain), G = water depth including the ocean, both in
+    /// height units. See [`water_heightfield`].
+    pub water_surface: Handle<Image>,
+    /// Water velocity at texel centres for the same heightfield (Rgba32Float, map size): RG in
+    /// texels per second.
+    pub water_velocity: Handle<Image>,
     /// Terrain brush edits (Rgba32Float, map size), applied to the source terrain at init:
     /// R = height offset, G = flatten weight, B = flatten target height, A = smooth weight.
     /// Edit it on the CPU and bump [`ResetSim`] to re-erode (see [`brush`]).
@@ -370,7 +378,34 @@ pub fn create_erosion_images(images: &mut Assets<Image>, size: UVec2) -> Erosion
         ao: add(images, TextureFormat::R16Float),
         ao_temp: add(images, TextureFormat::R16Float),
         water: add(images, TextureFormat::Rgba16Float),
+        water_surface: add(images, TextureFormat::Rgba32Float),
+        water_velocity: add(images, TextureFormat::Rgba32Float),
         terrain_edit: images.add(empty_terrain_edit_image(size)),
+    }
+}
+
+/// A bevy_fft [`WaterHeightfield`](bevy_fft::water::WaterHeightfield) over the erosion's water,
+/// for terrain drawn on a plane of `size` world units centred on the origin, displaced by
+/// `height_scale` world units per height unit (see [`TerrainExtension`]). bevy_fft's
+/// `WaterSurfaceMaterial` then draws the lakes, rivers and ocean. Add `bevy_fft::water::WaterPlugin`
+/// and, with no FFT ocean, insert `bevy_fft::water::WaterLodClear`.
+pub fn water_heightfield(
+    images: &ErosionImages,
+    map_size: UVec2,
+    size: f32,
+    height_scale: f32,
+) -> bevy_fft::water::WaterHeightfield {
+    let cell_size = size / map_size.x as f32;
+    bevy_fft::water::WaterHeightfield {
+        cell_size,
+        blend_cells: 1.0,
+        height_scale,
+        velocity_scale: cell_size,
+        ..bevy_fft::water::WaterHeightfield::new(
+            images.water_surface.clone(),
+            images.water_velocity.clone(),
+            map_size,
+        )
     }
 }
 
@@ -508,6 +543,9 @@ impl MaterialExtension for TerrainExtension {
     }
     fn fragment_shader() -> ShaderRef {
         TERRAIN_SHADER.into()
+    }
+    fn prepass_vertex_shader() -> ShaderRef {
+        TERRAIN_PREPASS_SHADER.into()
     }
 }
 
@@ -1229,8 +1267,8 @@ struct ErosionPipeline {
     pipeline_blur_h: CachedComputePipelineId,
     pipeline_blur_v: CachedComputePipelineId,
     /// `water.wgsl`: clear, flux, depth, erode, advect, copy, the bevy_fft solver's export,
-    /// gather and import, and apply (the staged erosion).
-    pipelines_water: [CachedComputePipelineId; 10],
+    /// gather and import, apply (the staged erosion), and the surface for bevy_fft's renderer.
+    pipelines_water: [CachedComputePipelineId; 11],
     /// `water_bed.wgsl`: init, tau, prior, smooth, write, dilate, grade.
     pipelines_water_bed: [CachedComputePipelineId; 7],
     layout_water_morpho: BindGroupLayoutDescriptor,
@@ -1490,6 +1528,9 @@ fn init_erosion_pipeline(
                 // bevy_fft solver bed and depth, and its cell-centred velocity.
                 texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::ReadWrite),
                 texture_2d(TextureSampleType::Float { filterable: false }),
+                // Water surface and velocity for bevy_fft's heightfield.
+                texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly),
+                texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly),
             ),
         ),
     );
@@ -1568,6 +1609,7 @@ fn init_erosion_pipeline(
         "swe_gather",
         "swe_import",
         "water_apply",
+        "water_surface",
     ]
     .map(|entry| {
         compute(
@@ -1946,6 +1988,8 @@ fn prepare_erosion_bind_groups(
         Some(view_ao),
         Some(view_ao_temp),
         Some(view_water),
+        Some(view_water_surface),
+        Some(view_water_velocity),
         Some(view_terrain_edit),
     ) = (
         gpu_images.get(&images.height),
@@ -1955,6 +1999,8 @@ fn prepare_erosion_bind_groups(
         gpu_images.get(&images.ao),
         gpu_images.get(&images.ao_temp),
         gpu_images.get(&images.water),
+        gpu_images.get(&images.water_surface),
+        gpu_images.get(&images.water_velocity),
         gpu_images.get(&images.terrain_edit),
     )
     else {
@@ -2163,6 +2209,8 @@ fn prepare_erosion_bind_groups(
                 &buffers.water.swe.source,
                 &buffers.water.swe.textures.bed_water,
                 &buffers.water.swe.textures.velocity,
+                &view_water_surface.texture_view,
+                &view_water_velocity.texture_view,
             )),
         ),
         blit: render_device.create_bind_group(
@@ -2241,6 +2289,8 @@ enum FrameCmd {
         offset: u32,
         /// Recompute ambient occlusion (see [`AO_INTERVAL`]).
         ao: bool,
+        /// Also refresh the water surface for bevy_fft's renderer (`water_surface`).
+        water: bool,
     },
 }
 
@@ -2495,26 +2545,13 @@ fn plan_erosion_frame(
         state.water_active = true;
     }
     let refining = state.refine_left > 0;
-    if finest_ready && (clear || stroke || refining || (state.water_active && !sim.paused)) {
-        let steps = if refining {
-            // Fast-forward: a fixed number of steps per frame, whatever the frame time.
-            let steps = state.refine_left.min(MAX_REFINE_STEPS);
-            state.refine_left -= steps;
-            steps
-        } else if sim.paused {
-            // One step so a brush stroke still shows.
-            1
-        } else {
-            state.water_time += water.dt;
-            let steps = ((state.water_time / WATER_STEP) as u32).min(MAX_WATER_STEPS);
-            state.water_time = (state.water_time - steps as f32 * WATER_STEP).min(WATER_STEP);
-            steps
-        };
-        let sea_level = if params.use_outflow != 0 {
-            params.outflow_sea_level
-        } else {
-            0.0
-        };
+    let sea_level = if params.use_outflow != 0 {
+        params.outflow_sea_level
+    } else {
+        0.0
+    };
+    // Written on every finest-level frame: the display's `water_surface` reads it too.
+    if finest_ready {
         let brush = stroke.then(|| Spring {
             center: water.center,
             radius: water.radius,
@@ -2544,6 +2581,22 @@ fn plan_erosion_frame(
             sources,
         });
         buffers.water.params.write_buffer(&render_device, &queue);
+    }
+    if finest_ready && (clear || stroke || refining || (state.water_active && !sim.paused)) {
+        let steps = if refining {
+            // Fast-forward: a fixed number of steps per frame, whatever the frame time.
+            let steps = state.refine_left.min(MAX_REFINE_STEPS);
+            state.refine_left -= steps;
+            steps
+        } else if sim.paused {
+            // One step so a brush stroke still shows.
+            1
+        } else {
+            state.water_time += water.dt;
+            let steps = ((state.water_time / WATER_STEP) as u32).min(MAX_WATER_STEPS);
+            state.water_time = (state.water_time - steps as f32 * WATER_STEP).min(WATER_STEP);
+            steps
+        };
         let bed_load = &water.bed_load;
         let mor_fac = if refining {
             bed_load.morph_factor.max(0.0)
@@ -2685,6 +2738,7 @@ fn plan_erosion_frame(
             set: state.cascade.current,
             offset: buffers.params.push(&level_erode_params(params, &level, 0)),
             ao,
+            water: finest_ready,
         });
     } else if buffers.params.is_empty() {
         // Keep a valid binding around for bind group creation.
@@ -2837,6 +2891,7 @@ fn erosion_compute(
                     p_gather,
                     p_import,
                     p_apply,
+                    _,
                 ] = pipes.pipelines_water.map(get);
                 let (
                     Some(p_flux),
@@ -2897,7 +2952,9 @@ fn erosion_compute(
                         }
                     }
                 }
-                if steps > 0 && let (Some(d), Some(h)) = (p_discharge, p_helical) {
+                if steps > 0
+                    && let (Some(d), Some(h)) = (p_discharge, p_helical)
+                {
                     pass.set_bind_group(0, &groups.water_morpho[set], &[]);
                     for p in [d, h] {
                         pass.set_pipeline(p);
@@ -2971,7 +3028,12 @@ fn erosion_compute(
                     pass.dispatch_workgroups(gx, gy, 1);
                 }
             }
-            FrameCmd::Display { set, offset, ao } => {
+            FrameCmd::Display {
+                set,
+                offset,
+                ao,
+                water,
+            } => {
                 let (gx, gy) = dispatch_grid(params.map_size);
                 let erosion = &groups.erosion[set];
                 let passes = [
@@ -2987,6 +3049,13 @@ fn erosion_compute(
                         pass.set_bind_group(1, group1, &[]);
                         pass.dispatch_workgroups(gx, gy, 1);
                     }
+                }
+                // The surface follows the terrain and the ocean even while no water moves.
+                if water && let Some(p) = get(pipes.pipelines_water[10]) {
+                    pass.set_pipeline(p);
+                    pass.set_bind_group(0, &groups.water[set], &[]);
+                    pass.set_bind_group(1, &groups.water_out, &[]);
+                    pass.dispatch_workgroups(gx, gy, 1);
                 }
             }
         }
@@ -3184,7 +3253,11 @@ mod tests {
         while cascade.level + 1 < levels.len() {
             let mut steps = Vec::new();
             cascade.advance(7, true, false, &mut steps);
-            assert!(work(&steps) < 7.0 + 1.0, "frame {frames} did {} passes of work", work(&steps));
+            assert!(
+                work(&steps) < 7.0 + 1.0,
+                "frame {frames} did {} passes of work",
+                work(&steps)
+            );
             frames += 1;
         }
         assert!(frames > 1, "the coarse levels ran in one frame");
