@@ -1102,3 +1102,238 @@ fn discharge_matches_ktt() {
     assert!(on_river > 0.5, "the spring's water does not follow KTT's rivers");
     assert!(d.iter().all(|v| v.is_finite()), "discharge holds NaN");
 }
+
+/// Straight channel along x, `width` texels wide, falling `slope` per texel toward +x, between
+/// walls 0.1 high.
+fn flume(slope: f32, width: f32) -> impl Fn(u32, u32) -> f32 {
+    move |x, y| {
+        let floor = 0.02 + slope * (N - 1 - x) as f32;
+        if (y as f32 + 0.5 - N as f32 / 2.0).abs() < width / 2.0 {
+            floor
+        } else {
+            floor + 0.1
+        }
+    }
+}
+
+struct FlumeRun {
+    before: Vec<f32>,
+    after: Vec<f32>,
+    water: Vec<Water>,
+}
+
+/// Live bed load on a flume fed by a spring at its top, for `seconds`.
+fn run_flume(bed: impl Fn(u32, u32) -> f32, radius: f32, rate: f32, seconds: f32) -> FlumeRun {
+    let mut h = Harness::new(WaterSolver::Swe, bed);
+    {
+        let mut water = h.water();
+        water.bed_load.live = true;
+        water.springs.push(Spring {
+            center: Vec2::new(12.0, N as f32 / 2.0),
+            radius,
+            rate,
+        });
+    }
+    // Let the flow reach the far end before the bed starts to count.
+    h.water().bed_load.live = false;
+    h.run(6.0);
+    let before = h.read_heights();
+    h.water().bed_load.live = true;
+    h.run(seconds);
+    let water = h.read_water();
+    let after = h.read_heights();
+    assert!(
+        after.iter().all(|v| v.is_finite()),
+        "heights hold NaN or infinity"
+    );
+    FlumeRun {
+        before,
+        after,
+        water,
+    }
+}
+
+/// Dominant period (texels) of `v` after removing its linear trend, that period's share of the
+/// power, the share of periods 8 to 40, and the RMS of the detrended profile.
+fn dominant_period(v: &[f32]) -> (f32, f32, f32, f32) {
+    let n = v.len();
+    let xm = (n as f32 - 1.0) / 2.0;
+    let ym = v.iter().sum::<f32>() / n as f32;
+    let (mut sxy, mut sxx) = (0.0, 0.0);
+    for (i, y) in v.iter().enumerate() {
+        sxy += (i as f32 - xm) * (y - ym);
+        sxx += (i as f32 - xm).powi(2);
+    }
+    let b = sxy / sxx;
+    let r: Vec<f32> = v
+        .iter()
+        .enumerate()
+        .map(|(i, y)| y - ym - b * (i as f32 - xm))
+        .collect();
+    let mut best = (0.0, 0.0);
+    let mut total = 0.0;
+    let mut band = 0.0;
+    for k in 1..n / 2 {
+        let (mut re, mut im) = (0.0f32, 0.0f32);
+        for (j, c) in r.iter().enumerate() {
+            let a = 2.0 * PI * (k * j) as f32 / n as f32;
+            re += c * a.cos();
+            im += c * a.sin();
+        }
+        let p = re * re + im * im;
+        total += p;
+        if (8.0..=40.0).contains(&(n as f32 / k as f32)) {
+            band += p;
+        }
+        if p > best.1 {
+            best = (n as f32 / k as f32, p);
+        }
+    }
+    let total = total.max(f32::MIN_POSITIVE);
+    let rms = (r.iter().map(|v| v * v).sum::<f32>() / n as f32).sqrt();
+    (best.0, best.1 / total, band / total, rms)
+}
+
+/// Bed load on a gentle and a steep flume: the gentle bed lowers without grid grooves; the steep
+/// one, in supercritical flow, grows steps.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn bed_load_on_flumes() {
+    let mid = N / 2;
+    let g = WaterControl::default().gravity;
+    for (name, slope, width) in [
+        ("gentle", 0.0003, 20.0f32),
+        ("steep", 0.004, 20.0),
+        ("narrow", 0.006, 6.0),
+    ] {
+        let seconds = std::env::var("TEST_FLUME_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20.0);
+        // The spring fits inside the channel; narrower channels get a stronger one.
+        let radius = (width / 2.0 - 1.0).min(6.0);
+        let r = run_flume(flume(slope, width), radius, 0.05 * 36.0 / (radius * radius), seconds);
+        let xs = 48..N - 24;
+        let cut: Vec<f32> = xs
+            .clone()
+            .map(|x| r.after[idx(x, mid)] - r.before[idx(x, mid)])
+            .collect();
+        let mean_cut = cut.iter().sum::<f32>() / cut.len() as f32;
+        // Cross-channel unevenness: the cut minus its row mean, RMS over the channel.
+        let mut across = 0.0;
+        let mut count = 0.0;
+        for x in xs.clone() {
+            let row: Vec<f32> = (mid - 6..mid + 6)
+                .map(|y| r.after[idx(x, y)] - r.before[idx(x, y)])
+                .collect();
+            if width < 12.0 {
+                continue;
+            }
+            let m = row.iter().sum::<f32>() / row.len() as f32;
+            for v in &row {
+                across += (v - m).powi(2);
+                count += 1.0;
+            }
+        }
+        let across = (across / count).sqrt();
+        let profile: Vec<f32> = xs.clone().map(|x| r.after[idx(x, mid)]).collect();
+        if std::env::var("TEST_PROFILE").is_ok() {
+            let detrended: Vec<String> = profile
+                .iter()
+                .zip(xs.clone())
+                .step_by(2)
+                .map(|(z, x)| format!("{:.4}", z - r.before[idx(x, mid)]))
+                .collect();
+            println!("{name} bed change along the centreline: {}", detrended.join(" "));
+        }
+        let (period, share, steps, relief) = dominant_period(&profile);
+        // Deepest cell across the channel at the middle (the thalweg wanders between bars).
+        let w = (mid - 10..mid + 10)
+            .map(|y| r.water[idx(N / 2, y)])
+            .max_by(|a, b| a.depth.total_cmp(&b.depth))
+            .unwrap();
+        let hc = w.depth * CELLS_PER_HEIGHT;
+        let froude = w.velocity.length() / (g * hc.max(1e-4)).sqrt();
+        let theta = {
+            let n = WaterControl::default().manning_n;
+            let grain = BedLoad::default().grain;
+            n * n * w.velocity.length().powi(2) / (grain * hc.max(1e-4).cbrt())
+        };
+        println!(
+            "{name} flume: depth {:.2} cells, speed {:.1}, Froude {froude:.2}, Shields {theta:.3}; \
+             mean cut {mean_cut:.5}, cross-channel rms {across:.5}, long profile period {period:.1} \
+             ({:.0}% of the detrended power, periods 8-40 {:.0}%, relief rms {relief:.4})",
+            hc,
+            w.velocity.length(),
+            100.0 * share,
+            100.0 * steps
+        );
+        // Dry ground far from the channel is left alone.
+        let dry = (0..N)
+            .flat_map(|x| (0..mid - 40).map(move |y| idx(x, y)))
+            .map(|i| (r.after[i] - r.before[i]).abs())
+            .fold(0.0f32, f32::max);
+        assert_eq!(dry, 0.0, "{name}: dry ground changed");
+        match name {
+            "gentle" => assert!(across < 0.0005, "grooves across the gentle flume ({across})"),
+            "narrow" => assert!(
+                steps > 0.5 && relief > 0.002,
+                "no steps on the steep narrow flume"
+            ),
+            _ => {}
+        }
+        if let Ok(dir) = std::env::var("TEST_IMAGE_DIR") {
+            let d: Vec<f32> = r.after.iter().zip(&r.before).map(|(a, b)| a - b).collect();
+            let m = d.iter().fold(1e-6f32, |a, b| a.max(b.abs()));
+            write_bmp(&format!("{dir}/flume_{name}_cut.bmp"), &d, N as usize, N as usize, -m, m, 2);
+            let depth: Vec<f32> = r.water.iter().map(|w| w.depth).collect();
+            let dm = depth.iter().fold(1e-6f32, |a, b| a.max(*b));
+            write_bmp(&format!("{dir}/flume_{name}_depth.bmp"), &depth, N as usize, N as usize, 0.0, dm, 2);
+        }
+    }
+}
+
+/// A steep flume running into a closed basin: bed load is conserved (nothing reaches the map
+/// border) and drops where the jet slows, building a bar at the mouth.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn bed_load_conserves_and_builds_a_delta() {
+    let mouth = 170u32;
+    let basin = move |x: u32, y: u32| {
+        let dy = (y as f32 + 0.5 - N as f32 / 2.0).abs();
+        if (mouth..mouth + 60).contains(&x) && dy < 40.0 {
+            0.02
+        } else if x < mouth && dy < 6.0 {
+            0.06 + 0.002 * (mouth - x) as f32
+        } else {
+            0.5
+        }
+    };
+    let r = run_flume(basin, 5.0, 0.07, 30.0);
+    let dh: Vec<f32> = r.after.iter().zip(&r.before).map(|(a, b)| a - b).collect();
+    let net: f32 = dh.iter().sum();
+    let moved: f32 = dh.iter().map(|v| v.abs()).sum::<f32>() / 2.0;
+    let mid = N / 2;
+    let near: f32 = (mouth..mouth + 15)
+        .flat_map(|x| (mid - 8..mid + 8).map(move |y| (x, y)))
+        .map(|(x, y)| dh[idx(x, y)])
+        .sum::<f32>()
+        / (15.0 * 16.0);
+    let far: f32 = (mouth + 40..mouth + 55)
+        .flat_map(|x| (mid - 8..mid + 8).map(move |y| (x, y)))
+        .map(|(x, y)| dh[idx(x, y)])
+        .sum::<f32>()
+        / (15.0 * 16.0);
+    println!(
+        "delta: moved {moved:.4}, net {net:.5} ({:.2}%), mean change at the mouth {near:.5}, \
+         far in the basin {far:.5}",
+        100.0 * net / moved.max(1e-9)
+    );
+    if let Ok(dir) = std::env::var("TEST_IMAGE_DIR") {
+        let m = dh.iter().fold(1e-6f32, |a, b| a.max(b.abs()));
+        write_bmp(&format!("{dir}/delta_change.bmp"), &dh, N as usize, N as usize, -m, m, 2);
+    }
+    assert!(moved > 0.05, "the flow moved no bed ({moved})");
+    assert!(net.abs() < 0.02 * moved, "bed volume changed by {net} of {moved} moved");
+    assert!(near > 2.0 * far.max(0.0) && near > 0.0, "no bar at the mouth");
+}

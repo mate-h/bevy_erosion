@@ -184,20 +184,26 @@ fn morpho_helical(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // Bed load (cells² per second) through the face from `a` to its neighbour `a + e`, along `e`.
+// Its size and direction come from the upwind cell (first-order upwind Exner): averaging the two
+// cells instead is a central scheme, which grows two-texel oscillations in the bed.
 fn face_load(a: vec2<i32>, e: vec2<i32>) -> f32 {
     let b = a + e;
     if (!inside(b)) { return 0.0; }
     let ha = depth[widx(a)];
     let hb = depth[widx(b)];
     if (min(ha, hb) < WET_DEPTH) { return 0.0; }
-    let hf = 0.5 * (ha + hb);
+    let ua = flow(a);
+    let ub = flow(b);
+    let downwind = dot(ua + ub, vec2<f32>(e)) >= 0.0;
+    let up = select(b, a, downwind);
+    let h = select(hb, ha, downwind);
+    let u = select(ub, ua, downwind);
     // Thin sheet flow keeps the capacity model of `water_erode`.
-    let w = smoothstep(0.5 * FULL_DEPTH, FULL_DEPTH, hf);
+    let w = smoothstep(0.5 * FULL_DEPTH, FULL_DEPTH, h);
     if (w <= 0.0) { return 0.0; }
-    let u = 0.5 * (flow(a) + flow(b));
     let speed = length(u);
     if (speed < MIN_SPEED) { return 0.0; }
-    let h_cells = hf * CELLS_PER_HEIGHT;
+    let h_cells = h * CELLS_PER_HEIGHT;
     let n = params.manning_n;
     let theta = n * n * speed * speed / (max(params.grain, 1e-6) * pow(h_cells, 1.0 / 3.0));
     let excess = theta - params.critical_shields;
@@ -205,9 +211,11 @@ fn face_load(a: vec2<i32>, e: vec2<i32>) -> f32 {
     let q = params.bed_load_k * pow(excess, 1.5) * w;
 
     // Direction: along the flow, turned toward the inner bank by the helical flow.
-    let slot = params.parity;
-    let s = 0.5 * (helical(a, slot) + helical(b, slot));
-    let delta = clamp(atan(params.helical_strength * s), -MAX_DEFLECTION, MAX_DEFLECTION);
+    let delta = clamp(
+        atan(params.helical_strength * helical(up, params.parity)),
+        -MAX_DEFLECTION,
+        MAX_DEFLECTION,
+    );
     let c = cos(delta);
     let sn = sin(delta);
     let along = u / speed;
@@ -215,18 +223,16 @@ fn face_load(a: vec2<i32>, e: vec2<i32>) -> f32 {
 
     // Talmon: bed load slides down the cross-slope only, so the long profile keeps its steps.
     let perp = vec2<i32>(abs(e.y), abs(e.x));
-    let za = terrain(a);
-    let zb = terrain(b);
     let ga = terrain(clamp_map(a + perp)) - terrain(clamp_map(a - perp));
     let gb = terrain(clamp_map(b + perp)) - terrain(clamp_map(b - perp));
-    let normal_grad = zb - za;
+    let normal_grad = terrain(b) - terrain(a);
     let tangent_grad = 0.25 * (ga + gb);
     let grad = (vec2<f32>(e) * normal_grad + vec2<f32>(perp) * tangent_grad) * CELLS_PER_HEIGHT;
     let across = vec2<f32>(-dir.y, dir.x);
     let pull = q / (max(params.slope_effect, 1e-3) * sqrt(theta)) * dot(grad, across);
     let load = q * dir - pull * across;
 
-    var qn = dot(load, vec2<f32>(e));
+    let qn = dot(load, vec2<f32>(e));
     let most = MAX_FACE_CUT * min(ha, hb) * CELLS_PER_HEIGHT
         / max(params.mor_fac * params.step_seconds, 1e-9);
     return clamp(qn, -most, most);

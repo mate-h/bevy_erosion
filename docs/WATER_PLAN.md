@@ -380,7 +380,25 @@ Add four checks:
 - a river entering a lake keeps a visible jet a few widths past the mouth (velocity readback);
 - Raise or Lower under a lake moves the bed without resetting the water.
 
-### 4b. Bed load and Exner
+### 4b. Bed load and Exner (done)
+
+`assets/water_morpho.wgsl` (`morpho_flux`, `morpho_exner`, after every water step while
+`BedLoad::live`). Differences from the plan below:
+- Each face takes its bed load from the upwind cell (first-order upwind Exner); averaging the
+  two cells is a central scheme and grows two-texel oscillations.
+- The per-step clamp limits each face's transfer to 2% of the shallower side's depth, which keeps
+  conservation exact.
+
+Measured (`bed_load_on_flumes`, `bed_load_conserves_and_builds_a_delta`, 20–30 s live):
+- closed basin: net bed change 0.12% of the volume moved;
+- gentle flume (Froude 0.4, Shields 0.09): the bed barely moves, cross-channel RMS 0.00008;
+- steep 20-texel flume (Froude about 1.2): alternate bars with a winding thalweg, not
+  axis-aligned;
+- steep 6-texel flume (Froude about 1.5): a sawtooth long profile, steps 14–20 texels long with
+  0.0066 RMS relief;
+- dry ground is unchanged; the demo frame costs about 0.4 ms more (7.7 against 7.3 ms in
+  `--simple`).
+
 
 New shader `assets/water_morpho.wgsl`, run after each flow step (or every k steps). It uses
 non-dimensional versions of `riverbed.typ` stage 4:
