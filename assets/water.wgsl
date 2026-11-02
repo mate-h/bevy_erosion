@@ -105,12 +105,19 @@ fn is_ocean(h: f32) -> bool {
 
 const DIRS = array<vec2<i32>, 4>(vec2<i32>(-1, 0), vec2<i32>(1, 0), vec2<i32>(0, -1), vec2<i32>(0, 1));
 
-// Remove all water.
+// Remove all water; its suspended sediment settles.
 @compute @workgroup_size(8, 8, 1)
 fn water_clear(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec2<i32>(gid.xy);
     if (!inside(p)) { return; }
     let i = widx(p);
+    // The suspended load settles where it is instead of vanishing with the water.
+    let s = sediment[i];
+    if (s > 0.0) {
+        let g = gidx(p);
+        let h = f32(atomicLoad(&height[g])) / HEIGHT_SCALE + s;
+        atomicStore(&height[g], u32(round(h * HEIGHT_SCALE)));
+    }
     depth[i] = 0.0;
     flux[i] = vec4<f32>(0.0);
     sediment[i] = 0.0;

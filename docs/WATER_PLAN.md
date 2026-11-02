@@ -621,7 +621,17 @@ factor of 1.5 of 1 depending on the terrain.
 - Verify: on a spring-fed valley, KTT's flow and the solver's discharge peak in the same cells.
   Report their correlation.
 
-### 6b. Rain feeds the water
+### 6b. Rain feeds the water (done)
+
+- `mx`/`my` are one interleaved buffer `m` now (erode pass, level resample, `water_morpho.wgsl`),
+  which freed the erode pass's eighth binding for `splat` (atomic `u32`, two values per cell,
+  fixed point 1e-8, shared by both work sets).
+- Brush trails on the finest level add `WaterControl::rain_water` (Rain Water slider, default
+  0.0002 per step) to `splat` at every step; `water_splat` (`assets/water_splat.wgsl`, first in
+  each water frame) adds it to the depth and to the solver's state, except over the ocean.
+- `rain_wets_the_trails`: one second of the default rain brush leaves 3.04 of water at 30 fps and
+  3.10 at 120 fps (the brush already scales its trail count with the frame time).
+
 
 The open item from Phase 1.5: rain trails leave water along their path.
 - The erode pass already binds 8 storage buffers. Free one by packing `mx` and `my` into a
@@ -639,7 +649,20 @@ The open item from Phase 1.5: rain trails leave water along their path.
   exist now instead of carving parallel channels.
 - Verify: after a restart with a river present, trail density overlaps the wet channel.
 
-### 6d. One sediment budget
+### 6d. One sediment budget (done)
+
+- While the water runs (`ErodeParams::water_handoff`), a trail on the finest level that reaches
+  a cell with `masks.y` > 0.5 adds its carried sediment to `splat` and ends; `water_splat` makes
+  it suspended load (dropped over the ocean, as KTT's outflow drops it). Without water the
+  trails behave as before, so nothing piles up in `splat`.
+- Clear Water settles the suspended load in place.
+- `water_record` (last in each water frame) adds the frame's height change to KTT's deposition
+  (and cuts to its erosion buffer), in whole 1e-5 quanta with the remainder carried over.
+- `trail_sediment_reaches_the_lake`: of 0.042 the rain trails carved above a lake, 0.027 settles
+  in the lake and shows as loose sediment in the analysis view; Clear Water settles the
+  suspended rest instead of deleting it. (The water's capacity model deposits the handed load
+  quickly, so it builds near the shore of a still lake; bed load then moves what sits in flow.)
+
 
 - Trails that end in water hand their remaining sediment to the water's suspended load, or to
   Exner's bed load once 4b exists. It then builds deltas in lakes instead of a pile at the

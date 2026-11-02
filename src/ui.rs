@@ -144,6 +144,7 @@ enum ErosionSliderFieldKind {
     BedRiverDepth,
     BedRiverWidth,
     BedChannelDischarge,
+    WaterRainWater,
     BedLoadGrain,
     BedLoadK,
     BedLoadCriticalShields,
@@ -228,6 +229,8 @@ impl ErosionSliderFieldKind {
             Self::BedRiverDepth => water.bed.river_depth = value,
             Self::BedRiverWidth => water.bed.river_width = value,
             Self::BedChannelDischarge => water.bed.channel_discharge = value,
+            // Shown per thousand trail steps.
+            Self::WaterRainWater => water.rain_water = value / 1000.0,
             Self::BedLoadGrain => water.bed_load.grain = value,
             Self::BedLoadK => water.bed_load.k = value,
             Self::BedLoadCriticalShields => water.bed_load.critical_shields = value,
@@ -651,6 +654,8 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         @slider_row("Evaporation %/s", 0.0, 10.0, water.evaporation * 100.0, ErosionSliderFieldKind::WaterEvaporation)
                         --
                         @slider_row("Rainfall ‰/s", 0.0, 1.0, water.rainfall * 1000.0, ErosionSliderFieldKind::WaterRainfall)
+                        --
+                        @slider_row("Rain Water (per 1000 trail steps)", 0.0, 2.0, water.rain_water * 1000.0, ErosionSliderFieldKind::WaterRainWater)
                         --
                         @toggle_row("Momentum Flow (SWE)", ToggleKind::MomentumFlow)
                         --

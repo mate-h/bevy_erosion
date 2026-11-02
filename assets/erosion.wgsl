@@ -7,6 +7,8 @@
 
 const HEIGHT_SCALE: f32 = 1000000.0;
 const DEPOSITION_SCALE: f32 = 100000.0;  // for i32 fixed-point
+// Fixed point of `splat` (must match `water_splat.wgsl`).
+const SPLAT_SCALE: f32 = 100000000.0;
 // Compute_Erosion binding transforms (see `ref/node_tree.json`)
 const TRAIL_DENSITY_SCALE: f32 = 0.1;   // Trail_Density = Erosion_Amount * 0.1
 const RIVER_SCARRING_SCALE: f32 = 0.25; // River_Scarring = River_Scale * 0.25
@@ -90,6 +92,10 @@ struct ErodeParams {
     spawn_center: vec2<f32>,
     spawn_radius: f32,
     spawn_count: u32,
+    // Bevy-only: water each brush trail leaves per step on the finest level (`splat`).
+    rain_water: f32,
+    // Bevy-only: the water solver is running, so trails that reach water hand it their load.
+    water_handoff: u32,
 }
 
 @group(0) @binding(1) var<uniform> params: ErodeParams;
@@ -98,11 +104,15 @@ struct ErodeParams {
 @group(0) @binding(2) var<storage, read_write> flow_buffer: array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read_write> deposition: array<atomic<i32>>;  // loose sediment per cell (fixed-point)
 @group(0) @binding(4) var<storage, read_write> erosion_buffer: array<atomic<u32>>;
-// River momentum `__m` (enabled when do_rivers != 0). Without momentum coherence only `mx` is used,
-// as a scalar water accumulation (KTT compiles without HAS_my).
+// River momentum `__m` (enabled when do_rivers != 0), two floats per cell (x at 2i, y at 2i + 1),
+// packed into one buffer to keep a binding free for `splat`. Without momentum coherence only x is
+// used, as a scalar water accumulation (KTT compiles without HAS_my).
 // Stored as f32 bits (KTT `__m` is a float field); adds go through a compare-exchange loop.
-@group(0) @binding(5) var<storage, read_write> mx: array<atomic<u32>>;
-@group(0) @binding(6) var<storage, read_write> my: array<atomic<u32>>;
+@group(0) @binding(5) var<storage, read_write> m: array<atomic<u32>>;
+// Handed to the water on the finest level (`water_splat.wgsl`), two fixed-point values per cell
+// (`SPLAT_SCALE`): water rain trails leave along their path (2i), and the sediment of trails that
+// end in water (2i + 1).
+@group(0) @binding(6) var<storage, read_write> splat: array<atomic<u32>>;
 // Per-cell masks, packed to stay within 8 storage buffers per stage:
 //   x = `__Softness_Mask` (scales Rock_Softness)
 //   y = `__Outflow` (cells that drain away: no erosion, deposition or uplift)
@@ -240,23 +250,23 @@ fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&flow_buffer[idx], 0u);
     atomicStore(&deposition[idx], 0i);
     atomicStore(&erosion_buffer[idx], 0u);
-    atomicStore(&mx[idx], 0u);
-    atomicStore(&my[idx], 0u);
+    atomicStore(&m[2u * idx], 0u);
+    atomicStore(&m[2u * idx + 1u], 0u);
 
-    var m = vec4<f32>(1.0, 0.0, 1.0, 1.0);
+    var cell_mask = vec4<f32>(1.0, 0.0, 1.0, 1.0);
     if (params.use_softness_mask != 0u) {
-        m.x = mask_noise(uv, MASK_SOFTNESS_SEED);
+        cell_mask.x = mask_noise(uv, MASK_SOFTNESS_SEED);
     }
     if (params.use_outflow != 0u) {
-        m.y = outflow_source(gid.xy, hval);
+        cell_mask.y = outflow_source(gid.xy, hval);
     }
     if (params.use_erosion_mask != 0u) {
-        m.z = mask_noise(uv, MASK_ERODE_SEED);
+        cell_mask.z = mask_noise(uv, MASK_ERODE_SEED);
     }
     if (params.use_uplift_map != 0u) {
-        m.w = mask_noise(uv, MASK_UPLIFT_SEED);
+        cell_mask.w = mask_noise(uv, MASK_UPLIFT_SEED);
     }
-    masks[idx] = m;
+    masks[idx] = cell_mask;
     layers[idx] = vec2<f32>(bedrock, 0.0);
 }
 
@@ -287,19 +297,19 @@ fn load_deposition(p: vec2<i32>) -> f32 {
 
 fn load_mx(p: vec2<i32>) -> f32 {
     let size = i32(params.map_size.x);
-    return bitcast<f32>(atomicLoad(&mx[u32(p.y * size + p.x)]));
+    return bitcast<f32>(atomicLoad(&m[2u * u32(p.y * size + p.x)]));
 }
 
 fn load_my(p: vec2<i32>) -> f32 {
     let size = i32(params.map_size.x);
-    return bitcast<f32>(atomicLoad(&my[u32(p.y * size + p.x)]));
+    return bitcast<f32>(atomicLoad(&m[2u * u32(p.y * size + p.x) + 1u]));
 }
 
 // Float atomic add via compare-exchange on the bit pattern.
 fn add_mx(idx: u32, val: f32) {
-    var old = atomicLoad(&mx[idx]);
+    var old = atomicLoad(&m[2u * idx]);
     loop {
-        let r = atomicCompareExchangeWeak(&mx[idx], old, bitcast<u32>(bitcast<f32>(old) + val));
+        let r = atomicCompareExchangeWeak(&m[2u * idx], old, bitcast<u32>(bitcast<f32>(old) + val));
         if (r.exchanged) {
             break;
         }
@@ -308,9 +318,9 @@ fn add_mx(idx: u32, val: f32) {
 }
 
 fn add_my(idx: u32, val: f32) {
-    var old = atomicLoad(&my[idx]);
+    var old = atomicLoad(&m[2u * idx + 1u]);
     loop {
-        let r = atomicCompareExchangeWeak(&my[idx], old, bitcast<u32>(bitcast<f32>(old) + val));
+        let r = atomicCompareExchangeWeak(&m[2u * idx + 1u], old, bitcast<u32>(bitcast<f32>(old) + val));
         if (r.exchanged) {
             break;
         }
@@ -319,11 +329,11 @@ fn add_my(idx: u32, val: f32) {
 }
 
 fn store_mx(idx: u32, val: f32) {
-    atomicStore(&mx[idx], bitcast<u32>(val));
+    atomicStore(&m[2u * idx], bitcast<u32>(val));
 }
 
 fn store_my(idx: u32, val: f32) {
-    atomicStore(&my[idx], bitcast<u32>(val));
+    atomicStore(&m[2u * idx + 1u], bitcast<u32>(val));
 }
 
 // Reference hash functions (compute_erosion.cl)
@@ -405,9 +415,9 @@ fn bilinear_sample_erosion(pos: vec2<f32>) -> f32 {
 }
 
 fn river_momentum_at_idx(idx: u32) -> f32 {
-    let x = bitcast<f32>(atomicLoad(&mx[idx]));
+    let x = bitcast<f32>(atomicLoad(&m[2u * idx]));
     if (params.momentum_coherence > 0.0) {
-        let y = bitcast<f32>(atomicLoad(&my[idx]));
+        let y = bitcast<f32>(atomicLoad(&m[2u * idx + 1u]));
         return length(vec2<f32>(x, y));
     }
     return x;
@@ -609,6 +619,8 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var carry = 0.0;
     var h_current = bilinear_sample_height(p);
+    // On the finest level, trails meet the water bodies (`water_splat.wgsl`).
+    let finest = all(params.map_size == params.padded_size);
 
     for (var step = 0; step < flow_steps; step = step + 1) {
         let cell = vec2<i32>(clamp(i32(p.x), 0, res_x - 1), clamp(i32(p.y), 0, res_y - 1));
@@ -620,6 +632,20 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
         let h = f32(h_bits) / HEIGHT_SCALE;
         let cell_masks = masks[idx];
         let cell_layers = layers[idx];
+        if (finest) {
+            // Rain trails leave water along their path, so the brush wets what it carves.
+            if (brush && params.rain_water > 0.0) {
+                atomicAdd(&splat[2u * idx], u32(params.rain_water * SPLAT_SCALE));
+            }
+            // A trail that reaches water (or the ocean) hands its load to it and ends: the water
+            // carries it on and drops it where it slows, instead of a pile at the shore.
+            if (params.water_handoff != 0u && cell_masks.y > 0.5) {
+                if (carry > 0.0) {
+                    atomicAdd(&splat[2u * idx + 1u], u32(carry * SPLAT_SCALE));
+                }
+                return;
+            }
+        }
         let dep_val = load_deposition(cell);
         var hmin = h;
         var hmax = h;

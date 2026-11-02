@@ -66,15 +66,15 @@ struct MorphoParams {
 // x, y = averaged unit discharge h·u (height units × texels per second), z = averaged depth,
 // w = KTT river discharge in the same units.
 @group(0) @binding(3) var<storage, read_write> discharge: array<vec4<f32>>;
-// KTT river momentum of the finest work set (f32 bits; see `erosion.wgsl`).
-@group(0) @binding(4) var<storage, read> mx: array<u32>;
-@group(0) @binding(5) var<storage, read> my: array<u32>;
+// KTT river momentum of the finest work set, x and y per cell (f32 bits; see `erosion.wgsl`).
+@group(0) @binding(4) var<storage, read> m: array<u32>;
 // Bed load through the +x (x) and +y (y) faces of each cell (cells² per second).
-@group(0) @binding(6) var<storage, read_write> bed_load: array<vec2<f32>>;
+@group(0) @binding(5) var<storage, read_write> bed_load: array<vec2<f32>>;
 // Four floats per cell: helical intensity in two slots (ping-pong), the bed change not yet
-// written to the heights (height units), and a spare.
-@group(0) @binding(7) var<storage, read_write> state: array<f32>;
-@group(0) @binding(8) var<uniform> params: MorphoParams;
+// written to the heights (height units), and the height when the water frame began
+// (`water_splat.wgsl`).
+@group(0) @binding(6) var<storage, read_write> state: array<f32>;
+@group(0) @binding(7) var<uniform> params: MorphoParams;
 
 const DIRS = array<vec2<i32>, 4>(vec2<i32>(-1, 0), vec2<i32>(1, 0), vec2<i32>(0, -1), vec2<i32>(0, 1));
 
@@ -125,11 +125,11 @@ fn morpho_discharge(@builtin(global_invocation_id) gid: vec3<u32>) {
     var d = discharge[i];
     d = vec4<f32>(mix(d.xy, q, a), mix(d.z, h, a), d.w);
     let g = gidx(p);
-    var m = bitcast<f32>(mx[g]);
+    var river = bitcast<f32>(m[2u * g]);
     if (params.ktt_vector != 0u) {
-        m = length(vec2<f32>(m, bitcast<f32>(my[g])));
+        river = length(vec2<f32>(river, bitcast<f32>(m[2u * g + 1u])));
     }
-    d.w = params.ktt_scale * max(m, 0.0);
+    d.w = params.ktt_scale * max(river, 0.0);
     discharge[i] = d;
 }
 

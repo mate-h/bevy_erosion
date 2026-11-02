@@ -54,6 +54,7 @@ struct Water {
 
 struct Harness {
     app: App,
+    fps: f32,
 }
 
 impl Harness {
@@ -103,7 +104,7 @@ impl Harness {
         app.cleanup();
         app.update();
 
-        let mut h = Self { app };
+        let mut h = Self { app, fps: FPS };
         {
             let mut water = h.app.world_mut().resource_mut::<WaterControl>();
             water.solver = solver;
@@ -197,7 +198,7 @@ impl Harness {
     }
 
     fn run(&mut self, seconds: f32) {
-        for _ in 0..(seconds * FPS).round() as u32 {
+        for _ in 0..(seconds * self.fps).round() as u32 {
             self.frame();
         }
     }
@@ -268,6 +269,15 @@ impl Harness {
     fn read_discharge(&mut self) -> Vec<Vec4> {
         let handle = self.app.world().resource::<WaterFields>().discharge.clone();
         self.read_vec4(handle)
+    }
+
+    /// Simulated frames per second from now on.
+    fn set_fps(&mut self, fps: f32) {
+        self.fps = fps;
+        self.app
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+                1.0 / fps,
+            )));
     }
 
     fn pause(&mut self, paused: bool) {
@@ -1448,5 +1458,117 @@ fn refine_fast_forwards_the_bed() {
     assert!(
         refine_moved > 5.0 * live_moved,
         "refining did not fast-forward the bed"
+    );
+}
+
+/// Hold the rain brush over `center` for `seconds` at `fps`, as the demo does each frame.
+fn rain(h: &mut Harness, center: Vec2, seconds: f32, fps: f32) {
+    h.set_fps(fps);
+    let brush = bevy_erosion::brush::WaterBrush::default();
+    for _ in 0..(seconds * fps).round() as u32 {
+        *h.app.world_mut().resource_mut::<BrushStroke>() = brush.rain_stroke(center, 1.0 / fps);
+        h.frame();
+    }
+    *h.app.world_mut().resource_mut::<BrushStroke>() = BrushStroke::default();
+    h.set_fps(FPS);
+}
+
+/// Water and sediment in the water texture: total depth and total suspended load.
+fn water_totals(water: &[Water], sediment: &[f32]) -> (f32, f32) {
+    (water.iter().map(|w| w.depth).sum(), sediment.iter().sum())
+}
+
+/// The rain brush leaves water along its trails, the same amount at any frame rate.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn rain_wets_the_trails() {
+    let mut volumes = Vec::new();
+    for fps in [30.0, 120.0] {
+        let mut h = Harness::new(WaterSolver::Swe, bowl(0.0));
+        rain(&mut h, Vec2::new(N as f32 / 2.0 + 60.0, N as f32 / 2.0), 1.0, fps);
+        h.run(0.5);
+        let water = h.read_water();
+        volumes.push(water.iter().map(|w| w.depth).sum::<f32>());
+    }
+    println!("rain water: {:.4} at 30 fps, {:.4} at 120 fps", volumes[0], volumes[1]);
+    assert!(volumes[0] > 0.01, "the rain brush left no water");
+    assert!(
+        (volumes[0] - volumes[1]).abs() < 0.1 * volumes[0],
+        "the water rain leaves depends on the frame rate"
+    );
+}
+
+/// Trails that reach a lake hand it their sediment, which settles in the lake; Clear Water
+/// settles what is still suspended instead of deleting it.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn trail_sediment_reaches_the_lake() {
+    let mut h = Harness::new(WaterSolver::Swe, bowl(0.0));
+    {
+        let mut params = h.app.world_mut().resource_mut::<ErodeParams>();
+        // Trails carve again (the harness turns erosion off to keep its beds).
+        params.erosion_strength = 0.5;
+    }
+    h.water().rain_water = 0.0;
+    // The capacity model keeps some of the load suspended for Clear Water to settle.
+    h.water().sediment_capacity = WaterControl::default().sediment_capacity;
+    h.pour(Vec2::splat(N as f32 / 2.0), 40.0, 0.3, 1.0);
+    h.run(4.0);
+    let heights0 = h.read_heights();
+    let lake: Vec<bool> = h.read_water().iter().map(|w| w.depth > 0.004).collect();
+    rain(&mut h, Vec2::new(N as f32 / 2.0 + 62.0, N as f32 / 2.0), 2.0, FPS);
+    let read_sediment = |h: &mut Harness| -> Vec<f32> {
+        let handle = h.app.world().resource::<ErosionImages>().water.clone();
+        h.read(handle).iter().map(|t| t[3]).collect()
+    };
+    let sediment = read_sediment(&mut h);
+    let heights1 = h.read_heights();
+    let suspended: f32 = sediment.iter().sum();
+    let cut: f32 = heights0.iter().zip(&heights1).map(|(a, b)| (a - b).max(0.0)).sum();
+    let in_lake: f32 = (0..heights0.len())
+        .filter(|&i| lake[i])
+        .map(|i| (heights1[i] - heights0[i]).max(0.0))
+        .sum();
+    h.run(4.0);
+    let heights2 = h.read_heights();
+    let settled: f32 = (0..heights0.len())
+        .filter(|&i| lake[i])
+        .map(|i| (heights2[i] - heights0[i]).max(0.0))
+        .sum();
+    let sediment2 = read_sediment(&mut h);
+    // The water's deposits count as KTT's loose sediment (analysis G).
+    let handle = h.app.world().resource::<ErosionImages>().analysis.clone();
+    let analysis = h.read(handle);
+    let shown: f32 = (0..heights0.len())
+        .filter(|&i| lake[i] && heights2[i] > heights0[i])
+        .map(|i| analysis[i][1])
+        .sum();
+    println!("loose sediment shown under the lake deposits: {shown:.3}");
+    assert!(shown > 0.0, "the water's deposits are not in KTT's deposition buffer");
+    let before_clear: f32 = h.read_heights().iter().sum();
+    {
+        let mut water = h.water();
+        water.clear_generation = water.clear_generation.wrapping_add(1);
+    }
+    h.run(0.1);
+    let after_clear: f32 = h.read_heights().iter().sum();
+    let suspended2: f32 = sediment2.iter().sum();
+    println!(
+        "trail sediment: trails cut {cut:.3}; right after the rain {suspended:.3} suspended and {in_lake:.3} \
+         settled in the lake; 4 s later {settled:.3} settled and {suspended2:.3} suspended; \
+         Clear Water settled {:.3}",
+        after_clear - before_clear
+    );
+    assert!(cut > 0.01, "the rain carved nothing");
+    assert!(
+        settled + suspended2 > 0.3 * cut,
+        "little of the carved sediment reached the lake"
+    );
+    assert!(suspended2 > 0.001, "nothing stayed suspended to check Clear Water with");
+    // Heights read back as f16 (about 0.00024 apart here), so the sum of many small deposits is
+    // only good to tens of percent; before this, Clear Water deleted the load (0 settled).
+    assert!(
+        after_clear - before_clear > 0.5 * suspended2,
+        "Clear Water lost the suspended load"
     );
 }

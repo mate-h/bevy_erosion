@@ -44,6 +44,7 @@ const PYRAMID_MASKS_SHADER: &str = "pyramid_masks.wgsl";
 const WATER_SHADER: &str = "water.wgsl";
 const WATER_BED_SHADER: &str = "water_bed.wgsl";
 const WATER_MORPHO_SHADER: &str = "water_morpho.wgsl";
+const WATER_SPLAT_SHADER: &str = "water_splat.wgsl";
 /// Erode dispatches per `writeBack` at geological age 0 (`Compute_Erosion.iterations`).
 const ERODE_ITERS_PER_WRITEBACK: u32 = 200;
 const TERRAIN_SHADER: &str = "terrain_extended.wesl";
@@ -608,6 +609,12 @@ pub struct ErodeParams {
     pub spawn_radius: f32,
     /// Set per dispatch: trails to start in the brush disc; 0 = KTT's map-wide trail density.
     pub spawn_count: u32,
+    /// Bevy-only: water (height units × texels²) each rain brush trail leaves per step on the
+    /// finest level (set from [`WaterControl::rain_water`] for brush dispatches only).
+    pub rain_water: f32,
+    /// Bevy-only, set per frame: the water solver runs, so trails on the finest level that reach
+    /// water (`masks.y` > 0.5) hand it their sediment and end.
+    pub water_handoff: u32,
 }
 
 impl Default for ErodeParams {
@@ -692,6 +699,8 @@ impl Default for ErodeParams {
             spawn_center: Vec2::ZERO,
             spawn_radius: 0.0,
             spawn_count: 0,
+            rain_water: 0.0,
+            water_handoff: 0,
         }
     }
 }
@@ -746,6 +755,9 @@ pub struct WaterControl {
     pub springs: Vec<Spring>,
     /// Water depth added per second everywhere (height units).
     pub rainfall: f32,
+    /// Water each rain brush trail leaves per step along its path (height units × texels²), so
+    /// the rain brush wets the channels it carves (0 = it only carves).
+    pub rain_water: f32,
     /// Bump to remove all water.
     pub clear_generation: u32,
     /// Fraction of water lost per second.
@@ -896,6 +908,7 @@ impl Default for WaterControl {
             rate: 0.0,
             springs: Vec::new(),
             rainfall: 0.0,
+            rain_water: 0.0002,
             clear_generation: 0,
             evaporation: 0.01,
             sediment_capacity: 0.0005,
@@ -1166,6 +1179,9 @@ struct ErosionPipeline {
     layout_water_morpho: BindGroupLayoutDescriptor,
     /// `water_morpho.wgsl`: discharge, helical, flux, exner.
     pipelines_water_morpho: [CachedComputePipelineId; 4],
+    layout_water_splat: BindGroupLayoutDescriptor,
+    /// `water_splat.wgsl`: splat, record.
+    pipelines_water_splat: [CachedComputePipelineId; 2],
 }
 
 impl ErosionPipeline {
@@ -1201,8 +1217,8 @@ fn init_erosion_pipeline(
                 storage_buffer::<u32>(false), // flow (atomic<u32> in shader)
                 storage_buffer::<i32>(false), // deposition (atomic<i32> in shader)
                 storage_buffer::<u32>(false), // erosion (atomic<u32> in shader)
-                storage_buffer::<f32>(false), // mx (f32 bits in atomic<u32>)
-                storage_buffer::<f32>(false), // my (f32 bits in atomic<u32>)
+                storage_buffer::<f32>(false), // river momentum x, y (f32 bits in atomic<u32>)
+                storage_buffer::<u32>(false), // splat to the water (atomic<u32>, fixed-point)
                 storage_buffer::<Vec4>(false), // masks: softness, outflow, erode mask, uplift map
                 storage_buffer::<Vec2>(false), // layers: bedrock, age
             ),
@@ -1271,10 +1287,8 @@ fn init_erosion_pipeline(
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                storage_buffer_read_only::<f32>(false), // src mx
-                storage_buffer_read_only::<f32>(false), // src my
-                storage_buffer::<f32>(false),           // dst mx
-                storage_buffer::<f32>(false),           // dst my
+                storage_buffer_read_only::<f32>(false), // src river momentum
+                storage_buffer::<f32>(false),           // dst river momentum
                 storage_buffer::<u32>(false),           // dst flow
                 storage_buffer::<u32>(false),           // dst erosion
                 uniform_buffer::<PyramidResampleParams>(true),
@@ -1368,11 +1382,28 @@ fn init_erosion_pipeline(
                 storage_buffer_read_only::<f32>(false), // water depth
                 storage_buffer_read_only::<Vec2>(false), // velocity
                 storage_buffer::<Vec4>(false), // discharge
-                storage_buffer_read_only::<f32>(false), // work set river momentum mx
-                storage_buffer_read_only::<f32>(false), // work set river momentum my
+                storage_buffer_read_only::<f32>(false), // work set river momentum
                 storage_buffer::<Vec2>(false), // face bed load
                 storage_buffer::<f32>(false), // helical intensity and pending bed change
                 uniform_buffer::<MorphoParams>(false),
+            ),
+        ),
+    );
+    // Trails and the water (`water_splat.wgsl`).
+    let layout_water_splat = BindGroupLayoutDescriptor::new(
+        "WaterSplatGroup0",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                storage_buffer::<u32>(false), // splat (atomic, fixed-point)
+                storage_buffer::<f32>(false), // water depth
+                storage_buffer::<f32>(false), // suspended sediment
+                storage_buffer::<u32>(false), // work set height (atomic, fixed-point)
+                storage_buffer::<i32>(false), // work set deposition (atomic)
+                storage_buffer::<u32>(false), // work set erosion (atomic)
+                storage_buffer::<f32>(false), // morpho state
+                uniform_buffer::<WaterParams>(false),
+                texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::ReadWrite),
             ),
         ),
     );
@@ -1511,8 +1542,14 @@ fn init_erosion_pipeline(
         )
     });
 
+    let water_splat_shader = asset_server.load(WATER_SPLAT_SHADER);
+    let pipelines_water_splat = ["water_splat", "water_record"]
+        .map(|entry| compute(vec![layout_water_splat.clone()], &water_splat_shader, entry));
+
     commands.insert_resource(ErosionPipeline {
         layout_erosion,
+        layout_water_splat,
+        pipelines_water_splat,
         layout_water_morpho,
         pipelines_water_morpho,
         layout_water_bed,
@@ -1549,8 +1586,8 @@ struct FieldSet {
     flow: StorageBuffer<Vec<u32>>,
     deposition: StorageBuffer<Vec<i32>>,
     erosion: StorageBuffer<Vec<u32>>,
-    mx: StorageBuffer<Vec<f32>>,
-    my: StorageBuffer<Vec<f32>>,
+    /// KTT `__m`: river momentum x and y per cell, interleaved.
+    m: StorageBuffer<Vec<f32>>,
     /// KTT `__Softness_Mask`, `__Outflow`, `__Erode_Mask`, `__Uplift` (identity values when unused).
     masks: StorageBuffer<Vec<Vec4>>,
     /// KTT `__Bedrock` and `__Age`.
@@ -1566,8 +1603,7 @@ impl FieldSet {
             flow: StorageBuffer::from(vec![0u32; texels]),
             deposition: StorageBuffer::from(vec![0i32; texels]),
             erosion: StorageBuffer::from(vec![0u32; texels]),
-            mx: StorageBuffer::from(vec![0f32; texels]),
-            my: StorageBuffer::from(vec![0f32; texels]),
+            m: StorageBuffer::from(vec![0f32; 2 * texels]),
             masks: StorageBuffer::from(vec![Vec4::new(1.0, 0.0, 1.0, 1.0); texels]),
             layers: StorageBuffer::from(vec![Vec2::ZERO; texels]),
             outflow_acc: StorageBuffer::from(vec![0f32; texels]),
@@ -1576,8 +1612,7 @@ impl FieldSet {
         set.flow.write_buffer(device, queue);
         set.deposition.write_buffer(device, queue);
         set.erosion.write_buffer(device, queue);
-        set.mx.write_buffer(device, queue);
-        set.my.write_buffer(device, queue);
+        set.m.write_buffer(device, queue);
         set.masks.write_buffer(device, queue);
         set.layers.write_buffer(device, queue);
         set.outflow_acc.write_buffer(device, queue);
@@ -1598,6 +1633,8 @@ struct ErosionBuffers {
     resample_params: DynamicUniformBuffer<PyramidResampleParams>,
     blit_display: UniformBuffer<BlitDisplayParams>,
     water: WaterBuffers,
+    /// Water and sediment trails hand to the water on the finest level (`erosion.wgsl` `splat`).
+    splat: StorageBuffer<Vec<u32>>,
 }
 
 /// Water solver state at base map size (`water.wgsl`).
@@ -1751,6 +1788,8 @@ struct ErosionBindGroups {
     water_bed: [BindGroup; 2],
     /// Discharge and bed load, indexed by work set.
     water_morpho: [BindGroup; 2],
+    /// Trails and the water, indexed by work set.
+    water_splat: [BindGroup; 2],
     blit: BindGroup,
     blit_blur: BindGroup,
 }
@@ -1779,6 +1818,11 @@ fn prepare_erosion_buffers(
         resample_params: DynamicUniformBuffer::default(),
         blit_display,
         water: WaterBuffers::new(params.map_size, &render_device, &queue),
+        splat: {
+            let mut splat = StorageBuffer::from(vec![0u32; 2 * texels]);
+            splat.write_buffer(&render_device, &queue);
+            splat
+        },
     });
 }
 
@@ -1838,8 +1882,8 @@ fn prepare_erosion_bind_groups(
                 &set.flow,
                 &set.deposition,
                 &set.erosion,
-                &set.mx,
-                &set.my,
+                &set.m,
+                &buffers.splat,
                 &set.masks,
                 &set.layers,
             )),
@@ -1870,10 +1914,8 @@ fn prepare_erosion_bind_groups(
             None,
             &layout(&pipeline.layout_upscale_rivers),
             &BindGroupEntries::sequential((
-                &src.mx,
-                &src.my,
-                &dst.mx,
-                &dst.my,
+                &src.m,
+                &dst.m,
                 &dst.flow,
                 &dst.erosion,
                 &buffers.resample_params,
@@ -1967,11 +2009,29 @@ fn prepare_erosion_bind_groups(
                     w.depth.binding().unwrap(),
                     w.velocity.binding().unwrap(),
                     discharge.clone(),
-                    set.mx.binding().unwrap(),
-                    set.my.binding().unwrap(),
+                    set.m.binding().unwrap(),
                     w.bed_load.binding().unwrap(),
                     w.morpho_state.binding().unwrap(),
                     w.morpho_params.binding().unwrap(),
+                )),
+            )
+        }),
+        water_splat: [0, 1].map(|set| {
+            let w = &buffers.water;
+            let set = &buffers.sets[set];
+            render_device.create_bind_group(
+                None,
+                &layout(&pipeline.layout_water_splat),
+                &BindGroupEntries::sequential((
+                    buffers.splat.binding().unwrap(),
+                    w.depth.binding().unwrap(),
+                    w.sediment.binding().unwrap(),
+                    set.height.binding().unwrap(),
+                    set.deposition.binding().unwrap(),
+                    set.erosion.binding().unwrap(),
+                    w.morpho_state.binding().unwrap(),
+                    w.params.binding().unwrap(),
+                    &w.swe.textures.bed_water,
                 )),
             )
         }),
@@ -2162,6 +2222,7 @@ fn plan_erosion_frame(
     let params = &ErodeParams {
         pad_offset,
         padded_size: finest_size,
+        water_handoff: u32::from(state.water_active),
         ..params.clone()
     };
     for step in &state.steps {
@@ -2247,6 +2308,7 @@ fn plan_erosion_frame(
                 spawn_center: stroke.center + pad_offset.as_vec2(),
                 spawn_radius: stroke.radius,
                 spawn_count: stroke.particles,
+                rain_water: water.rain_water,
                 ..level_erode_params(params, &finest, state.brush_iteration)
             };
             state.brush_iteration = state.brush_iteration.wrapping_add(1);
@@ -2258,6 +2320,9 @@ fn plan_erosion_frame(
         }
     }
     // Water bodies: the solver runs on the finest level whenever any water exists.
+    if stroke.active && stroke.particles > 0 && water.rain_water > 0.0 {
+        state.water_active = true;
+    }
     let clear = water.clear_generation != state.last_water_clear;
     if clear {
         state.last_water_clear = water.clear_generation;
@@ -2601,6 +2666,12 @@ fn erosion_compute(
                 let (gx, gy) = dispatch_grid(params.map_size);
                 let [p_discharge, p_helical, p_bed_flux, p_exner] =
                     pipes.pipelines_water_morpho.map(get);
+                let [p_splat, p_record] = pipes.pipelines_water_splat.map(get);
+                if let Some(p) = p_splat {
+                    pass.set_bind_group(0, &groups.water_splat[set], &[]);
+                    pass.set_pipeline(p);
+                    pass.dispatch_workgroups(gx, gy, 1);
+                }
                 let [
                     p_clear,
                     p_flux,
@@ -2672,6 +2743,11 @@ fn erosion_compute(
                         pass.set_pipeline(p);
                         pass.dispatch_workgroups(gx, gy, 1);
                     }
+                }
+                if let Some(p) = p_record {
+                    pass.set_bind_group(0, &groups.water_splat[set], &[]);
+                    pass.set_pipeline(p);
+                    pass.dispatch_workgroups(gx, gy, 1);
                 }
             }
             FrameCmd::ShapeBeds {
