@@ -9,7 +9,7 @@
 //! re-filtering the environment map every frame. `EROSION_BENCH_POUR=x,y` places a spring at
 //! texel (x, y) and moves the camera close to it (or to `EROSION_BENCH_TARGET=x,y`;
 //! `EROSION_BENCH_DISTANCE`, `_PITCH` and `_YAW`,
-//! in degrees, frame it), and `EROSION_BENCH_RAIN=<‰/s>` rains on the whole map. `EROSION_BENCH_SCREENSHOT=<path>` hides the settings panel and saves
+//! in degrees, frame it), and `EROSION_BENCH_RAIN=<‰/s>` rains on the whole map. `EROSION_BENCH_SCREENSHOT=<path>` hides the settings panel (kept with `EROSION_BENCH_PANEL=1`) and saves
 //! the window just before the bench quits.
 
 use bevy::{
@@ -283,9 +283,11 @@ fn log_frame_times(
             && !*shot_taken
         {
             *shot_taken = true;
-            // The settings panel would cover part of the shot.
-            for mut visibility in &mut panels {
-                *visibility = Visibility::Hidden;
+            // The settings panel would cover part of the shot, unless `EROSION_BENCH_PANEL=1`.
+            if !std::env::var("EROSION_BENCH_PANEL").is_ok_and(|v| v != "0") {
+                for mut visibility in &mut panels {
+                    *visibility = Visibility::Hidden;
+                }
             }
             commands
                 .spawn(Screenshot::primary_window())

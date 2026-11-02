@@ -9,7 +9,9 @@ use bevy::{
         FeathersPlugins,
         constants::{fonts, icons},
         controls::{
-            ButtonVariant, FeathersButton, FeathersCheckbox, FeathersScrollbar, FeathersSlider,
+            ButtonVariant, FeathersButton, FeathersCheckbox, FeathersNumberInput,
+            FeathersScrollbar, HardLimit, NumberInputPrecision, NumberInputStep, NumberInputValue,
+            SoftLimit,
         },
         dark_theme::create_dark_theme,
         display::icon,
@@ -20,11 +22,11 @@ use bevy::{
     input_focus::tab_navigation::TabGroup,
     prelude::*,
     scene::SceneList,
-    text::FontWeight,
+    text::{FontWeight, LineHeight},
     ui::Checked,
     ui_widgets::{
-        Activate, Button, Checkbox, ControlOrientation, ScrollArea, SliderPrecision, SliderStep,
-        SliderValue, ValueChange, checkbox_self_update, slider_self_update,
+        Activate, Button, Checkbox, ControlOrientation, ScrollArea, ValueChange,
+        checkbox_self_update,
     },
 };
 
@@ -1190,6 +1192,9 @@ fn slider_row(
 ) -> impl Scene {
     let label = label.to_string();
     let (step, precision) = slider_step(min, max, field.is_int());
+    // Shown at the field's precision, so 0.2 does not read 0.19999999.
+    let scale = 10f32.powi(precision);
+    let value = (value * scale).round() / scale;
     bsn! {
         Node {
             display: Display::Flex,
@@ -1215,17 +1220,19 @@ fn slider_row(
                 min_width: px(60.0),
             }
             Children [
-                @FeathersSlider {
-                    @min: min,
-                    @max: max,
-                }
-                SliderValue(value)
-                SliderStep(step)
-                SliderPrecision(precision)
+                // Drag to scrub through the range, or click to type a value (Enter or clicking
+                // away applies it).
+                @FeathersNumberInput
+                NumberInputValue::F32(value)
+                SoftLimit::f32(min..=max)
+                HardLimit::f32(min..=max)
+                NumberInputStep({step as f64})
+                NumberInputPrecision(precision)
                 ErosionSliderField
-                on(slider_self_update)
-                on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut brush: ResMut<WaterBrush>, mut water: ResMut<WaterControl>, mut reset: ResMut<ResetSim>| {
-                    field.apply(&mut params, &mut sim, &mut brush, &mut water, change.value);
+                on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut brush: ResMut<WaterBrush>, mut water: ResMut<WaterControl>, mut reset: ResMut<ResetSim>, mut commands: Commands| {
+                    let value = if field.is_int() { change.value.round() } else { change.value };
+                    commands.entity(change.source).insert(NumberInputValue::F32(value));
+                    field.apply(&mut params, &mut sim, &mut brush, &mut water, value);
                     if field.resets_sim() {
                         reset.generation = reset.generation.wrapping_add(1);
                     }
@@ -1246,13 +1253,17 @@ fn shrink_slider_value_font(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
 ) {
-    for (_slider, children) in &q {
-        if let Some(&text_container) = children.first() {
-            commands.entity(text_container).insert(InheritableFont {
-                font: asset_server.load(fonts::MONO),
-                font_size: FontSize::Px(SLIDER_VALUE_FONT_SIZE),
-                weight: FontWeight::NORMAL,
-            });
+    for (_input, children) in &q {
+        // The number input's text field, sized to the row.
+        if let Some(&text) = children.first() {
+            commands.entity(text).insert((
+                InheritableFont {
+                    font: asset_server.load(fonts::MONO),
+                    font_size: FontSize::Px(SLIDER_VALUE_FONT_SIZE),
+                    weight: FontWeight::NORMAL,
+                },
+                LineHeight::Px(SLIDER_HEIGHT),
+            ));
         }
     }
 }
