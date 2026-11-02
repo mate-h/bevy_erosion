@@ -454,7 +454,22 @@ sits on the outer bank, and the skew changes sign between the two bends.
 - **New panel controls:** Manning n, Grain, Bed Load K, Critical Shields, Slope Effect, Helical
   Strength, Morph. Factor, Refine Steps.
 
-### 4f. Shape Beds from discharge
+### 4f. Shape Beds from discharge (done)
+
+Built as planned, with these choices (`water_bed.wgsl`):
+- The domain is water deeper than 0.002 or averaged unit discharge above Channel Discharge (6a's
+  field). The channel discharge Q is the averaged flow summed along the line across the cell to
+  both banks; the thalweg's unit discharge times the domain width overestimated it once the flow
+  had narrowed into the cut.
+- η_ref is the nearest first-ring bank (the lower one where two are at the same distance), or
+  the water surface in still water. The first ring of banks is never graded, and grading ramps up
+  from it, so nothing η_ref depends on moves when the bed is cut.
+- Rivers are pulled hard toward their prior (cross-sections are already smooth) and smoothed
+  across the flow only; cells outside the channel's hydraulic width stay uncut.
+- `tests/water_swe_gpu.rs` `shape_beds_converges`, a spring in a broad valley: the first press
+  cuts the thalweg 0.005 (half-width about 6), a second press changes nothing, and a press
+  after 10 s more flow moves the thalweg by at most 0.0017.
+
 
 Shape Beds cuts the bed a target depth below the water surface as it is when pressed. The flow
 then drains into the deeper bed, the surface drops, and the next press cuts deeper again. It
@@ -542,7 +557,16 @@ Roles once unified:
 - One discharge field and one sediment budget connect them, so beds, deltas and steps come from
   how much water and sediment a channel actually carries.
 
-### 6a. Shared discharge field
+### 6a. Shared discharge field (done)
+
+`WaterFields::discharge`, a public `ShaderBuffer` (one `vec4` per texel), written once per
+frame by `morpho_discharge` in `water_morpho.wgsl`: averaged h·u (3 s), averaged depth, and
+KTT's discharge. KTT's `flow_buffer` turned out to hold the deposition along trails, not water,
+so KTT's discharge is the river momentum |(mx, my)| instead (only with Do Rivers on), scaled by
+`KTT_DISCHARGE_SCALE`. `discharge_matches_ktt`: a spring on a KTT river keeps all of its 200
+strongest cells on KTT's upper-quartile rivers, correlation 0.49–0.65, and solver/KTT within a
+factor of 1.5 of 1 depending on the terrain.
+
 
 - A `discharge` buffer at base map size (in this crate's water layouts, not bevy_fft's), with
   two parts:

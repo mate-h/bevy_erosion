@@ -52,6 +52,8 @@ struct WaterParams {
     rain: f32,
     // Seconds per step.
     step_seconds: f32,
+    // Bed load runs (`water_morpho.wgsl`): the capacity model only erodes thin sheet flow.
+    bed_load: u32,
     source_count: u32,
     // Springs and the brush: xy = disc center (texels), z = radius, w = depth per step at the
     // center (negative removes water).
@@ -234,7 +236,12 @@ fn water_erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     let hb = terrain(nb[3]);
     let slope = length(vec2<f32>(hr - hl, hb - ht)) * 0.5 * SLOPE_SCALE;
     let tilt = max(slope / sqrt(1.0 + slope * slope), MIN_TILT);
-    let capacity = params.capacity * tilt * length(velocity[i]) * min(d / FULL_DEPTH, 1.0);
+    var capacity = params.capacity * tilt * length(velocity[i]) * min(d / FULL_DEPTH, 1.0);
+    if (params.bed_load != 0u) {
+        // Deeper water moves its bed as bed load (`water_morpho.wgsl`); the capacity model fades
+        // out over the same depths, so what it still carries settles there.
+        capacity *= 1.0 - smoothstep(0.5 * FULL_DEPTH, FULL_DEPTH, d);
+    }
 
     // Positive dh deposits onto the terrain, negative dissolves it.
     var dh = DEPOSIT_RATE * (s - capacity);

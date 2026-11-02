@@ -16,6 +16,7 @@ use bevy::{
             *,
         },
         renderer::{RenderContext, RenderDevice, RenderGraph, RenderQueue},
+        storage::{GpuShaderBuffer, ShaderBuffer},
         texture::GpuImage,
     },
     shader::{ShaderCacheError, ShaderRef},
@@ -42,6 +43,7 @@ const PYRAMID_RIVERS_SHADER: &str = "pyramid_rivers.wgsl";
 const PYRAMID_MASKS_SHADER: &str = "pyramid_masks.wgsl";
 const WATER_SHADER: &str = "water.wgsl";
 const WATER_BED_SHADER: &str = "water_bed.wgsl";
+const WATER_MORPHO_SHADER: &str = "water_morpho.wgsl";
 /// Erode dispatches per `writeBack` at geological age 0 (`Compute_Erosion.iterations`).
 const ERODE_ITERS_PER_WRITEBACK: u32 = 200;
 const TERRAIN_SHADER: &str = "terrain_extended.wesl";
@@ -350,6 +352,29 @@ pub fn create_erosion_images(images: &mut Assets<Image>, size: UVec2) -> Erosion
     }
 }
 
+/// Water fields other systems can read (or read back to the CPU with
+/// `bevy::render::gpu_readback::Readback::buffer`).
+#[derive(Resource, Clone, ExtractResource)]
+#[extract_app(RenderApp)]
+pub struct WaterFields {
+    /// Shared discharge field, one `vec4<f32>` per map texel: xy = unit discharge h·u averaged
+    /// over a few seconds (height units × texels per second), z = averaged depth, w = KTT's river
+    /// momentum scaled to the same units as xy (0 unless Do Rivers is on).
+    pub discharge: Handle<ShaderBuffer>,
+}
+
+impl WaterFields {
+    /// Zeroed fields for a map of `size` texels.
+    pub fn new(buffers: &mut Assets<ShaderBuffer>, size: UVec2) -> Self {
+        let n = (size.x * size.y) as usize;
+        let mut discharge = ShaderBuffer::new(vec![Vec4::ZERO; n], RenderAssetUsages::RENDER_WORLD);
+        discharge.label = Cow::Borrowed("water_discharge");
+        Self {
+            discharge: buffers.add(discharge),
+        }
+    }
+}
+
 /// A cleared [`ErosionImages::terrain_edit`] layer.
 pub fn empty_terrain_edit_image(size: UVec2) -> Image {
     let mut image = Image::new_fill(
@@ -632,7 +657,7 @@ impl Default for ErodeParams {
             uplift: 0.0, // Uplift_Amount
             noise_frequency: 0.005,
             noise_scale: 1.5,
-            feature_size: 8.0,            // Feature_Size
+            feature_size: 64.0,           // Feature_Size
             source_detail_smoothing: 1.0, // Source_Terrain_Detail_Smoothing
             geological_age: 0.0,          // Geological_Age
             voxel_size: 1.0,
@@ -741,16 +766,61 @@ pub struct WaterControl {
     pub bed: BedShaping,
     /// Bump to reshape the beds of the current lakes and rivers once.
     pub shape_generation: u32,
+    /// Bed load moved by the flow (see [`BedLoad`]).
+    pub bed_load: BedLoad,
+    /// Bump to fast-forward the beds by [`BedLoad::refine_steps`] steps.
+    pub refine_generation: u32,
 }
 
-/// Bed reconstruction (`water_bed.wgsl`): deepens the bed under the current wet domain into a
-/// smooth channel (rivers) or bowl (lakes) below the solver's water surface, and grades the
-/// banks next to it. Depths in height units, widths in texels.
+/// Bed load and Exner (`water_morpho.wgsl`): on water deeper than a thin sheet, the flow moves
+/// bed material along the bed (Shields and Meyer-Peter Müller), toward the inner banks of bends
+/// (helical flow) and down cross-slopes (Talmon), and the bed changes by its divergence. Units
+/// are the solver's: cells (heights × 100) and seconds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BedLoad {
+    /// Run bed load with every water step (morphological factor 1).
+    pub live: bool,
+    /// Submerged grain weight R·D (cells) in the Shields number θ = n²|u|² / (grain · h^(1/3)):
+    /// coarser grains need faster flow to move.
+    pub grain: f32,
+    /// Meyer-Peter Müller coefficient: bed load K · (θ − θ_c)^1.5 in cells² per second.
+    pub k: f32,
+    /// Shields number θ_c below which the bed does not move.
+    pub critical_shields: f32,
+    /// Talmon's A_s: how weakly bed load slides down cross-slopes (larger is weaker).
+    pub slope_effect: f32,
+    /// A_h in the helical deflection δ = atan(A_h · I_s) toward the inner bank.
+    pub helical_strength: f32,
+    /// Morphological factor while refining (bed change per water step).
+    pub morph_factor: f32,
+    /// Water steps one refine runs.
+    pub refine_steps: u32,
+}
+
+impl Default for BedLoad {
+    fn default() -> Self {
+        Self {
+            live: true,
+            grain: 0.25,
+            k: 4.0,
+            critical_shields: 0.047,
+            slope_effect: 1.0,
+            helical_strength: 7.0,
+            morph_factor: 20.0,
+            refine_steps: 400,
+        }
+    }
+}
+
+/// Bed reconstruction (`water_bed.wgsl`): cuts a channel (rivers) or bowl (lakes) under the
+/// current water and grades the banks next to it. Rivers are found and sized from the averaged
+/// discharge, and cut below their banks rather than below the water surface, so one press shapes
+/// a stream and a second press changes nothing. Depths in height units, widths in texels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BedShaping {
-    /// Depth the bed levels off toward below the water surface.
+    /// Depth the bed levels off toward.
     pub max_depth: f32,
-    /// Depth gained per texel of distance from the shore (or of river half-width).
+    /// Lakes: depth gained per texel of distance from the shore.
     pub shore_slope: f32,
     /// River cross-section exponent of (1 − n²)^profile: below 1 is boxy with steep banks, above
     /// 1 narrows toward a V.
@@ -759,10 +829,17 @@ pub struct BedShaping {
     pub strength: f32,
     /// Bank grading reach outside the water (texels, at most [`MAX_BANK_WIDTH`]).
     pub bank_width: f32,
-    /// Bank height at the waterline above the surface.
-    pub bank_rise: f32,
-    /// Bank rise per texel away from the shore.
+    /// Bank rise per texel away from the first bank cell.
     pub bank_slope: f32,
+    /// River thalweg depth below the banks at a channel discharge of about a default demo
+    /// spring; it grows with the discharge to the power 0.4.
+    pub river_depth: f32,
+    /// River half-width at the same discharge; it grows with the square root of the discharge,
+    /// up to the width of the flowing water.
+    pub river_width: f32,
+    /// Averaged unit discharge (height units × texels per second) above which flowing water
+    /// belongs to a channel.
+    pub channel_discharge: f32,
 }
 
 impl Default for BedShaping {
@@ -773,8 +850,10 @@ impl Default for BedShaping {
             profile: 0.8,
             strength: 1.0,
             bank_width: 8.0,
-            bank_rise: 0.001,
             bank_slope: 0.0015,
+            river_depth: 0.008,
+            river_width: 5.0,
+            channel_discharge: 0.02,
         }
     }
 }
@@ -783,6 +862,8 @@ impl Default for BedShaping {
 pub const MAX_BANK_WIDTH: f32 = 32.0;
 /// Red-black SOR sweeps for the bank distance τ and the depth smoothing.
 const BED_TAU_SWEEPS: u32 = 400;
+/// Reach of the bank reference inside rivers (texels); wider rivers fall back to their surface.
+const BED_BANK_REACH: f32 = 32.0;
 const BED_SMOOTH_SWEEPS: u32 = 200;
 const BED_OMEGA: f32 = 1.9;
 
@@ -799,8 +880,10 @@ struct BedParams {
     profile: f32,
     strength: f32,
     bank_width: f32,
-    bank_rise: f32,
     bank_slope: f32,
+    river_depth: f32,
+    river_width: f32,
+    channel_discharge: f32,
 }
 
 impl Default for WaterControl {
@@ -821,6 +904,8 @@ impl Default for WaterControl {
             dt: 0.0,
             bed: BedShaping::default(),
             shape_generation: 0,
+            bed_load: BedLoad::default(),
+            refine_generation: 0,
         }
     }
 }
@@ -874,10 +959,45 @@ pub struct WaterParams {
     pub rain: f32,
     /// Seconds per step ([`WATER_STEP`]).
     pub step_seconds: f32,
+    /// Bed load runs (`water_morpho.wgsl`), so the capacity model only erodes thin sheet flow.
+    pub bed_load: u32,
     pub source_count: u32,
     /// Springs and the brush: center, radius, depth per step at the center.
     pub sources: [Vec4; MAX_WATER_SOURCES],
 }
+
+/// Uniform for `water_morpho.wgsl`.
+#[derive(Clone, Copy, ShaderType)]
+struct MorphoParams {
+    size: UVec2,
+    pad_offset: UVec2,
+    grid_size: UVec2,
+    step_seconds: f32,
+    frame_seconds: f32,
+    discharge_time: f32,
+    ktt_scale: f32,
+    ktt_vector: u32,
+    sea_level: f32,
+    manning_n: f32,
+    grain: f32,
+    bed_load_k: f32,
+    critical_shields: f32,
+    slope_effect: f32,
+    helical_strength: f32,
+    helical_length: f32,
+    mor_fac: f32,
+    parity: u32,
+}
+
+/// Seconds the shared discharge field averages over, so roll waves do not make it flicker.
+const DISCHARGE_TIME: f32 = 3.0;
+/// KTT river momentum (trail water per texel) to unit discharge (height units × texels per
+/// second), fitted on a spring-fed valley (`tests/water_swe_gpu.rs`, `discharge_matches_ktt`).
+const KTT_DISCHARGE_SCALE: f32 = 0.0044;
+/// Helical flow adaptation length in texels (terracraft uses 42 m at 1 m per pixel).
+const HELICAL_LENGTH: f32 = 20.0;
+/// Most water steps one frame runs while refining beds.
+const MAX_REFINE_STEPS: u32 = 64;
 
 /// Resource to trigger simulation reset
 #[derive(Resource, Clone, ExtractResource, Default)]
@@ -953,9 +1073,11 @@ fn setup_erosion_resources(
     config: Res<ErosionConfig>,
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
+    mut shader_buffers: ResMut<Assets<ShaderBuffer>>,
 ) {
     let size = config.map_size;
     commands.insert_resource(create_erosion_images(&mut images, size));
+    commands.insert_resource(WaterFields::new(&mut shader_buffers, size));
     commands.insert_resource(config.to_erode_params(0));
     commands.insert_resource(ResetSim::default());
     commands.insert_resource(SimControl::default());
@@ -976,6 +1098,7 @@ impl Plugin for ErosionComputePlugin {
             .insert_resource(progress.clone())
             .add_plugins((
                 ExtractResourcePlugin::<ErosionImages>::default(),
+                ExtractResourcePlugin::<WaterFields>::default(),
                 ExtractResourcePlugin::<ErodeParams>::default(),
                 ExtractResourcePlugin::<ResetSim>::default(),
                 ExtractResourcePlugin::<SimControl>::default(),
@@ -1039,6 +1162,9 @@ struct ErosionPipeline {
     pipelines_water: [CachedComputePipelineId; 10],
     /// `water_bed.wgsl`: init, tau, prior, smooth, write, dilate, grade.
     pipelines_water_bed: [CachedComputePipelineId; 7],
+    layout_water_morpho: BindGroupLayoutDescriptor,
+    /// `water_morpho.wgsl`: discharge, helical, flux, exner.
+    pipelines_water_morpho: [CachedComputePipelineId; 4],
 }
 
 impl ErosionPipeline {
@@ -1221,13 +1347,31 @@ fn init_erosion_pipeline(
             (
                 storage_buffer::<u32>(false), // work set height (atomic, fixed-point)
                 storage_buffer::<f32>(false), // water depth
-                storage_buffer_read_only::<Vec2>(false), // velocity
+                storage_buffer_read_only::<Vec4>(false), // discharge
                 storage_buffer::<f32>(false), // bank distance tau
                 storage_buffer::<f32>(false), // bed depth
                 storage_buffer::<f32>(false), // depth prior
                 storage_buffer::<Vec2>(false), // shore (eta, distance) ping
                 storage_buffer::<Vec2>(false), // shore pong
                 uniform_buffer::<BedParams>(true),
+            ),
+        ),
+    );
+    // Discharge, helical flow and bed load on the finest work set (`water_morpho.wgsl`).
+    let layout_water_morpho = BindGroupLayoutDescriptor::new(
+        "WaterMorphoGroup0",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                storage_buffer::<u32>(false), // work set height (atomic, fixed-point)
+                storage_buffer_read_only::<f32>(false), // water depth
+                storage_buffer_read_only::<Vec2>(false), // velocity
+                storage_buffer::<Vec4>(false), // discharge
+                storage_buffer_read_only::<f32>(false), // work set river momentum mx
+                storage_buffer_read_only::<f32>(false), // work set river momentum my
+                storage_buffer::<Vec2>(false), // face bed load
+                storage_buffer::<f32>(false), // helical intensity and pending bed change
+                uniform_buffer::<MorphoParams>(false),
             ),
         ),
     );
@@ -1351,8 +1495,25 @@ fn init_erosion_pipeline(
     ]
     .map(|entry| compute(vec![layout_water_bed.clone()], &water_bed_shader, entry));
 
+    let water_morpho_shader = asset_server.load(WATER_MORPHO_SHADER);
+    let pipelines_water_morpho = [
+        "morpho_discharge",
+        "morpho_helical",
+        "morpho_flux",
+        "morpho_exner",
+    ]
+    .map(|entry| {
+        compute(
+            vec![layout_water_morpho.clone()],
+            &water_morpho_shader,
+            entry,
+        )
+    });
+
     commands.insert_resource(ErosionPipeline {
         layout_erosion,
+        layout_water_morpho,
+        pipelines_water_morpho,
         layout_water_bed,
         pipelines_water_bed,
         layout_color,
@@ -1453,6 +1614,11 @@ struct WaterBuffers {
     shore: [StorageBuffer<Vec<Vec2>>; 2],
     bed_params: DynamicUniformBuffer<BedParams>,
     swe: SweGrid,
+    /// Bed load through each cell's +x and +y faces.
+    bed_load: StorageBuffer<Vec<Vec2>>,
+    /// Per cell: helical intensity (two slots) and the bed change not yet written.
+    morpho_state: StorageBuffer<Vec<f32>>,
+    morpho_params: UniformBuffer<MorphoParams>,
 }
 
 /// bevy_fft solver grid and its inputs at base map size ([`WaterSolver::Swe`]).
@@ -1514,6 +1680,7 @@ impl WaterBuffers {
                 sea_level: 0.0,
                 rain: 0.0,
                 step_seconds: WATER_STEP,
+                bed_load: 0,
                 source_count: 0,
                 sources: [Vec4::ZERO; MAX_WATER_SOURCES],
             }),
@@ -1523,6 +1690,28 @@ impl WaterBuffers {
             shore: [0, 1].map(|_| StorageBuffer::from(vec![Vec2::ZERO; n])),
             bed_params: DynamicUniformBuffer::default(),
             swe: SweGrid::new(size, device),
+            bed_load: StorageBuffer::from(vec![Vec2::ZERO; n]),
+            morpho_state: StorageBuffer::from(vec![0f32; 4 * n]),
+            morpho_params: UniformBuffer::from(MorphoParams {
+                size,
+                pad_offset: UVec2::ZERO,
+                grid_size: size,
+                step_seconds: WATER_STEP,
+                frame_seconds: 0.0,
+                discharge_time: DISCHARGE_TIME,
+                ktt_scale: KTT_DISCHARGE_SCALE,
+                ktt_vector: 0,
+                sea_level: 0.0,
+                manning_n: 0.0,
+                grain: 1.0,
+                bed_load_k: 0.0,
+                critical_shields: 0.0,
+                slope_effect: 1.0,
+                helical_strength: 0.0,
+                helical_length: HELICAL_LENGTH,
+                mor_fac: 0.0,
+                parity: 0,
+            }),
         };
         b.depth.write_buffer(device, queue);
         b.flux.write_buffer(device, queue);
@@ -1536,6 +1725,9 @@ impl WaterBuffers {
         for shore in &mut b.shore {
             shore.write_buffer(device, queue);
         }
+        b.bed_load.write_buffer(device, queue);
+        b.morpho_state.write_buffer(device, queue);
+        b.morpho_params.write_buffer(device, queue);
         b
     }
 }
@@ -1556,6 +1748,8 @@ struct ErosionBindGroups {
     water_out: BindGroup,
     /// Bed reconstruction, indexed by work set.
     water_bed: [BindGroup; 2],
+    /// Discharge and bed load, indexed by work set.
+    water_morpho: [BindGroup; 2],
     blit: BindGroup,
     blit_blur: BindGroup,
 }
@@ -1593,10 +1787,16 @@ fn prepare_erosion_bind_groups(
     pipeline_cache: Res<PipelineCache>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     images: Res<ErosionImages>,
+    fields: Option<Res<WaterFields>>,
+    gpu_buffers: Res<RenderAssets<GpuShaderBuffer>>,
     buffers: Option<Res<ErosionBuffers>>,
     render_device: Res<RenderDevice>,
 ) {
     let Some(buffers) = buffers else { return };
+    let Some(discharge) = fields.and_then(|f| gpu_buffers.get(&f.discharge)) else {
+        return;
+    };
+    let discharge = discharge.buffer.as_entire_binding();
     if buffers.params.buffer().is_none()
         || buffers.resample_params.buffer().is_none()
         || buffers.water.bed_params.buffer().is_none()
@@ -1745,13 +1945,32 @@ fn prepare_erosion_bind_groups(
                 &BindGroupEntries::sequential((
                     buffers.sets[set].height.binding().unwrap(),
                     w.depth.binding().unwrap(),
-                    w.velocity.binding().unwrap(),
+                    discharge.clone(),
                     w.tau.binding().unwrap(),
                     w.bed_depth.binding().unwrap(),
                     w.prior.binding().unwrap(),
                     w.shore[0].binding().unwrap(),
                     w.shore[1].binding().unwrap(),
                     w.bed_params.binding().unwrap(),
+                )),
+            )
+        }),
+        water_morpho: [0, 1].map(|set| {
+            let w = &buffers.water;
+            let set = &buffers.sets[set];
+            render_device.create_bind_group(
+                None,
+                &layout(&pipeline.layout_water_morpho),
+                &BindGroupEntries::sequential((
+                    set.height.binding().unwrap(),
+                    w.depth.binding().unwrap(),
+                    w.velocity.binding().unwrap(),
+                    discharge.clone(),
+                    set.mx.binding().unwrap(),
+                    set.my.binding().unwrap(),
+                    w.bed_load.binding().unwrap(),
+                    w.morpho_state.binding().unwrap(),
+                    w.morpho_params.binding().unwrap(),
                 )),
             )
         }),
@@ -1814,12 +2033,14 @@ enum FrameCmd {
     },
     /// Water solver steps on the finest level, after removing all water when `clear`. With
     /// `swe`, bevy_fft's solver moves the water; `import` first hands it this crate's depth.
+    /// `bed_load` runs Exner after every step; the discharge and helical flow follow once.
     Water {
         set: usize,
         steps: u32,
         clear: bool,
         swe: bool,
         import: bool,
+        bed_load: bool,
     },
     /// Rebuild the beds under the current water (`water_bed.wgsl`); `offsets` per SOR parity.
     /// With `swe`, the new depth is handed to bevy_fft's solver afterwards.
@@ -1860,6 +2081,11 @@ struct ErosionState {
     /// Frame time not yet simulated by the water solver (below one [`WATER_STEP`]).
     water_time: f32,
     last_shape: u32,
+    last_refine: u32,
+    /// Water steps still to run for the current Refine Beds request.
+    refine_left: u32,
+    /// Helical flow slot holding the latest intensity.
+    helical_parity: u32,
     /// Cascade was finished last frame (AO refresh on the frame it finishes).
     was_finished: bool,
     /// Finest-level displays since AO was last computed (`None` before the first one).
@@ -2065,8 +2291,19 @@ fn plan_erosion_frame(
         );
     }
     let swe = water.solver == WaterSolver::Swe && grid.solver.is_some();
-    if finest_ready && (clear || stroke || (state.water_active && !sim.paused)) {
-        let steps = if sim.paused {
+    if water.refine_generation != state.last_refine && finest_ready {
+        state.last_refine = water.refine_generation;
+        state.refine_left = water.bed_load.refine_steps;
+        state.water_active = true;
+    }
+    let refining = state.refine_left > 0;
+    if finest_ready && (clear || stroke || refining || (state.water_active && !sim.paused)) {
+        let steps = if refining {
+            // Fast-forward: a fixed number of steps per frame, whatever the frame time.
+            let steps = state.refine_left.min(MAX_REFINE_STEPS);
+            state.refine_left -= steps;
+            steps
+        } else if sim.paused {
             // One step so a brush stroke still shows.
             1
         } else {
@@ -2104,10 +2341,43 @@ fn plan_erosion_frame(
             sea_level,
             rain: water.rainfall * WATER_STEP,
             step_seconds: WATER_STEP,
+            bed_load: u32::from(water.bed_load.live || refining),
             source_count: source_count as u32,
             sources,
         });
         buffers.water.params.write_buffer(&render_device, &queue);
+        let bed_load = &water.bed_load;
+        let mor_fac = if refining {
+            bed_load.morph_factor.max(0.0)
+        } else if bed_load.live {
+            1.0
+        } else {
+            0.0
+        };
+        buffers.water.morpho_params.set(MorphoParams {
+            size: params.map_size,
+            pad_offset,
+            grid_size: finest_size,
+            step_seconds: WATER_STEP,
+            frame_seconds: steps as f32 * WATER_STEP,
+            discharge_time: DISCHARGE_TIME,
+            ktt_scale: KTT_DISCHARGE_SCALE,
+            ktt_vector: u32::from(params.do_rivers != 0 && params.momentum_coherence > 0.0),
+            sea_level,
+            manning_n: water.manning_n,
+            grain: bed_load.grain,
+            bed_load_k: bed_load.k,
+            critical_shields: bed_load.critical_shields,
+            slope_effect: bed_load.slope_effect,
+            helical_strength: bed_load.helical_strength,
+            helical_length: HELICAL_LENGTH,
+            mor_fac,
+            parity: state.helical_parity,
+        });
+        buffers
+            .water
+            .morpho_params
+            .write_buffer(&render_device, &queue);
         if swe && let Some(solver) = &buffers.water.swe.solver {
             // Sources, sinks and the map border come in through `swe_export`, so the borders
             // stay closed walls. The overshoot limiter is off: it does not conserve water.
@@ -2131,8 +2401,12 @@ fn plan_erosion_frame(
                 clear,
                 swe,
                 import: swe && !state.last_swe && !clear,
+                bed_load: mor_fac > 0.0,
             });
             state.last_swe = swe;
+            if steps > 0 {
+                state.helical_parity ^= 1;
+            }
         }
     } else {
         state.water_time = 0.0;
@@ -2151,8 +2425,10 @@ fn plan_erosion_frame(
         profile: bed.profile,
         strength: bed.strength,
         bank_width: bed.bank_width.clamp(1.0, MAX_BANK_WIDTH),
-        bank_rise: bed.bank_rise,
         bank_slope: bed.bank_slope,
+        river_depth: bed.river_depth,
+        river_width: bed.river_width,
+        channel_discharge: bed.channel_discharge,
     };
     let offsets = [0, 1].map(|parity| buffers.water.bed_params.push(&bed_params(parity)));
     if water.shape_generation != state.last_shape && finest_ready {
@@ -2162,7 +2438,7 @@ fn plan_erosion_frame(
             set: state.cascade.current,
             offsets,
             // Even, so the result ends up back in the first shore buffer.
-            dilate_steps: 2 * (bed.bank_width.clamp(1.0, MAX_BANK_WIDTH) / 2.0).ceil() as u32,
+            dilate_steps: 2 * (bed.bank_width.max(BED_BANK_REACH) / 2.0).ceil() as u32,
             swe,
         });
         // The pipes' depth now differs from the solver's: hand it over when it takes back over.
@@ -2319,8 +2595,11 @@ fn erosion_compute(
                 clear,
                 swe,
                 import,
+                bed_load,
             } => {
                 let (gx, gy) = dispatch_grid(params.map_size);
+                let [p_discharge, p_helical, p_bed_flux, p_exner] =
+                    pipes.pipelines_water_morpho.map(get);
                 let [
                     p_clear,
                     p_flux,
@@ -2378,6 +2657,20 @@ fn erosion_compute(
                     for p in [p_erode, p_apply, p_advect, p_copy] {
                         run(&mut pass, p);
                     }
+                    if bed_load && let (Some(f), Some(e)) = (p_bed_flux, p_exner) {
+                        pass.set_bind_group(0, &groups.water_morpho[set], &[]);
+                        for p in [f, e] {
+                            pass.set_pipeline(p);
+                            pass.dispatch_workgroups(gx, gy, 1);
+                        }
+                    }
+                }
+                if steps > 0 && let (Some(d), Some(h)) = (p_discharge, p_helical) {
+                    pass.set_bind_group(0, &groups.water_morpho[set], &[]);
+                    for p in [d, h] {
+                        pass.set_pipeline(p);
+                        pass.dispatch_workgroups(gx, gy, 1);
+                    }
                 }
             }
             FrameCmd::ShapeBeds {
@@ -2411,15 +2704,15 @@ fn erosion_compute(
                     run(tau, 0);
                     run(tau, 1);
                 }
+                for k in 0..dilate_steps {
+                    run(dilate, (k % 2) as usize);
+                }
                 run(prior, 0);
                 for _ in 0..BED_SMOOTH_SWEEPS {
                     run(smooth, 0);
                     run(smooth, 1);
                 }
                 run(write, 0);
-                for k in 0..dilate_steps {
-                    run(dilate, (k % 2) as usize);
-                }
                 run(grade, 0);
                 // The shaped depth keeps the surface in place; the solver takes it over.
                 if swe && let Some(p) = get(pipes.pipelines_water[8]) {

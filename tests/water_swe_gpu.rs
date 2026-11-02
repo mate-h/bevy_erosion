@@ -13,6 +13,7 @@ use bevy::{
         gpu_readback::{Readback, ReadbackComplete},
         render_resource::PollType,
         renderer::RenderDevice,
+        storage::ShaderBuffer,
     },
     time::TimeUpdateStrategy,
     window::ExitCondition,
@@ -108,6 +109,7 @@ impl Harness {
             water.solver = solver;
             water.evaporation = 0.0;
             water.sediment_capacity = 0.0;
+            water.bed_load.live = false;
             if let Some(g) = std::env::var("TEST_GRAVITY")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -228,6 +230,48 @@ impl Harness {
                 std::array::from_fn(|k| f16_to_f32(u16::from_le_bytes([c[2 * k], c[2 * k + 1]])))
             })
             .collect()
+    }
+
+    /// Read a storage buffer of `vec4<f32>`; the water is paused meanwhile.
+    fn read_vec4(&mut self, handle: Handle<ShaderBuffer>) -> Vec<Vec4> {
+        self.app.world_mut().resource_mut::<SimControl>().paused = true;
+        let captured = Arc::new(Mutex::new(None));
+        let sink = captured.clone();
+        self.app
+            .world_mut()
+            .spawn(Readback::buffer(handle))
+            .observe(move |event: On<ReadbackComplete>, mut commands: Commands| {
+                *sink.lock().unwrap() = Some(event.data.clone());
+                commands.entity(event.entity).try_despawn();
+            });
+        for _ in 0..200 {
+            self.frame();
+            if captured.lock().unwrap().is_some() {
+                break;
+            }
+        }
+        self.app.world_mut().resource_mut::<SimControl>().paused = false;
+        let bytes = captured.lock().unwrap().take().expect("readback timed out");
+        bytes
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .map(|c| {
+                Vec4::from_array(std::array::from_fn(|k| {
+                    f32::from_le_bytes(c[4 * k..4 * k + 4].try_into().unwrap())
+                }))
+            })
+            .collect()
+    }
+
+    /// The shared discharge field ([`WaterFields::discharge`]).
+    fn read_discharge(&mut self) -> Vec<Vec4> {
+        let handle = self.app.world().resource::<WaterFields>().discharge.clone();
+        self.read_vec4(handle)
+    }
+
+    fn pause(&mut self, paused: bool) {
+        self.app.world_mut().resource_mut::<SimControl>().paused = paused;
     }
 
     fn read_water(&mut self) -> Vec<Water> {
@@ -878,4 +922,183 @@ fn natural_ridge_pour_images() {
         corr(&fine(&cut), &bed_fine),
         corr(&fine(&depth), &bed_fine)
     );
+}
+
+/// Valley along x, falling toward +x, with its thalweg at y = N/2; low, so the f16 height
+/// readback resolves about 3e-5.
+fn valley(x: u32, y: u32) -> f32 {
+    0.03 + 0.0003 * (N - 1 - x) as f32 + 0.0001 * (y as f32 + 0.5 - N as f32 / 2.0).abs()
+}
+
+/// Shape Beds from discharge: a spring-fed stream gets its channel on the first press, and a
+/// second press changes nothing.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn shape_beds_converges() {
+    let mut h = Harness::new(WaterSolver::Swe, valley);
+    h.water().springs.push(Spring {
+        center: Vec2::new(24.0, N as f32 / 2.0),
+        radius: 6.0,
+        rate: 0.05,
+    });
+    h.run(40.0);
+    let q = h.read_discharge();
+    let water = h.read_water();
+    let before = h.read_heights();
+    let mid = N / 2;
+    let q_mid = q[idx(N / 2, mid)].truncate().truncate().length();
+    let channel = h.app.world().resource::<WaterControl>().bed.channel_discharge;
+    let flowing = q
+        .iter()
+        .filter(|v| v.truncate().truncate().length() > channel)
+        .count();
+    println!(
+        "valley stream: depth {:.4} speed {:.1} texels/s at the middle, unit discharge {q_mid:.3}, \
+         {flowing} cells above the channel threshold",
+        water[idx(N / 2, mid)].depth,
+        water[idx(N / 2, mid)].velocity.length()
+    );
+
+    let press = |h: &mut Harness| {
+        h.pause(true);
+        let mut water = h.water();
+        water.shape_generation = water.shape_generation.wrapping_add(1);
+        h.frame();
+        h.frame();
+        h.read_heights()
+    };
+    let first = press(&mut h);
+    if std::env::var("TEST_PROFILE").is_ok() {
+        for x in (8..N - 8).step_by(16) {
+            let w = q[idx(x, mid)];
+            let wet = (0..N).filter(|&y| q[idx(x, y)].truncate().truncate().length() > channel).count();
+            println!(
+                "x {x}: cut {:.4} q {:.3} depth {:.4} flowing width {wet}",
+                before[idx(x, mid)] - first[idx(x, mid)],
+                w.truncate().truncate().length(),
+                w.z
+            );
+        }
+    }
+    let second = press(&mut h);
+    // Below the spring's pool, which is shaped as still water.
+    let cut: Vec<f32> = (64..N - 40)
+        .map(|x| before[idx(x, mid)] - first[idx(x, mid)])
+        .collect();
+    let mean_cut = cut.iter().sum::<f32>() / cut.len() as f32;
+    let min_cut = cut.iter().fold(f32::MAX, |a, b| a.min(*b));
+    let (again, at) = first
+        .iter()
+        .zip(&second)
+        .enumerate()
+        .fold((0.0f32, 0), |a, (i, (x, y))| if (x - y).abs() > a.0 { ((x - y).abs(), i) } else { a });
+    println!("largest second-press change at ({}, {})", at as u32 % N, at as u32 / N);
+    // Cross-section at the middle: the thalweg is the lowest point and the banks rise from it.
+    let section: Vec<f32> = (mid - 6..=mid + 6)
+        .map(|y| first[idx(N / 2, y)] - before[idx(N / 2, y)])
+        .collect();
+    println!(
+        "shape beds: thalweg cut mean {mean_cut:.4} min {min_cut:.4}, second press changes {again:.6}, \
+         cross-section change {:?}",
+        section.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>()
+    );
+    // Keep shaping with the water running between presses: the cut settles.
+    h.pause(false);
+    h.run(10.0);
+    let third = press(&mut h);
+    let drift = (64..N - 40)
+        .map(|x| (third[idx(x, mid)] - first[idx(x, mid)]).abs())
+        .fold(0.0f32, f32::max);
+    println!("after 10 s of flow, another press moves the thalweg by up to {drift:.5}");
+    assert!(min_cut > 0.002, "the stream got no channel ({min_cut})");
+    assert!(again < 1e-4, "a second press changed the bed by {again}");
+    assert!(
+        section[6] <= section[0] && section[6] <= section[12],
+        "the thalweg is not the deepest cut"
+    );
+    assert!(
+        drift < 0.4 * mean_cut,
+        "pressing again after the flow settled cut {drift} deeper"
+    );
+}
+
+/// The shared discharge field: on the default terrain with KTT rivers, the solver's discharge
+/// from a spring runs where KTT's rivers are. Reports their correlation and the calibration
+/// of `KTT_DISCHARGE_SCALE`.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn discharge_matches_ktt() {
+    let mut h = Harness::natural(WaterSolver::Swe);
+    {
+        let mut params = h.app.world_mut().resource_mut::<ErodeParams>();
+        params.do_rivers = 1;
+        params.momentum_coherence = 0.5;
+    }
+    let mut reset = h.app.world_mut().resource_mut::<ResetSim>();
+    reset.generation = reset.generation.wrapping_add(1);
+    h.settle_cascade();
+    // One frame of water so the discharge field picks up KTT's rivers.
+    h.water().rainfall = 1e-9;
+    h.run(0.1);
+    let heights = h.read_heights();
+    let ktt: Vec<f32> = h.read_discharge().iter().map(|v| v.w).collect();
+    // Spring on a strong river high up: the largest KTT discharge above the median height.
+    let mut sorted = heights.clone();
+    sorted.sort_by(f32::total_cmp);
+    let median = sorted[sorted.len() / 2];
+    let m = 24;
+    let (mut best, mut at) = (0.0f32, (N / 2, N / 2));
+    for y in m..N - m {
+        for x in m..N - m {
+            let i = idx(x, y);
+            if heights[i] > median && ktt[i] > best {
+                best = ktt[i];
+                at = (x, y);
+            }
+        }
+    }
+    h.water().rainfall = 0.0;
+    h.water().springs.push(Spring {
+        center: Vec2::new(at.0 as f32, at.1 as f32),
+        radius: 6.0,
+        rate: 0.05,
+    });
+    h.run(20.0);
+    let d = h.read_discharge();
+    let solver: Vec<f32> = d.iter().map(|v| v.truncate().truncate().length()).collect();
+    // Cells the spring's water reaches.
+    let cells: Vec<usize> = (0..d.len()).filter(|&i| solver[i] > 0.01).collect();
+    let mean = |f: &dyn Fn(usize) -> f32| cells.iter().map(|&i| f(i)).sum::<f32>() / cells.len() as f32;
+    let (ms, mk) = (mean(&|i| solver[i]), mean(&|i| ktt[i]));
+    let cov = mean(&|i| (solver[i] - ms) * (ktt[i] - mk));
+    let (vs, vk) = (
+        mean(&|i| (solver[i] - ms).powi(2)),
+        mean(&|i| (ktt[i] - mk).powi(2)),
+    );
+    let corr = cov / (vs * vk).sqrt().max(1e-12);
+    // Share of the solver's strongest discharge that sits on KTT's upper-quartile rivers.
+    let mut k_sorted: Vec<f32> = ktt.clone();
+    k_sorted.sort_by(f32::total_cmp);
+    let k75 = k_sorted[k_sorted.len() * 3 / 4];
+    let mut top = cells.clone();
+    top.sort_by(|&a, &b| solver[b].total_cmp(&solver[a]));
+    top.truncate(200);
+    let on_river = top.iter().filter(|&&i| ktt[i] > k75).count() as f32 / top.len().max(1) as f32;
+    let mut ratios: Vec<f32> = top
+        .iter()
+        .filter(|&&i| ktt[i] > 0.0)
+        .map(|&i| solver[i] / ktt[i])
+        .collect();
+    ratios.sort_by(f32::total_cmp);
+    let ratio = ratios.get(ratios.len() / 2).copied().unwrap_or(0.0);
+    println!(
+        "discharge: spring at {at:?} (KTT {best:.3}), {} wet cells, correlation {corr:.2}, \
+         {:.0}% of the 200 strongest on KTT's upper-quartile rivers, solver / KTT {ratio:.2} \
+         (scale KTT_DISCHARGE_SCALE by this)",
+        cells.len(),
+        100.0 * on_river
+    );
+    assert!(cells.len() > 100, "the spring did not flow");
+    assert!(on_river > 0.5, "the spring's water does not follow KTT's rivers");
+    assert!(d.iter().all(|v| v.is_finite()), "discharge holds NaN");
 }

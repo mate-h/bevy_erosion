@@ -141,6 +141,9 @@ enum ErosionSliderFieldKind {
     BedProfile,
     BedStrength,
     BedBankWidth,
+    BedRiverDepth,
+    BedRiverWidth,
+    BedChannelDischarge,
 }
 
 impl ErosionSliderFieldKind {
@@ -215,6 +218,9 @@ impl ErosionSliderFieldKind {
             Self::BedProfile => water.bed.profile = value,
             Self::BedStrength => water.bed.strength = value,
             Self::BedBankWidth => water.bed.bank_width = value,
+            Self::BedRiverDepth => water.bed.river_depth = value,
+            Self::BedRiverWidth => water.bed.river_width = value,
+            Self::BedChannelDischarge => water.bed.channel_discharge = value,
         }
     }
 
@@ -655,7 +661,7 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                     })
                     --
                     @section("Lake & River Beds", true, bsn_list! {
-                        @note_text("Rebuilds beds under the current water.")
+                        @note_text("Cuts channels sized by their discharge, and lake bowls, under the current water.")
                         --
                         @FeathersButton {
                             @caption: bsn! { Text("Shape Beds (G)") ThemedText },
@@ -664,6 +670,12 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         on(|_: On<Activate>, mut water: ResMut<WaterControl>| {
                             water.shape_generation = water.shape_generation.wrapping_add(1);
                         })
+                        --
+                        @slider_row("River Depth", 0.0, 0.03, water.bed.river_depth, ErosionSliderFieldKind::BedRiverDepth)
+                        --
+                        @slider_row("River Width", 1.0, 16.0, water.bed.river_width, ErosionSliderFieldKind::BedRiverWidth)
+                        --
+                        @slider_row("Channel Discharge", 0.0, 0.2, water.bed.channel_discharge, ErosionSliderFieldKind::BedChannelDischarge)
                         --
                         @slider_row("Max Depth", 0.0, 0.1, water.bed.max_depth, ErosionSliderFieldKind::BedMaxDepth)
                         --
@@ -703,7 +715,7 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         @note_text(format!("Pyramid Levels: {}", params.pyramid_levels().len()))
                         PyramidLevelCountText
                         --
-                        @slider_row("Feature Size", 0.5, 64.0, params.feature_size, ErosionSliderFieldKind::FeatureSize)
+                        @slider_row("Feature Size", 0.5, 128.0, params.feature_size, ErosionSliderFieldKind::FeatureSize)
                         --
                         @slider_row("Detail Smoothing", 0.0, 4.0, params.source_detail_smoothing, ErosionSliderFieldKind::SourceDetailSmoothing)
                         --
