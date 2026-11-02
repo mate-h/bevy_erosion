@@ -210,7 +210,9 @@ impl Harness {
         self.app.world_mut().resource_mut::<SimControl>().paused = false;
         let bytes = captured.lock().unwrap().take().expect("readback timed out");
         bytes
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|c| {
                 std::array::from_fn(|k| f16_to_f32(u16::from_le_bytes([c[2 * k], c[2 * k + 1]])))
             })

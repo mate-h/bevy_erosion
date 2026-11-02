@@ -134,6 +134,7 @@ struct CachedEnvMap(GeneratedEnvironmentMapLight);
 /// then take [`GeneratedEnvironmentMapLight`] off the camera (its [`EnvironmentMapLight`] stays)
 /// and bake again once the sun has moved and settled. Same approach as flex's
 /// `freeze_atmosphere_env_map`.
+#[allow(clippy::type_complexity)]
 fn freeze_atmosphere_env_map(
     mut commands: Commands,
     ready: Res<RenderReadyFrames>,
@@ -181,6 +182,7 @@ fn freeze_atmosphere_env_map(
 
 /// In simple or bench mode, log the mean frame time every few seconds once the cascade is done
 /// (and, for a bench, quit after `EROSION_BENCH_SECONDS`).
+#[allow(clippy::too_many_arguments)]
 fn log_frame_times(
     time: Res<Time<Real>>,
     progress: Res<PyramidProgress>,
