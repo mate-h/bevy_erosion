@@ -1193,3 +1193,24 @@ fn blur_ao_vertical(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(ao_out, vec2<i32>(px, py), vec4<f32>(sum, 0.0, 0.0, 0.0));
 }
 
+
+// Debug views (`TerrainView`): KTT's per-cell masks and the sediment above the bedrock.
+@group(1) @binding(0) var masks_out: texture_storage_2d<rgba16float, write>;
+// R = sediment above the bedrock (height units, 0 without bedrock), G = raw age.
+@group(1) @binding(1) var layers_out: texture_storage_2d<rgba16float, write>;
+
+@compute @workgroup_size(8,8,1)
+fn blit_fields(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let out_px = vec2<i32>(gid.xy);
+    if (any(gid.xy >= textureDimensions(masks_out))) { return; }
+    let px = gid.x + params.pad_offset.x;
+    let py = gid.y + params.pad_offset.y;
+    let idx = py * params.map_size.x + px;
+    let h = f32(atomicLoad(&height[idx])) / HEIGHT_SCALE;
+    textureStore(masks_out, out_px, masks[idx]);
+    var above_bedrock = 0.0;
+    if (params.use_bedrock != 0u) {
+        above_bedrock = max(h - layers[idx].x, 0.0);
+    }
+    textureStore(layers_out, out_px, vec4<f32>(above_bedrock, layers[idx].y, 0.0, 1.0));
+}

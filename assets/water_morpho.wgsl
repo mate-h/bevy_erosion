@@ -339,3 +339,26 @@ fn morpho_exner(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     state[4u * i + 2u] = pending;
 }
+
+// Debug views (`TerrainView`), on the water grid.
+// x, y = averaged unit discharge, z = averaged depth, w = KTT river discharge.
+@group(1) @binding(0) var discharge_out: texture_storage_2d<rgba16float, write>;
+// x = bed load through the cell (cells² per second), y = helical intensity, z = bed change not yet
+// written to the heights (height units).
+@group(1) @binding(1) var bed_out: texture_storage_2d<rgba16float, write>;
+
+@compute @workgroup_size(8, 8, 1)
+fn morpho_debug(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = vec2<i32>(gid.xy);
+    if (!inside(p)) { return; }
+    let i = widx(p);
+    textureStore(discharge_out, p, discharge[i]);
+    // Face fluxes averaged onto the cell centre.
+    let qb = 0.5 * (bed_load[i] + vec2<f32>(
+        bed_load[widx(clamp_map(p + DIRS[0]))].x,
+        bed_load[widx(clamp_map(p + DIRS[2]))].y,
+    ));
+    // The helical pass this frame wrote the slot the parity does not name.
+    let helical_now = state[4u * i + 1u - params.parity];
+    textureStore(bed_out, p, vec4<f32>(length(qb), helical_now, state[4u * i + 2u], 1.0));
+}

@@ -356,6 +356,15 @@ pub struct ErosionImages {
     /// R = height offset, G = flatten weight, B = flatten target height, A = smooth weight.
     /// Edit it on the CPU and bump [`ResetSim`] to re-erode (see [`brush`]).
     pub terrain_edit: Handle<Image>,
+    /// Debug views of KTT's masks (Rgba16Float, map size): softness, outflow, erode mask, uplift.
+    pub debug_masks: Handle<Image>,
+    /// Debug views (Rgba16Float, map size): R = sediment above the bedrock, G = raw age.
+    pub debug_layers: Handle<Image>,
+    /// Debug views of [`WaterFields::discharge`] (Rgba16Float, map size).
+    pub debug_discharge: Handle<Image>,
+    /// Debug views of the bed load (Rgba16Float, map size): R = bed load through the cell,
+    /// G = helical intensity, B = bed change not yet written to the heights.
+    pub debug_bed: Handle<Image>,
 }
 
 /// Creates all erosion render-target images for the given map size and adds them to `images`.
@@ -381,6 +390,10 @@ pub fn create_erosion_images(images: &mut Assets<Image>, size: UVec2) -> Erosion
         water_surface: add(images, TextureFormat::Rgba32Float),
         water_velocity: add(images, TextureFormat::Rgba32Float),
         terrain_edit: images.add(empty_terrain_edit_image(size)),
+        debug_masks: add(images, TextureFormat::Rgba16Float),
+        debug_layers: add(images, TextureFormat::Rgba16Float),
+        debug_discharge: add(images, TextureFormat::Rgba16Float),
+        debug_bed: add(images, TextureFormat::Rgba16Float),
     }
 }
 
@@ -452,23 +465,213 @@ pub fn empty_terrain_edit_image(size: UVec2) -> Image {
 /// Extended material type for terrain rendering
 pub type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
 
-/// Preview mode for terrain visualization
+/// How the terrain is drawn: shaded, or one simulation field in false colour. The discriminant
+/// is the `mode` the terrain shader switches on (`terrain_extended.wesl`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Reflect)]
+#[repr(u32)]
 pub enum PreviewMode {
+    /// Full PBR with the atmosphere and bevy_fft's water surface.
     #[default]
-    Pbr,
-    Flow,
-    Sediment,
-    Erosion,
-    Height,
-    Normals,
-    Curvature,
-    Age,
+    Pbr = 0,
     /// Lambert-shaded terrain colour with flat water tint: no PBR or water optics, for timing the
     /// simulations.
-    Simple,
+    Simple = 1,
+    // Terrain
+    Albedo = 2,
+    Height = 3,
+    Slope = 4,
+    Normals = 5,
+    Curvature = 6,
+    AmbientOcclusion = 7,
+    TerrainEdits = 8,
+    // Erosion
+    Flow = 9,
+    Sediment = 10,
+    Erosion = 11,
     /// KTT river momentum, with Do Rivers on.
-    Rivers,
+    Rivers = 12,
+    Age = 13,
+    // KTT masks and layers
+    Softness = 14,
+    Outflow = 15,
+    ErodeMask = 16,
+    Uplift = 17,
+    Bedrock = 18,
+    // Water
+    WaterDepth = 19,
+    WaterVelocity = 20,
+    SuspendedSediment = 21,
+    Discharge = 22,
+    MeanDepth = 23,
+    RiverDischarge = 24,
+    BedLoad = 25,
+    Helical = 26,
+    BedChange = 27,
+}
+
+impl PreviewMode {
+    pub const ALL: [Self; 28] = [
+        Self::Pbr,
+        Self::Simple,
+        Self::Albedo,
+        Self::Height,
+        Self::Slope,
+        Self::Normals,
+        Self::Curvature,
+        Self::AmbientOcclusion,
+        Self::TerrainEdits,
+        Self::Flow,
+        Self::Sediment,
+        Self::Erosion,
+        Self::Rivers,
+        Self::Age,
+        Self::Softness,
+        Self::Outflow,
+        Self::ErodeMask,
+        Self::Uplift,
+        Self::Bedrock,
+        Self::WaterDepth,
+        Self::WaterVelocity,
+        Self::SuspendedSediment,
+        Self::Discharge,
+        Self::MeanDepth,
+        Self::RiverDischarge,
+        Self::BedLoad,
+        Self::Helical,
+        Self::BedChange,
+    ];
+
+    /// Shaded views draw the atmosphere and water; the rest show the bare field.
+    pub fn is_shaded(self) -> bool {
+        matches!(self, Self::Pbr | Self::Simple)
+    }
+
+    pub fn group(self) -> &'static str {
+        match self as u32 {
+            0..=1 => "Shading",
+            2..=8 => "Terrain",
+            9..=13 => "Erosion",
+            14..=18 => "Masks & Layers",
+            _ => "Water",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pbr => "Full PBR",
+            Self::Simple => "Simple",
+            Self::Albedo => "Albedo",
+            Self::Height => "Height",
+            Self::Slope => "Slope",
+            Self::Normals => "Normals",
+            Self::Curvature => "Curvature",
+            Self::AmbientOcclusion => "AO",
+            Self::TerrainEdits => "Edits",
+            Self::Flow => "Flow",
+            Self::Sediment => "Sediment",
+            Self::Erosion => "Erosion",
+            Self::Rivers => "Rivers",
+            Self::Age => "Age",
+            Self::Softness => "Softness",
+            Self::Outflow => "Outflow",
+            Self::ErodeMask => "Erode Mask",
+            Self::Uplift => "Uplift",
+            Self::Bedrock => "Bedrock",
+            Self::WaterDepth => "Depth",
+            Self::WaterVelocity => "Velocity",
+            Self::SuspendedSediment => "Suspended",
+            Self::Discharge => "Discharge",
+            Self::MeanDepth => "Mean Depth",
+            Self::RiverDischarge => "KTT Rivers",
+            Self::BedLoad => "Bed Load",
+            Self::Helical => "Helical",
+            Self::BedChange => "Bed Change",
+        }
+    }
+
+    /// What the view shows and how it is coloured.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Pbr => "Lit terrain with atmosphere, shadows and the water surface.",
+            Self::Simple => "Lambert-shaded terrain colour with a flat water tint; no atmosphere or water optics.",
+            Self::Albedo => "Unlit terrain colour from the erosion's colour bands.",
+            Self::Height => "Height with contour bands every 0.01.",
+            Self::Slope => "Slope angle: black flat, white 60°+.",
+            Self::Normals => "View-space normals.",
+            Self::Curvature => "Laplacian of height: blue concave (valleys), red convex (ridges).",
+            Self::AmbientOcclusion => "Baked ambient occlusion.",
+            Self::TerrainEdits => "Brush height offset: blue lowered, red raised; green flatten, white smooth weight.",
+            Self::Flow => "KTT trail flow magnitude (heat).",
+            Self::Sediment => "Loose deposited sediment (heat).",
+            Self::Erosion => "Material removed by trails (heat).",
+            Self::Rivers => "KTT river momentum, with Do Rivers on (heat).",
+            Self::Age => "Time since a trail last changed the cell (Age Strength scales it).",
+            Self::Softness => "Softness mask: black hard rock, white soft.",
+            Self::Outflow => "Outflow mask: white drains away (ocean, border).",
+            Self::ErodeMask => "Erode mask: trails start only where white.",
+            Self::Uplift => "Uplift map multiplier.",
+            Self::Bedrock => "Sediment above the bedrock (heat; black at bedrock). Needs Use Bedrock.",
+            Self::WaterDepth => "Water depth from the solver (heat), ocean in grey.",
+            Self::WaterVelocity => "Water velocity: hue is direction, brightness is speed.",
+            Self::SuspendedSediment => "Sediment carried by the water (heat).",
+            Self::Discharge => "Averaged unit discharge h·u: hue is direction, brightness magnitude.",
+            Self::MeanDepth => "Depth averaged over a few seconds (heat).",
+            Self::RiverDischarge => "KTT river discharge in water units (heat).",
+            Self::BedLoad => "Bed load through each cell (heat).",
+            Self::Helical => "Helical (secondary) flow intensity: blue one way, red the other.",
+            Self::BedChange => "Bed change not yet written: blue scour, red deposit.",
+        }
+    }
+}
+
+/// The terrain view the demo's terrain material draws. [`ErosionComputePlugin`] copies it to
+/// every [`TerrainMaterial`] when it changes.
+#[derive(Resource, Debug, Clone, Copy, PartialEq)]
+pub struct TerrainView {
+    pub mode: PreviewMode,
+    /// Multiplies the field before colouring, as a power of ten.
+    pub gain: f32,
+}
+
+impl Default for TerrainView {
+    fn default() -> Self {
+        Self {
+            mode: PreviewMode::Pbr,
+            gain: 0.0,
+        }
+    }
+}
+
+/// [`TerrainExtension`] view uniform.
+#[derive(Debug, Clone, Copy, ShaderType, Reflect)]
+pub struct TerrainViewUniform {
+    pub mode: u32,
+    /// Linear gain (10^[`TerrainView::gain`]).
+    pub gain: f32,
+}
+
+impl From<TerrainView> for TerrainViewUniform {
+    fn from(view: TerrainView) -> Self {
+        Self {
+            mode: view.mode as u32,
+            gain: 10f32.powf(view.gain),
+        }
+    }
+}
+
+fn sync_terrain_view(
+    view: Res<TerrainView>,
+    materials: Option<ResMut<Assets<TerrainMaterial>>>,
+) {
+    let Some(mut materials) = materials else {
+        return;
+    };
+    if !view.is_changed() {
+        return;
+    }
+    for (_, mat) in materials.iter_mut() {
+        mat.extension.view = (*view).into();
+    }
 }
 
 /// Parameters for ambient occlusion computation
@@ -511,15 +714,46 @@ pub struct TerrainExtension {
     // Displacement height scale
     #[uniform(106)]
     pub height_scale: f32,
-    // Preview mode: 0=PBR, 1=Flow, 2=Sediment, 3=Erosion, 4=Height, 5=Normals, 6=Curvature, 7=Age
+    /// [`PreviewMode`] and gain; set from [`TerrainView`].
     #[uniform(107)]
-    pub preview_mode: u32,
+    pub view: TerrainViewUniform,
     /// Water solver output ([`ErosionImages::water`]): the surface rises to terrain + depth.
     #[texture(108)]
     pub water_tex: Handle<Image>,
     /// Ocean level (0 = no ocean): terrain below it renders as a flat sea.
     #[uniform(109)]
     pub sea_level: f32,
+    /// Debug views: [`ErosionImages::terrain_edit`] and the `debug_*` images.
+    #[texture(110, sample_type = "float", filterable = false)]
+    pub terrain_edit_tex: Handle<Image>,
+    #[texture(111)]
+    pub debug_masks_tex: Handle<Image>,
+    #[texture(112)]
+    pub debug_layers_tex: Handle<Image>,
+    #[texture(113)]
+    pub debug_discharge_tex: Handle<Image>,
+    #[texture(114)]
+    pub debug_bed_tex: Handle<Image>,
+}
+
+impl TerrainExtension {
+    /// A terrain material over `images`, displaced by `height_scale` world units per height unit.
+    pub fn new(images: &ErosionImages, height_scale: f32) -> Self {
+        Self {
+            height_tex: images.height.clone(),
+            color_tex: images.color.clone(),
+            analysis_tex: images.analysis.clone(),
+            ao_tex: images.ao.clone(),
+            height_scale,
+            water_tex: images.water.clone(),
+            terrain_edit_tex: images.terrain_edit.clone(),
+            debug_masks_tex: images.debug_masks.clone(),
+            debug_layers_tex: images.debug_layers.clone(),
+            debug_discharge_tex: images.debug_discharge.clone(),
+            debug_bed_tex: images.debug_bed.clone(),
+            ..default()
+        }
+    }
 }
 
 impl Default for TerrainExtension {
@@ -530,9 +764,14 @@ impl Default for TerrainExtension {
             analysis_tex: Default::default(),
             ao_tex: Default::default(),
             height_scale: 50.0,
-            preview_mode: 0,
+            view: TerrainView::default().into(),
             water_tex: Default::default(),
             sea_level: 0.0,
+            terrain_edit_tex: Default::default(),
+            debug_masks_tex: Default::default(),
+            debug_layers_tex: Default::default(),
+            debug_discharge_tex: Default::default(),
+            debug_bed_tex: Default::default(),
         }
     }
 }
@@ -1216,8 +1455,9 @@ impl Plugin for ErosionComputePlugin {
                 ExtractResourcePlugin::<WaterControl>::default(),
                 ExtractResourcePlugin::<river::RiverBed>::default(),
             ))
+            .init_resource::<TerrainView>()
             .add_systems(Startup, setup_erosion_resources)
-            .add_systems(PostUpdate, update_water_time);
+            .add_systems(PostUpdate, (update_water_time, sync_terrain_view));
         if !app.is_plugin_added::<ShallowWaterSolverPlugin>() {
             app.add_plugins(ShallowWaterSolverPlugin);
         }
@@ -1252,6 +1492,8 @@ struct ErosionPipeline {
     layout_water_bed: BindGroupLayoutDescriptor,
     layout_blit: BindGroupLayoutDescriptor,
     layout_blit_blur: BindGroupLayoutDescriptor,
+    /// Two debug view outputs (group 1 of `blit_fields` and `morpho_debug`).
+    layout_debug_out: BindGroupLayoutDescriptor,
     layout_upscale_height: BindGroupLayoutDescriptor,
     layout_upscale_rivers: BindGroupLayoutDescriptor,
     layout_upscale_masks: BindGroupLayoutDescriptor,
@@ -1266,6 +1508,9 @@ struct ErosionPipeline {
     pipeline_ao: CachedComputePipelineId,
     pipeline_blur_h: CachedComputePipelineId,
     pipeline_blur_v: CachedComputePipelineId,
+    /// Debug views: `blit_fields` (`erosion.wgsl`) and `morpho_debug` (`water_morpho.wgsl`).
+    pipeline_blit_fields: CachedComputePipelineId,
+    pipeline_morpho_debug: CachedComputePipelineId,
     /// `water.wgsl`: clear, flux, depth, erode, advect, copy, the bevy_fft solver's export,
     /// gather and import, apply (the staged erosion), and the surface for bevy_fft's renderer.
     pipelines_water: [CachedComputePipelineId; 11],
@@ -1348,6 +1593,17 @@ fn init_erosion_pipeline(
                 texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly), // analysis (flow+sediment+erosion combined)
                 texture_storage_2d(TextureFormat::R16Float, StorageTextureAccess::ReadWrite), // AO
                 texture_storage_2d(TextureFormat::R16Float, StorageTextureAccess::ReadWrite), // AO temp
+            ),
+        ),
+    );
+
+    let layout_debug_out = BindGroupLayoutDescriptor::new(
+        "ErosionDebugGroup1",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
+                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
             ),
         ),
     );
@@ -1597,6 +1853,12 @@ fn init_erosion_pipeline(
         "blur_ao_vertical",
     );
 
+    let pipeline_blit_fields = compute(
+        vec![layout_erosion.clone(), layout_debug_out.clone()],
+        &shader,
+        "blit_fields",
+    );
+
     let water_shader = asset_server.load(WATER_SHADER);
     let pipelines_water = [
         "water_clear",
@@ -1647,6 +1909,11 @@ fn init_erosion_pipeline(
         };
         compute(vec![layout.clone()], &water_morpho_shader, entry)
     });
+    let pipeline_morpho_debug = compute(
+        vec![layout_water_morpho.clone(), layout_debug_out.clone()],
+        &water_morpho_shader,
+        "morpho_debug",
+    );
 
     let water_splat_shader = asset_server.load(WATER_SPLAT_SHADER);
     let pipelines_water_splat = ["water_splat", "water_record"]
@@ -1688,6 +1955,7 @@ fn init_erosion_pipeline(
         layout_water_out,
         layout_blit,
         layout_blit_blur,
+        layout_debug_out,
         layout_upscale_height,
         layout_upscale_rivers,
         layout_upscale_masks,
@@ -1702,6 +1970,8 @@ fn init_erosion_pipeline(
         pipeline_ao,
         pipeline_blur_h,
         pipeline_blur_v,
+        pipeline_blit_fields,
+        pipeline_morpho_debug,
         pipelines_water,
     });
 }
@@ -1930,6 +2200,9 @@ struct ErosionBindGroups {
     river: [BindGroup; 2],
     blit: BindGroup,
     blit_blur: BindGroup,
+    /// Debug view outputs of `blit_fields` and `morpho_debug`.
+    debug_fields: BindGroup,
+    debug_water: BindGroup,
 }
 
 fn prepare_erosion_buffers(
@@ -1991,6 +2264,10 @@ fn prepare_erosion_bind_groups(
         Some(view_water_surface),
         Some(view_water_velocity),
         Some(view_terrain_edit),
+        Some(view_debug_masks),
+        Some(view_debug_layers),
+        Some(view_debug_discharge),
+        Some(view_debug_bed),
     ) = (
         gpu_images.get(&images.height),
         gpu_images.get(&images.color),
@@ -2002,6 +2279,10 @@ fn prepare_erosion_bind_groups(
         gpu_images.get(&images.water_surface),
         gpu_images.get(&images.water_velocity),
         gpu_images.get(&images.terrain_edit),
+        gpu_images.get(&images.debug_masks),
+        gpu_images.get(&images.debug_layers),
+        gpu_images.get(&images.debug_discharge),
+        gpu_images.get(&images.debug_bed),
     )
     else {
         return;
@@ -2232,6 +2513,22 @@ fn prepare_erosion_bind_groups(
                 &view_analysis.texture_view,
                 &view_ao.texture_view,
                 &view_ao_temp.texture_view,
+            )),
+        ),
+        debug_fields: render_device.create_bind_group(
+            None,
+            &layout(&pipeline.layout_debug_out),
+            &BindGroupEntries::sequential((
+                &view_debug_masks.texture_view,
+                &view_debug_layers.texture_view,
+            )),
+        ),
+        debug_water: render_device.create_bind_group(
+            None,
+            &layout(&pipeline.layout_debug_out),
+            &BindGroupEntries::sequential((
+                &view_debug_discharge.texture_view,
+                &view_debug_bed.texture_view,
             )),
         ),
     });
@@ -3042,13 +3339,23 @@ fn erosion_compute(
                     (pipes.pipeline_blur_h, &groups.blit_blur),
                     (pipes.pipeline_blur_v, &groups.blit_blur),
                 ];
-                for &(id, group1) in &passes[..if ao { 4 } else { 1 }] {
+                let fields = (pipes.pipeline_blit_fields, &groups.debug_fields);
+                for &(id, group1) in passes[..if ao { 4 } else { 1 }]
+                    .iter()
+                    .chain(std::iter::once(&fields))
+                {
                     if let Some(p) = get(id) {
                         pass.set_pipeline(p);
                         pass.set_bind_group(0, erosion, &[offset]);
                         pass.set_bind_group(1, group1, &[]);
                         pass.dispatch_workgroups(gx, gy, 1);
                     }
+                }
+                if water && let Some(p) = get(pipes.pipeline_morpho_debug) {
+                    pass.set_pipeline(p);
+                    pass.set_bind_group(0, &groups.water_morpho[set], &[]);
+                    pass.set_bind_group(1, &groups.debug_water, &[]);
+                    pass.dispatch_workgroups(gx, gy, 1);
                 }
                 // The surface follows the terrain and the ocean even while no water moves.
                 if water && let Some(p) = get(pipes.pipelines_water[10]) {

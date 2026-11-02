@@ -12,7 +12,7 @@
 //! re-filtering the environment map every frame. `EROSION_BENCH_POUR=x,y` places a spring at
 //! texel (x, y) and moves the camera close to it or to the river's source (or to `EROSION_BENCH_TARGET=x,y`;
 //! `EROSION_BENCH_DISTANCE`, `_PITCH` and `_YAW`,
-//! in degrees, frame it), and `EROSION_BENCH_RAIN=<‰/s>` rains on the whole map, `EROSION_BENCH_RIVER=x,y` places a river from texel (x, y). `EROSION_BENCH_SCREENSHOT=<path>` hides the settings panel (kept with `EROSION_BENCH_PANEL=1`) and saves
+//! in degrees, frame it), and `EROSION_BENCH_RAIN=<‰/s>` rains on the whole map, `EROSION_BENCH_RIVER=x,y` places a river from texel (x, y). `EROSION_VIEW=<view>` starts in a debug view (see the View tab). `EROSION_BENCH_SCREENSHOT=<path>` hides the settings panel (kept with `EROSION_BENCH_PANEL=1`) and saves
 //! the window just before the bench quits.
 
 use bevy::camera::visibility::NoFrustumCulling;
@@ -88,6 +88,22 @@ fn seed_from_env(mut params: ResMut<ErodeParams>) {
     }
 }
 
+/// `EROSION_VIEW=<view>` starts in another view, by its label in the View tab or its
+/// [`PreviewMode`] name (any case, spaces optional), e.g. `EROSION_VIEW=bedload`.
+fn view_from_env(mut view: ResMut<TerrainView>) {
+    let Ok(name) = std::env::var("EROSION_VIEW") else {
+        return;
+    };
+    let key = |s: &str| s.to_lowercase().replace(' ', "");
+    let found = PreviewMode::ALL
+        .iter()
+        .find(|m| [key(m.label()), key(&format!("{m:?}"))].contains(&key(&name)));
+    match found {
+        Some(&mode) => view.mode = mode,
+        None => warn!("EROSION_VIEW: no view named {name}"),
+    }
+}
+
 fn main() {
     let simple = simple_mode();
     let present_mode = if simple || bench_seconds().is_some() {
@@ -121,13 +137,14 @@ fn main() {
             ErosionParamsPlugin,
         ))
         .add_systems(Startup, (setup, print_controls))
-        .add_systems(PostStartup, (spawn_terrain, seed_from_env))
+        .add_systems(PostStartup, (spawn_terrain, seed_from_env, view_from_env))
         .add_systems(
             Update,
             (
                 handle_reset_input,
                 handle_sim_input,
                 handle_preview_mode_input,
+                apply_terrain_view.after(handle_preview_mode_input),
                 handle_brush_input,
                 sync_sea_level,
                 freeze_atmosphere_env_map,
@@ -333,20 +350,17 @@ fn log_frame_times(
     }
 }
 
-#[derive(Resource, Default)]
-struct CurrentPreviewMode {
-    mode: PreviewMode,
-}
-
 #[derive(Component)]
 struct DemoAtmosphere;
 
-#[derive(Resource)]
-struct DemoEarthMedium(Handle<ScatteringMedium>);
-
 fn setup(mut commands: Commands) {
-    commands.insert_resource(CurrentPreviewMode::default());
     commands.insert_resource(GlobalAmbientLight::NONE);
+    if simple_mode() {
+        commands.insert_resource(TerrainView {
+            mode: PreviewMode::Simple,
+            ..default()
+        });
+    }
 }
 
 fn print_controls() {
@@ -364,6 +378,7 @@ fn print_controls() {
     println!("  8 - Age map preview");
     println!("  9 - Simple shading (no atmosphere or water optics; see --simple)");
     println!("  0 - River momentum (Do Rivers)");
+    println!("  (the View tab of the settings panel has every view)");
     println!("  B - toggle the brush (left drag paints, Shift + drag erases, right drag orbits)");
     println!("  V - cycle brush: rain / terrain / water body");
     println!("  T - cycle terrain tool: raise / lower / flatten / smooth");
@@ -406,16 +421,8 @@ fn spawn_terrain(
             opaque_render_method: OpaqueRendererMethod::Auto,
             ..Default::default()
         },
-        extension: TerrainExtension {
-            height_tex: erosion_images.height.clone(),
-            color_tex: erosion_images.color.clone(),
-            analysis_tex: erosion_images.analysis.clone(),
-            ao_tex: erosion_images.ao.clone(),
-            height_scale,
-            preview_mode: if simple_mode() { 8 } else { 0 }, // PBR, or Simple
-            water_tex: erosion_images.water.clone(),
-            sea_level: 0.0,
-        },
+        // The view (PBR, or Simple with --simple) follows `TerrainView`.
+        extension: TerrainExtension::new(&erosion_images, height_scale),
     });
 
     if !simple_mode() {
@@ -470,7 +477,6 @@ fn spawn_terrain(
     ));
 
     let earth_medium = scattering_mediums.add(ScatteringMedium::earth(256, 256));
-    commands.insert_resource(DemoEarthMedium(earth_medium.clone()));
 
     let mut atmosphere = Atmosphere::earth(earth_medium);
     atmosphere.ground_albedo = Vec3::splat(0.3);
@@ -630,10 +636,34 @@ fn sync_sea_level(params: Res<ErodeParams>, mut materials: ResMut<Assets<Terrain
     }
 }
 
-fn handle_preview_mode_input(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut preview_mode: ResMut<CurrentPreviewMode>,
-    mut materials: ResMut<Assets<TerrainMaterial>>,
+/// Digits pick the first ten views (the settings panel's View tab has them all).
+fn handle_preview_mode_input(keys: Res<ButtonInput<KeyCode>>, mut view: ResMut<TerrainView>) {
+    let mode = [
+        (KeyCode::Digit1, PreviewMode::Pbr),
+        (KeyCode::Digit2, PreviewMode::Flow),
+        (KeyCode::Digit3, PreviewMode::Sediment),
+        (KeyCode::Digit4, PreviewMode::Erosion),
+        (KeyCode::Digit5, PreviewMode::Height),
+        (KeyCode::Digit6, PreviewMode::Normals),
+        (KeyCode::Digit7, PreviewMode::Curvature),
+        (KeyCode::Digit8, PreviewMode::Age),
+        (KeyCode::Digit9, PreviewMode::Simple),
+        (KeyCode::Digit0, PreviewMode::Rivers),
+    ]
+    .into_iter()
+    .find_map(|(key, mode)| keys.just_pressed(key).then_some(mode));
+    if let Some(mode) = mode
+        && view.mode != mode
+    {
+        view.mode = mode;
+    }
+}
+
+/// Full PBR draws the atmosphere, the water surface, tonemapping, bloom and auto exposure; every
+/// other view shows the terrain alone with none of them, so the colours are the data's.
+#[allow(clippy::type_complexity)]
+fn apply_terrain_view(
+    view: Res<TerrainView>,
     mut commands: Commands,
     mut cameras: Query<
         (
@@ -641,85 +671,48 @@ fn handle_preview_mode_input(
             &mut Tonemapping,
             &mut Bloom,
             Has<AtmosphereSettings>,
+            Option<&AutoExposure>,
         ),
         With<Camera3d>,
     >,
-    mut atmosphere_query: Query<(&mut Atmosphere, &mut Visibility), With<DemoAtmosphere>>,
-    demo_earth_medium: Res<DemoEarthMedium>,
+    mut atmosphere_query: Query<&mut Visibility, With<DemoAtmosphere>>,
+    mut water_surfaces: Query<&mut Visibility, (With<WaterSurfaceTag>, Without<DemoAtmosphere>)>,
+    mut stored_exposure: Local<Option<AutoExposure>>,
 ) {
-    let new_mode = if keys.just_pressed(KeyCode::Digit1) {
-        Some(PreviewMode::Pbr)
-    } else if keys.just_pressed(KeyCode::Digit2) {
-        Some(PreviewMode::Flow)
-    } else if keys.just_pressed(KeyCode::Digit3) {
-        Some(PreviewMode::Sediment)
-    } else if keys.just_pressed(KeyCode::Digit4) {
-        Some(PreviewMode::Erosion)
-    } else if keys.just_pressed(KeyCode::Digit5) {
-        Some(PreviewMode::Height)
-    } else if keys.just_pressed(KeyCode::Digit6) {
-        Some(PreviewMode::Normals)
-    } else if keys.just_pressed(KeyCode::Digit7) {
-        Some(PreviewMode::Curvature)
-    } else if keys.just_pressed(KeyCode::Digit8) {
-        Some(PreviewMode::Age)
-    } else if keys.just_pressed(KeyCode::Digit9) {
-        Some(PreviewMode::Simple)
-    } else if keys.just_pressed(KeyCode::Digit0) {
-        Some(PreviewMode::Rivers)
+    if !view.is_changed() || simple_mode() {
+        return;
+    }
+    let pbr = view.mode == PreviewMode::Pbr;
+    let visibility = if pbr {
+        Visibility::Visible
     } else {
-        None
+        Visibility::Hidden
     };
-
-    if let Some(mode) = new_mode {
-        if preview_mode.mode != mode {
-            preview_mode.mode = mode;
-            println!("Preview mode: {:?}", mode);
-
-            // Update all terrain materials
-            for (_, mat) in materials.iter_mut() {
-                mat.extension.preview_mode = match mode {
-                    PreviewMode::Pbr => 0,
-                    PreviewMode::Flow => 1,
-                    PreviewMode::Sediment => 2,
-                    PreviewMode::Erosion => 3,
-                    PreviewMode::Height => 4,
-                    PreviewMode::Normals => 5,
-                    PreviewMode::Curvature => 6,
-                    PreviewMode::Age => 7,
-                    PreviewMode::Simple => 8,
-                    PreviewMode::Rivers => 9,
-                };
+    for mut v in atmosphere_query.iter_mut().chain(water_surfaces.iter_mut()) {
+        v.set_if_neq(visibility);
+    }
+    for (camera, mut tonemapping, mut bloom, has_atmosphere_settings, exposure) in &mut cameras {
+        if pbr {
+            if !has_atmosphere_settings {
+                commands
+                    .entity(camera)
+                    .insert(AtmosphereSettings::default());
             }
-
-            // Toggle atmosphere, tonemapping, and bloom based on mode
-            for (camera, mut tonemapping, mut bloom, has_atmosphere_settings) in cameras.iter_mut()
-            {
-                if mode == PreviewMode::Pbr {
-                    let mut atmosphere = Atmosphere::earth(demo_earth_medium.0.clone());
-                    atmosphere.ground_albedo = Vec3::splat(0.3);
-                    for (mut atmosphere_component, mut visibility) in atmosphere_query.iter_mut() {
-                        *atmosphere_component = atmosphere.clone();
-                        *visibility = Visibility::Visible;
-                    }
-                    if !has_atmosphere_settings {
-                        commands
-                            .entity(camera)
-                            .insert(AtmosphereSettings::default());
-                    }
-                    *tonemapping = Tonemapping::AcesFitted;
-                    *bloom = Bloom::NATURAL;
-                } else {
-                    for (_, mut visibility) in atmosphere_query.iter_mut() {
-                        *visibility = Visibility::Hidden;
-                    }
-                    if has_atmosphere_settings {
-                        commands.entity(camera).remove::<AtmosphereSettings>();
-                    }
-                    *tonemapping = Tonemapping::None;
-                    bloom.intensity = 0.0;
-                }
+            if let Some(exposure) = stored_exposure.take() {
+                commands.entity(camera).insert(exposure);
             }
+            *tonemapping = Tonemapping::AcesFitted;
+            *bloom = Bloom::NATURAL;
+        } else {
+            if has_atmosphere_settings {
+                commands.entity(camera).remove::<AtmosphereSettings>();
+            }
+            if let Some(exposure) = exposure {
+                *stored_exposure = Some(exposure.clone());
+                commands.entity(camera).remove::<AutoExposure>();
+            }
+            *tonemapping = Tonemapping::None;
+            bloom.intensity = 0.0;
         }
     }
 }

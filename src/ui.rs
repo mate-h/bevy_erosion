@@ -1,8 +1,8 @@
 //! Bevy Feathers UI for erosion parameters.
 //!
-//! A sidebar with a fixed header (simulation controls and progress) over a scrolling list of
-//! collapsible sections. The brush and water sections come first and start open; the KTT
-//! parameter groups start collapsed.
+//! A sidebar with a fixed header (simulation controls, progress and the tab bar) over a scrolling
+//! page of collapsible sections per tab: Brush, Water, Erosion (the KTT parameter groups, mostly
+//! collapsed) and View (render modes and every simulation field as a debug view).
 
 use bevy::{
     feathers::{
@@ -32,8 +32,8 @@ use bevy::{
 
 use crate::camera::OrbitInputBlocked;
 use crate::{
-    ErodeParams, MAX_BANK_WIDTH, MAX_SPRINGS, PyramidProgress, ResetSim, SimControl, WaterControl,
-    WaterSolver,
+    ErodeParams, MAX_BANK_WIDTH, MAX_SPRINGS, PreviewMode, PyramidProgress, ResetSim, SimControl,
+    TerrainView, WaterControl, WaterSolver,
     brush::{BrushMode, TerrainTool, WaterBrush},
 };
 
@@ -64,6 +64,39 @@ struct BrushModeButton {
     mode: BrushMode,
     tool: bool,
 }
+
+/// Top-level tabs of the panel.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+enum Tab {
+    #[default]
+    Brush,
+    Water,
+    Erosion,
+    View,
+}
+
+#[derive(Resource, Default)]
+struct ActiveTab(Tab);
+
+#[derive(Component, Clone, Default)]
+struct TabButton {
+    tab: Tab,
+}
+
+/// A tab's page of sections, shown while its tab is active.
+#[derive(Component, Clone, Default)]
+struct TabPage {
+    tab: Tab,
+}
+
+/// Selects a terrain view; highlighted while it is drawn.
+#[derive(Component, Clone, Default)]
+struct ViewModeButton {
+    mode: PreviewMode,
+}
+
+#[derive(Component, Clone, Default)]
+struct ViewDescriptionText;
 
 /// Clickable header of a collapsible section.
 #[derive(Component, Clone, Default)]
@@ -162,6 +195,7 @@ enum ErosionSliderFieldKind {
     RiverBrushArmour,
     RiverBrushDetail,
     RiverBrushBreach,
+    ViewGain,
 }
 
 impl ErosionSliderFieldKind {
@@ -171,9 +205,11 @@ impl ErosionSliderFieldKind {
         sim: &mut SimControl,
         brush: &mut WaterBrush,
         water: &mut WaterControl,
+        view: &mut TerrainView,
         value: f32,
     ) {
         match self {
+            Self::ViewGain => view.gain = value,
             Self::ErosionStrength => params.erosion_strength = value,
             Self::RockSoftness => params.rock_softness = value,
             Self::ErosionAmount => params.erosion_amount = value,
@@ -265,6 +301,7 @@ impl ErosionSliderFieldKind {
         !matches!(
             self,
             Self::IterationsPerFrame
+                | Self::ViewGain
                 | Self::AgeStrength
                 | Self::BrushRadius
                 | Self::BrushStrength
@@ -462,6 +499,7 @@ impl Plugin for ErosionParamsPlugin {
             )
             .init_resource::<WaterBrush>()
             .init_resource::<WaterControl>()
+            .init_resource::<ActiveTab>()
             .add_systems(
                 PostUpdate,
                 (
@@ -470,6 +508,8 @@ impl Plugin for ErosionParamsPlugin {
                     update_brush_ui,
                     update_spring_count,
                     update_section_chevrons,
+                    update_tabs,
+                    update_view_ui,
                 ),
             );
     }
@@ -553,6 +593,55 @@ fn update_brush_ui(
     };
     for mut text in &mut hints {
         **text = hint.to_string();
+    }
+}
+
+/// Show the active tab's page, highlight its button, and start it scrolled to the top.
+fn update_tabs(
+    active: Res<ActiveTab>,
+    mut buttons: Query<(&TabButton, &mut ButtonVariant)>,
+    mut pages: Query<(&TabPage, &mut Node)>,
+    mut scroll: Query<&mut ScrollPosition, With<ScrollArea>>,
+) {
+    if !active.is_changed() {
+        return;
+    }
+    for (button, mut variant) in &mut buttons {
+        variant.set_if_neq(ButtonVariant::selected(button.tab == active.0));
+    }
+    for (page, mut node) in &mut pages {
+        let display = if page.tab == active.0 {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if node.display != display {
+            node.display = display;
+        }
+    }
+    for mut position in &mut scroll {
+        *position = ScrollPosition::default();
+    }
+}
+
+/// Highlight the drawn view and describe it.
+fn update_view_ui(
+    view: Res<TerrainView>,
+    mut buttons: Query<(&ViewModeButton, &mut ButtonVariant)>,
+    added: Query<(), Added<ViewModeButton>>,
+    mut descriptions: Query<&mut Text, With<ViewDescriptionText>>,
+) {
+    if !view.is_changed() && added.is_empty() {
+        return;
+    }
+    for (button, mut variant) in &mut buttons {
+        variant.set_if_neq(ButtonVariant::selected(button.mode == view.mode));
+    }
+    let text = format!("{}: {}", view.mode.label(), view.mode.description());
+    for mut t in &mut descriptions {
+        if **t != text {
+            **t = text.clone();
+        }
     }
 }
 
@@ -660,6 +749,7 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                 ScrollArea
                 ThemedText
                 Children [
+                    @tab_page(Tab::Brush, bsn_list! {
                     @section("Brush", true, bsn_list! {
                         @toggle_row("Brush On (B)", ToggleKind::BrushEnabled)
                         --
@@ -718,7 +808,9 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                             })
                         })
                     })
+                    })
                     --
+                    @tab_page(Tab::Water, bsn_list! {
                     @section("Water", true, bsn_list! {
                         @slider_row("Erosion", 0.0, 0.01, water.sediment_capacity, ErosionSliderFieldKind::WaterErosion)
                         --
@@ -812,7 +904,9 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         --
                         @slider_row("Refine Steps", 50.0, 4000.0, water.bed_load.refine_steps as f32, ErosionSliderFieldKind::BedLoadRefineSteps)
                     })
+                    })
                     --
+                    @tab_page(Tab::Erosion, bsn_list! {
                     @section("Terrain Source", false, bsn_list! {
                         @slider_row("Noise Freq", 0.001, 0.05, params.noise_frequency, ErosionSliderFieldKind::NoiseFrequency)
                         --
@@ -972,11 +1066,101 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         --
                         @slider_row("Bedrock Depth", 0.0, 1.5, params.bedrock_depth, ErosionSliderFieldKind::BedrockDepth)
                     })
+                    })
+                    --
+                    @tab_page(Tab::View, bsn_list! {
+                    @section("Render Mode", true, bsn_list! {
+                        @button_row(bsn_list! {
+                            @view_button(PreviewMode::Pbr)
+                            --
+                            @view_button(PreviewMode::Simple)
+                        })
+                        --
+                        @note_text("")
+                        ViewDescriptionText
+                        --
+                        @slider_row("Gain (log10)", -3.0, 3.0, 0.0, ErosionSliderFieldKind::ViewGain)
+                        --
+                        @note_text("Debug views scale their field by the gain before colouring.")
+                    })
+                    --
+                    @section("Terrain", true, bsn_list! {
+                        @button_row(bsn_list! {
+                            @view_button(PreviewMode::Albedo)
+                            --
+                            @view_button(PreviewMode::Height)
+                            --
+                            @view_button(PreviewMode::Slope)
+                            --
+                            @view_button(PreviewMode::Normals)
+                            --
+                            @view_button(PreviewMode::Curvature)
+                            --
+                            @view_button(PreviewMode::AmbientOcclusion)
+                            --
+                            @view_button(PreviewMode::TerrainEdits)
+                        })
+                    })
+                    --
+                    @section("Erosion Fields", true, bsn_list! {
+                        @button_row(bsn_list! {
+                            @view_button(PreviewMode::Flow)
+                            --
+                            @view_button(PreviewMode::Sediment)
+                            --
+                            @view_button(PreviewMode::Erosion)
+                            --
+                            @view_button(PreviewMode::Rivers)
+                            --
+                            @view_button(PreviewMode::Age)
+                        })
+                    })
+                    --
+                    @section("Masks & Layers", true, bsn_list! {
+                        @button_row(bsn_list! {
+                            @view_button(PreviewMode::Softness)
+                            --
+                            @view_button(PreviewMode::Outflow)
+                            --
+                            @view_button(PreviewMode::ErodeMask)
+                            --
+                            @view_button(PreviewMode::Uplift)
+                            --
+                            @view_button(PreviewMode::Bedrock)
+                        })
+                    })
+                    --
+                    @section("Water Fields", true, bsn_list! {
+                        @button_row(bsn_list! {
+                            @view_button(PreviewMode::WaterDepth)
+                            --
+                            @view_button(PreviewMode::WaterVelocity)
+                            --
+                            @view_button(PreviewMode::SuspendedSediment)
+                            --
+                            @view_button(PreviewMode::Discharge)
+                            --
+                            @view_button(PreviewMode::MeanDepth)
+                            --
+                            @view_button(PreviewMode::RiverDischarge)
+                        })
+                    })
+                    --
+                    @section("Bed Load Fields", true, bsn_list! {
+                        @button_row(bsn_list! {
+                            @view_button(PreviewMode::BedLoad)
+                            --
+                            @view_button(PreviewMode::Helical)
+                            --
+                            @view_button(PreviewMode::BedChange)
+                        })
+                    })
                     --
                     @section("Age View", false, bsn_list! {
                         @slider_row("Age Strength", -4.0, 2.0, params.age_strength, ErosionSliderFieldKind::AgeStrength)
                         --
                         @toggle_row("Normalize Age", ToggleKind::NormalizeAge)
+                    })
                     })
                 ]
                 --
@@ -1038,7 +1222,60 @@ fn header_controls() -> impl Scene {
             --
             @note_text("Level –")
             PyramidStatusText
+            --
+            @button_row(bsn_list! {
+                @tab_button("Brush", Tab::Brush)
+                --
+                @tab_button("Water", Tab::Water)
+                --
+                @tab_button("Erosion", Tab::Erosion)
+                --
+                @tab_button("View", Tab::View)
+            })
         ]
+    }
+}
+
+/// One tab's sections; only the active tab's page is shown (`update_tabs`).
+fn tab_page(tab: Tab, body: impl SceneList) -> impl Scene {
+    bsn! {
+        Node {
+            display: {if tab == Tab::default() { Display::Flex } else { Display::None }},
+            flex_direction: FlexDirection::Column,
+            row_gap: px(ROW_GAP),
+        }
+        TabPage { tab: {tab} }
+        ThemedText
+        Children [
+            {body}
+        ]
+    }
+}
+
+fn tab_button(label: &str, tab: Tab) -> impl Scene {
+    let label = label.to_string();
+    bsn! {
+        @FeathersButton {
+            @caption: bsn! { Text({label.clone()}) ThemedText },
+            @variant: {ButtonVariant::selected(tab == Tab::default())},
+        }
+        TabButton { tab: {tab} }
+        on(move |_: On<Activate>, mut active: ResMut<ActiveTab>| {
+            active.0 = tab;
+        })
+    }
+}
+
+/// Draws the terrain in `mode`.
+fn view_button(mode: PreviewMode) -> impl Scene {
+    bsn! {
+        @FeathersButton {
+            @caption: bsn! { Text({mode.label().to_string()}) ThemedText },
+        }
+        ViewModeButton { mode: {mode} }
+        on(move |_: On<Activate>, mut view: ResMut<TerrainView>| {
+            view.mode = mode;
+        })
     }
 }
 
@@ -1264,10 +1501,10 @@ fn slider_row(
                 NumberInputStep({step as f64})
                 NumberInputPrecision(precision)
                 ErosionSliderField
-                on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut brush: ResMut<WaterBrush>, mut water: ResMut<WaterControl>, mut reset: ResMut<ResetSim>, mut commands: Commands| {
+                on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut brush: ResMut<WaterBrush>, mut water: ResMut<WaterControl>, mut view: ResMut<TerrainView>, mut reset: ResMut<ResetSim>, mut commands: Commands| {
                     let value = if field.is_int() { change.value.round() } else { change.value };
                     commands.entity(change.source).insert(NumberInputValue::F32(value));
-                    field.apply(&mut params, &mut sim, &mut brush, &mut water, value);
+                    field.apply(&mut params, &mut sim, &mut brush, &mut water, &mut view, value);
                     if field.resets_sim() {
                         reset.generation = reset.generation.wrapping_add(1);
                     }
