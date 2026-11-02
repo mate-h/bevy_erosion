@@ -771,6 +771,9 @@ pub struct WaterControl {
     pub solver: WaterSolver,
     /// Manning roughness for [`WaterSolver::Swe`] (0 = no bed friction).
     pub manning_n: f32,
+    /// Carries depth with a second-order flux in [`WaterSolver::Swe`] instead of first-order
+    /// upwind, whose numerical diffusion damps roll waves.
+    pub second_order_depth: bool,
     /// Gravity for [`WaterSolver::Swe`] in cells per second², with heights in cells (×100).
     /// Higher levels lakes faster; the solver's depth limiter caps the depth that carries flux at
     /// about 2 / (g · step) cells, so lower lets deep water flow.
@@ -928,6 +931,7 @@ impl Default for WaterControl {
             sediment_capacity: 0.0005,
             solver: WaterSolver::default(),
             manning_n: 0.01,
+            second_order_depth: false,
             gravity: 2000.0,
             dt: 0.0,
             bed: BedShaping::default(),
@@ -2521,6 +2525,7 @@ fn plan_erosion_frame(
                     manning_n: water.manning_n,
                     evaporation: -(1.0 - water.evaporation.clamp(0.0, 0.999)).ln(),
                     overshoot_limiter: false,
+                    second_order_depth: water.second_order_depth,
                     ..default()
                 },
             );

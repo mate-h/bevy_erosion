@@ -18,8 +18,9 @@ The water and bed model (Phases 4 and 6 of `WATER_PLAN.md`) checked against prim
 | Uniform flow | Manning u = h^(2/3) S^(1/2) / n | speed 0.98, depth 0.99 of Manning (`flume_follows_manning`) | agrees |
 | Bed load relation | Wong & Parker 2006: q* = 3.97 (θ − 0.0495)^1.5 | q* = 4 (θ − 0.047)^1.5 | same form and coefficients by construction |
 | Cyclic steps, onset | Parker & Izumi 2000; Balmforth & Vakil 2012: Fr > 1 (slightly below 1 with fast erosion) | none at Fr 0.70 and 0.92; steps at Fr ≥ 1.2 | agrees |
-| Cyclic steps, wavelength | set by eddy viscosity in shallow-water theory (k = √(3/ν)); recurrent isolated steps in flumes (Taki & Parker 2005) | 10–15 texels, 34–115 depths, 0.7–1.2 cells relief | plausible; set by numerical diffusion |
-| Roll waves, onset | Jeffreys 1925 / Vedernikov: Fr > 1.5 for Manning (2 for Chézy); convective, so hard to excite in short flumes | depth unevenness decays downstream up to Fr 2.15; grows only at Fr ≈ 5 | onset 2–3× too high (numerical damping) |
+| Cyclic steps, wavelength | set by eddy viscosity in shallow-water theory (k = √(3/ν)); recurrent isolated steps in flumes (Taki & Parker 2005) | 13–31 texels, 30–300 depths, 0.2–1.2 cells relief | plausible; set by numerical diffusion |
+| Cyclic steps, migration | upstream at every wavenumber once Fr > 1 (Parker & Izumi 2000; Sun & Parker 2005) | upstream at 0.04–0.28 texels/s | agrees |
+| Roll waves, onset | Jeffreys 1925 / Vedernikov: Fr > 1.5 for Manning (2 for Chézy); convective, so hard to excite in short flumes | first-order flux: grows only from Fr ≈ 2.7; second-order flux: from Fr ≈ 2.2 | onset 1.5–2× too high (numerical damping) |
 | Alternate bars, onset | β = W/2h above β_cr ≈ 3–8 (Redolfi et al. 2020, Table 1) | no bars at β 6; bars from β ≈ 10 | agrees |
 | Alternate bars, wavelength | L = 5–12 W; shorter (< 5 W) diagonal bars at high flow (Redolfi et al. 2020) | 1–3 W, a criss-cross of oblique bars | too short (diagonal or braid bars) |
 | Hydraulic geometry, depth | Leopold & Maddock 1953: depth ∝ Q^0.4 | deepest point ∝ Q^0.41–0.52 | agrees |
@@ -37,10 +38,19 @@ swept to vary the Froude number.
 upstream and downstream halves of the reach. An instability grows downstream; an inlet
 disturbance decays.
 
-| Fr | 0.86 | 1.14 | 1.55 | 1.82 | 2.15 | 2.67 | 3.30 | 4.16 | 5.24 |
+First-order upwind depth flux (the default):
+
+| Fr | 0.87 | 1.14 | 1.55 | 1.82 | 2.15 | 2.67 | 3.30 | 4.16 | 5.24 |
 |---|---|---|---|---|---|---|---|---|---|
 | CV upstream | 0.004 | 0.014 | 0.032 | 0.049 | 0.059 | 0.108 | 0.050 | 0.073 | 0.078 |
-| CV downstream | 0.000 | 0.002 | 0.009 | 0.017 | 0.021 | 0.091 | 0.023 | 0.024 | 0.102 |
+| CV downstream | 0.000 | 0.002 | 0.009 | 0.017 | 0.021 | 0.147 | 0.028 | 0.024 | 0.102 |
+
+Second-order depth flux (`TEST_SECOND_ORDER=1`, the Second-Order Depth Flux toggle):
+
+| Fr | 0.87 | 1.14 | 1.55 | 1.81 | 2.19 | 2.64 | 3.32 | 4.17 | 5.24 |
+|---|---|---|---|---|---|---|---|---|---|
+| CV upstream | 0.006 | 0.016 | 0.047 | 0.049 | 0.086 | 0.058 | 0.052 | 0.169 | 0.199 |
+| CV downstream | 0.001 | 0.003 | 0.013 | 0.019 | 0.141 | 0.199 | 0.033 | 0.076 | 0.101 |
 
 - Theory puts roll-wave instability at Fr > 1.5 for Manning friction. In the model, unevenness
   decays downstream up to Fr 2.15 and grows only near Fr 5 (2.67 is close to even).
@@ -49,8 +59,16 @@ disturbance decays.
   waves show only on steep slopes in the demo.
 - Roll waves are convective, so a 256-texel flume with a quiet inlet also limits them. Taki &
   Parker's flume saw none.
-- Lowering the onset would need a higher-order depth flux in bevy_fft's solver. That trades
-  against the shock-capturing robustness the water needs.
+- bevy_fft's `second_order_depth` setting replaces the upwind depth flux with a flux-limited
+  Lax-Wendroff one (van Leer limiter, Sweby 1984). Growth then starts near Fr 2.2 instead of
+  2.7, and the decay at Fr 1.5–1.8 is weaker, but it still decays. The remaining damping
+  likely comes from the momentum update (semi-Lagrangian advection, the depth limiter and the
+  velocity cap) and from the short reach, since the flux limiter falls back to first order at
+  every crest and trough.
+- The same change brings back an outflow limit on each cell and staged depth writes. Every
+  cell now reads its neighbours' depth from before the step, and the depth no longer goes
+  negative and gets clamped, which created water. Without second order the results are
+  unchanged (the first table).
 
 ## Cyclic steps (`validate_cyclic_steps`)
 
@@ -58,16 +76,45 @@ disturbance decays.
 
 | Slope (cells) | 0.1 | 0.2 | 0.4 | 0.6 | 0.9 | 1.3 |
 |---|---|---|---|---|---|---|
-| Fr | 0.70 | 0.92 | 1.20 | 1.30 | 1.18 | 1.44 |
-| Step wavelength (texels) | – | – | – | 9.7 | 14.2 | 15.3 |
-| Relief (cells) | 0.02 | 0.04 | 0.24 | 0.71 | 1.06 | 1.22 |
+| Fr | 0.70 | 0.92 | 1.20 | 1.38 | 1.36 | 1.22 |
+| Mean depth (cells) | 0.95 | 0.64 | 0.44 | 0.34 | 0.19 | 0.10 |
+| Step wavelength (texels) | – | – | 13.1 | 16.7 | 20.4 | 30.7 |
+| Relief (cells) | 0.02 | 0.04 | 0.20 | 0.49 | 0.96 | 1.22 |
 
 - Relief jumps once the flow is supercritical, as the Parker & Izumi instability requires
   (Fr > 1).
 - In shallow-water theory the most unstable wavelength is set by the eddy viscosity. Without
-  one, the short waves grow fastest. Ours has none beyond numerical diffusion, so the 10–15
+  one, the short waves grow fastest. Ours has none beyond numerical diffusion, so the 13–31
   texel spacing is a property of the grid and scheme, not of the sediment.
-- Taki & Parker observed recurrent steps migrating upstream; migration is not measured yet.
+- Taki & Parker observed recurrent steps migrating upstream; `validate_step_migration` below
+  measures it.
+
+## Step migration and mean slope (`validate_step_migration`)
+
+**Setup:** the stepped flumes above. After 25 s of live bed load, the detrended centreline bed
+is cross-correlated between snapshots 0.5 s apart over 4 s.
+
+| Slope (cells) | 0.6 | 0.9 | 1.3 |
+|---|---|---|---|
+| Wavelength, first order (texels) | 16.7 | 20.4 | 30.7 |
+| Migration, first order (texels/s) | −0.28 | −0.14 | −0.04 |
+| S_e / S_n, first order | 0.974 | 0.998 | 0.997 |
+| Wavelength, second order (texels) | 10.2 | 13.1 | 14.2 |
+| Migration, second order (texels/s) | −0.08 | −0.07 | −0.06 |
+| S_e / S_n, second order | 0.981 | 0.997 | 1.000 |
+
+- Negative speed is upstream. Steps migrate upstream at every slope, as Parker & Izumi (2000)
+  find for all wavenumbers once Fr > 1 (their eq. 7.6a) and as Sun & Parker (2005) find for
+  transportational steps.
+- Sun & Parker predict that steps usually lower the mean slope needed for the same transport
+  (S_e / S_n < 1 on their major branch). The mean slope falls by up to 2.6 %, but 25 s is far
+  from equilibrium, so this is the sign only.
+- With the second-order flux the spacing tightens to 10–14 texels, another sign that the grid
+  and scheme set it (see above).
+- Sawai's flumes (Parker & Izumi, table 1) had wavelengths 7–28 times the deepest flow. Ours are
+  30–300 times the mean depth, and the ratio grows with slope as the sheet thins. The steps are
+  far too long for their depth, as expected when the scheme rather than the flow sets the
+  spacing.
 
 ## Alternate bars (`validate_alternate_bars`)
 
@@ -122,14 +169,13 @@ dominate them. The default stays at r = 1, and the slider covers the literature 
 - **Point bars at equilibrium** (Struiksma et al. 1985; Talmon et al. 1995): the transverse bed
   slope against h/R.
 - **Mouth bar distance against jet momentum** (Edmonds & Slingerland 2007).
-- **Step migration speed**, and step wavelength against Taki & Parker's measurements.
+- **Step wavelength** against Taki & Parker's measurements (Part 1 is still unread).
 - **Bar counts against Crosato & Mosselman (2009).**
 
 The open-access copies of these papers could not be downloaded:
 
 | Paper | Link |
 |---|---|
-| Parker & Izumi 2000 | [JFM 419](https://www.cambridge.org/core/journals/journal-of-fluid-mechanics/article/purely-erosional-cyclic-and-solitary-steps-created-by-flow-over-a-cohesive-bed/F9A9D022A58B15539D7432ED5D11A489) |
 | Taki & Parker 2005 | https://doi.org/10.1080/00221680509500147 |
 | Colombini et al. 1987 | https://doi.org/10.1017/S0022112087002064 |
 | Talmon et al. 1995 | https://doi.org/10.1080/00221689509498657 |
@@ -152,5 +198,10 @@ The open-access copies of these papers could not be downloaded:
 - M. Wong & G. Parker (2006), *Reanalysis and correction of bed-load relation of Meyer-Peter and
   Müller using their own database*, J. Hydraul. Eng. 132(11)
   ([copy](https://documents.epfl.ch/users/b/bl/blanckae/www/HydrauliqueFluviale/Papers/2006_JHE_Wong_Parker.pdf)).
+- G. Parker & N. Izumi (2000), *Purely erosional cyclic and solitary steps created by flow over
+  a cohesive bed*, J. Fluid Mech. 419, 203–238 (https://doi.org/10.1017/S0022112000001403).
+- T. Sun & G. Parker (2005), *Transportational cyclic steps created by flow over an erodible
+  bed. Part 2. Theory and numerical simulation*, J. Hydraul. Res. 43(5)
+  (https://doi.org/10.1080/00221680509500148).
 - Downloaded but not yet read: *Channel confinement mollifies roll wave instabilities*
   ([arXiv 2609.23108](https://arxiv.org/pdf/2609.23108)).

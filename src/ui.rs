@@ -303,6 +303,7 @@ enum ToggleKind {
     AdditiveSediment,
     NormalizeAge,
     MomentumFlow,
+    SecondOrderDepth,
     LiveBedLoad,
 }
 
@@ -333,6 +334,7 @@ impl ToggleKind {
             Self::AdditiveSediment => params.additive_sediment != 0,
             Self::NormalizeAge => params.normalize_age != 0,
             Self::MomentumFlow => water.solver == WaterSolver::Swe,
+            Self::SecondOrderDepth => water.second_order_depth,
             Self::LiveBedLoad => water.bed_load.live,
         }
     }
@@ -371,6 +373,7 @@ impl ToggleKind {
                     WaterSolver::Pipes
                 }
             }
+            Self::SecondOrderDepth => water.second_order_depth = on,
             Self::LiveBedLoad => water.bed_load.live = on,
         }
     }
@@ -664,6 +667,8 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         @slider_row("Rain Water (per 1000 trail steps)", 0.0, 2.0, water.rain_water * 1000.0, ErosionSliderFieldKind::WaterRainWater)
                         --
                         @toggle_row("Momentum Flow (SWE)", ToggleKind::MomentumFlow)
+                        --
+                        @toggle_row("Second-Order Depth Flux", ToggleKind::SecondOrderDepth)
                         --
                         @slider_row("Bed Friction (Manning n)", 0.002, 0.1, water.manning_n, ErosionSliderFieldKind::WaterManning)
                         --

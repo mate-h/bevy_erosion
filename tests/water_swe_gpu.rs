@@ -1755,6 +1755,7 @@ fn validate_roll_wave_onset() {
     for n in [0.016, 0.012, 0.0095, 0.008, 0.007, 0.006, 0.005, 0.0042, 0.0035, 0.0028, 0.0022, 0.0017, 0.0013] {
         let mut h = Harness::new(WaterSolver::Swe, flume(0.002, 24.0));
         h.water().manning_n = n;
+        h.water().second_order_depth = std::env::var("TEST_SECOND_ORDER").is_ok();
         h.water().springs.push(Spring {
             center: Vec2::new(12.0, N as f32 / 2.0),
             radius: 6.0,
@@ -1780,6 +1781,102 @@ fn validate_roll_wave_onset() {
         }
         let froude = speed / (g * depth).sqrt();
         row(&mut f, &[n, depth, speed, froude, cv, up, down]);
+    }
+}
+
+/// Residual of `v` from its linear fit, and the fitted slope per sample.
+fn detrend(v: &[f32]) -> (Vec<f32>, f32) {
+    let n = v.len() as f32;
+    let xm = (n - 1.0) / 2.0;
+    let ym = v.iter().sum::<f32>() / n;
+    let (mut sxy, mut sxx) = (0.0, 0.0);
+    for (i, y) in v.iter().enumerate() {
+        sxy += (i as f32 - xm) * (y - ym);
+        sxx += (i as f32 - xm).powi(2);
+    }
+    let b = sxy / sxx;
+    let r = v
+        .iter()
+        .enumerate()
+        .map(|(i, y)| y - ym - b * (i as f32 - xm))
+        .collect();
+    (r, b)
+}
+
+/// Shift in samples that best maps `a` onto `b`, from the peak of their normalised
+/// cross-correlation within `max_lag`, refined with a parabola through the peak.
+fn profile_shift(a: &[f32], b: &[f32], max_lag: i32) -> f32 {
+    let n = a.len() as i32;
+    let corr = |lag: i32| {
+        let (mut ab, mut aa, mut bb) = (0.0, 0.0, 0.0);
+        for i in 0.max(-lag)..n.min(n - lag) {
+            let (x, y) = (a[i as usize], b[(i + lag) as usize]);
+            ab += x * y;
+            aa += x * x;
+            bb += y * y;
+        }
+        ab / (aa * bb).sqrt().max(f32::MIN_POSITIVE)
+    };
+    let c: Vec<f32> = (-max_lag..=max_lag).map(corr).collect();
+    let k = (0..c.len()).max_by(|&i, &j| c[i].total_cmp(&c[j])).unwrap();
+    let mut lag = k as f32 - max_lag as f32;
+    if k > 0 && k + 1 < c.len() {
+        let d = c[k - 1] - 2.0 * c[k] + c[k + 1];
+        if d < 0.0 {
+            lag += 0.5 * (c[k - 1] - c[k + 1]) / d;
+        }
+    }
+    lag
+}
+
+/// Step migration and mean slope: Parker & Izumi (2000) and Sun & Parker (2005) predict that
+/// cyclic steps migrate upstream, and that steps usually let the same transport run at a lower
+/// mean slope (S_e / S_n < 1). Track the bed profile of the stepped flumes over a few seconds.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn validate_step_migration() {
+    let mut f = data_file(
+        "step_migration",
+        "slope_cells,wavelength,speed_texels_per_s,slope_ratio",
+    );
+    let mid = N / 2;
+    let (x0, x1) = (48, N - 24);
+    for slope in [0.006f32, 0.009, 0.013] {
+        let mut h = Harness::new(WaterSolver::Swe, flume(slope, 6.0));
+        h.water().second_order_depth = std::env::var("TEST_SECOND_ORDER").is_ok();
+        h.water().springs.push(Spring {
+            center: Vec2::new(12.0, N as f32 / 2.0),
+            radius: 2.0,
+            rate: 0.45,
+        });
+        h.run(6.0);
+        let start = h.read_heights();
+        h.water().bed_load.live = true;
+        h.run(25.0);
+        let profile = |heights: &[f32]| -> Vec<f32> {
+            (x0..x1).map(|x| heights[idx(x, mid)]).collect()
+        };
+        let (_, slope_before) = detrend(&profile(&start));
+        let mut prev = detrend(&profile(&h.read_heights())).0;
+        let (period, ..) = dominant_period(&prev);
+        let (mut shift, mut slope_after) = (0.0, 0.0);
+        let (snapshots, dt) = (8, 0.5);
+        for _ in 0..snapshots {
+            h.run(dt);
+            let (r, b) = detrend(&profile(&h.read_heights()));
+            shift += profile_shift(&prev, &r, (period / 2.0).floor().max(1.0) as i32);
+            slope_after += b / snapshots as f32;
+            prev = r;
+        }
+        row(
+            &mut f,
+            &[
+                slope * CELLS_PER_HEIGHT,
+                period,
+                shift / (snapshots as f32 * dt),
+                slope_after / slope_before,
+            ],
+        );
     }
 }
 
