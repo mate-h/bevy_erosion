@@ -12,6 +12,10 @@ const SPLAT_SCALE: f32 = 100000000.0;
 // Compute_Erosion binding transforms (see `ref/node_tree.json`)
 const TRAIL_DENSITY_SCALE: f32 = 0.1;   // Trail_Density = Erosion_Amount * 0.1
 const RIVER_SCARRING_SCALE: f32 = 0.25; // River_Scarring = River_Scale * 0.25
+// Base texels per height unit, as drawn (and as `water.wgsl` counts cells). KTT works in metres
+// both ways; here heights are in height units and distances in texels, so an angle's tangent is
+// divided by this before it is compared with a slope.
+const CELLS_PER_HEIGHT: f32 = 100.0;
 
 @group(0) @binding(0) var<storage, read_write> height: array<atomic<u32>>;
 
@@ -541,12 +545,13 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     let gidx = i32(particle_id % u32(res_x));
     let gidy = i32(particle_id / u32(res_x));
 
+    // Angles as slopes in height units per texel (see CELLS_PER_HEIGHT).
     var wear_angle = params.wear_angle * 3.14159265 / 180.0;
-    wear_angle = tan(wear_angle);
+    wear_angle = tan(wear_angle) / CELLS_PER_HEIGHT;
     var talus_angle = params.talus_angle * 3.14159265 / 180.0;
-    talus_angle = tan(talus_angle) / 1.25;
+    talus_angle = tan(talus_angle) / 1.25 / CELLS_PER_HEIGHT;
     var max_deposit_angle = params.max_deposit_angle * 3.14159265 / 180.0;
-    max_deposit_angle = tan(max_deposit_angle);
+    max_deposit_angle = tan(max_deposit_angle) / CELLS_PER_HEIGHT;
 
     var p = random22(vec2<f32>(f32(gidx), f32(gidy) - f32(iteration) * 5.643));
     if (brush) {
@@ -618,7 +623,8 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     let do_rivers = params.do_rivers != 0u;
     let use_my = do_rivers && params.momentum_coherence > 0.0;
     // Erosion_Cutoff_Angle: stop the trail on drops steeper than this (90° = never).
-    let erosion_cutoff = tan(params.erosion_cutoff_angle * 3.14159 / 180.0) * dx_scaled;
+    let erosion_cutoff = tan(params.erosion_cutoff_angle * 3.14159 / 180.0) / CELLS_PER_HEIGHT
+        * dx_scaled;
 
     // UI `River_Scale` → kernel `River_Scarring` via RIVER_SCARRING_SCALE
     var river_scarring = params.river_scale * RIVER_SCARRING_SCALE;

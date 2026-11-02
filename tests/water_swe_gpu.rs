@@ -2167,6 +2167,9 @@ fn validate_ktt_rivers() {
             if let Some(d) = std::env::var("TEST_TRAIL_DAMPING").ok().and_then(|v| v.parse().ok()) {
                 params.trail_damping = d;
             }
+            if let Some(a) = std::env::var("TEST_MAX_DEPOSIT").ok().and_then(|v| v.parse().ok()) {
+                params.max_deposit_angle = a;
+            }
         }
         let mut reset = h.app.world_mut().resource_mut::<ResetSim>();
         reset.generation = reset.generation.wrapping_add(1);
@@ -2178,6 +2181,24 @@ fn validate_ktt_rivers() {
         (heights, momentum)
     };
     let (off, _) = run(&mut h, false, 0.25);
+    let mut angles: Vec<f32> = (0..N * N)
+        .map(|i| {
+            let (x, y) = (i % N, i / N);
+            let at = |x: u32, y: u32| off[idx(x.min(N - 1), y.min(N - 1))] * CELLS_PER_HEIGHT;
+            let gx = (at(x + 1, y) - at(x.saturating_sub(1), y)) / 2.0;
+            let gy = (at(x, y + 1) - at(x, y.saturating_sub(1))) / 2.0;
+            gx.hypot(gy).atan().to_degrees()
+        })
+        .collect();
+    angles.sort_by(f32::total_cmp);
+    let pct = |p: usize| angles[angles.len() * p / 100];
+    println!(
+        "slope angles (deg) 10/50/90/99: {:.1} {:.1} {:.1} {:.1}",
+        pct(10),
+        pct(50),
+        pct(90),
+        pct(99)
+    );
     let (_, momentum) = run(&mut h, true, 0.25);
     let mut sorted = momentum.clone();
     sorted.sort_by(f32::total_cmp);
