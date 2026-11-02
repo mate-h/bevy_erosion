@@ -789,7 +789,8 @@ pub struct BedLoad {
     pub critical_shields: f32,
     /// Talmon's A_s: how weakly bed load slides down cross-slopes (larger is weaker).
     pub slope_effect: f32,
-    /// A_h in the helical deflection δ = atan(A_h · I_s) toward the inner bank.
+    /// A_h in the helical deflection δ = atan(A_h · I_s) toward the inner bank. Rivers measure
+    /// 7–11; the default is larger because these channels are shallow against their bends.
     pub helical_strength: f32,
     /// Morphological factor while refining (bed change per water step).
     pub morph_factor: f32,
@@ -805,7 +806,7 @@ impl Default for BedLoad {
             k: 4.0,
             critical_shields: 0.047,
             slope_effect: 1.0,
-            helical_strength: 7.0,
+            helical_strength: 20.0,
             morph_factor: 20.0,
             refine_steps: 400,
         }

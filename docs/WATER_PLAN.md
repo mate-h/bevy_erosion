@@ -437,7 +437,15 @@ Verify (as GPU tests in `tests/water_swe_gpu.rs`):
 - no NaNs;
 - a dry map is unchanged.
 
-### 4c. Helical flow in bends
+### 4c. Helical flow in bends (done)
+
+`morpho_helical`, once per frame, as planned (λ_s = 20 texels). `bends_scour_their_outer_banks`
+on a carved S-bend: relative to each apex cross-section, the bed is lowest about 3.8 texels
+toward the outer bank even without helical flow (the solver's momentum already throws the flow
+outward), and helical flow moves it a further 0.4–0.7 texels out, switching sides between bends.
+The default Helical Strength is 20 rather than the 7–11 measured in rivers: these channels are
+shallow against their bends (h/R about 0.03), and at 7 the shift is below the run-to-run noise.
+
 
 The CPU code in terracraft, ported to the GPU in `water_morpho.wgsl`:
 - **Curvature** at cells from the velocity: `κ = (u × (u·∇)u) / |u|³`, clamped.

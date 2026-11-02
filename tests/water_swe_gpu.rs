@@ -1337,3 +1337,72 @@ fn bed_load_conserves_and_builds_a_delta() {
     assert!(net.abs() < 0.02 * moved, "bed volume changed by {net} of {moved} moved");
     assert!(near > 2.0 * far.max(0.0) && near > 0.0, "no bar at the mouth");
 }
+
+/// Meandering channel: centreline y = N/2 + 24 sin(2π x / 128), 16 texels wide, falling toward
+/// +x, with banks rising 0.0025 per texel (below the wet slumping angle).
+fn s_bend(x: u32, y: u32) -> f32 {
+    let c = N as f32 / 2.0 + 24.0 * (2.0 * PI * x as f32 / 128.0).sin();
+    let floor = 0.02 + 0.0015 * (N - 1 - x) as f32;
+    floor + 0.0025 * ((y as f32 + 0.5 - c).abs() - 8.0).max(0.0)
+}
+
+/// Where the bed was cut at the bend apexes (x = 32 + 64k): the cut-weighted offset from the
+/// centreline toward the outer bank, per apex.
+fn apex_scour(helical: f32) -> Vec<f32> {
+    let mut h = Harness::new(WaterSolver::Swe, s_bend);
+    {
+        let mut water = h.water();
+        water.bed_load.helical_strength = helical;
+        water.springs.push(Spring {
+            center: Vec2::new(10.0, N as f32 / 2.0 + 24.0 * (2.0 * PI * 10.0 / 128.0).sin()),
+            radius: 6.0,
+            rate: 0.05,
+        });
+    }
+    h.run(6.0);
+    let before = h.read_heights();
+    h.water().bed_load.live = true;
+    h.run(25.0);
+    let after = h.read_heights();
+    [96u32, 160]
+        .iter()
+        .map(|&x| {
+            let s = (2.0 * PI * x as f32 / 128.0).sin();
+            let c = N as f32 / 2.0 + 24.0 * s;
+            // The bend curves around -s: its outer bank is on the side of +s.
+            let (mut moment, mut total) = (0.0, 0.0);
+            // Inside the channel, relative to the section's mean change.
+            let ys: Vec<u32> = ((c - 7.0).ceil() as u32..=(c + 6.0).floor() as u32).collect();
+            let dzs: Vec<f32> = ys.iter().map(|&y| after[idx(x, y)] - before[idx(x, y)]).collect();
+            let mean = dzs.iter().sum::<f32>() / dzs.len() as f32;
+            let section: Vec<String> = dzs.iter().map(|d| format!("{d:.4}")).collect();
+            for (&y, dz) in ys.iter().zip(&dzs) {
+                let cut = (mean - dz).max(0.0);
+                moment += cut * (y as f32 + 0.5 - c) * s.signum();
+                total += cut;
+            }
+            println!("apex x {x} (outer side {}): {}", if s > 0.0 { "+y" } else { "-y" }, section.join(" "));
+            moment / total.max(1e-9)
+        })
+        .collect()
+}
+
+/// Helical flow moves bed load toward the inner banks of bends: the outer bank scours, on
+/// opposite sides in successive bends.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn bends_scour_their_outer_banks() {
+    let strength = std::env::var("TEST_HELICAL").ok().and_then(|v| v.parse().ok()).unwrap_or(BedLoad::default().helical_strength);
+    let with = apex_scour(strength);
+    let without = apex_scour(0.0);
+    println!(
+        "bend scour toward the outer bank (texels): helical {strength}: {with:?}, without: {without:?}"
+    );
+    for (w, wo) in with.iter().zip(&without) {
+        assert!(*w > 0.5, "the scour is not on the outer bank ({w})");
+        assert!(
+            *w > wo + 0.2,
+            "helical flow did not move the scour outward ({w} against {wo})"
+        );
+    }
+}
