@@ -20,7 +20,7 @@ use bevy::{
     core_pipeline::tonemapping::Tonemapping,
     curve::cubic_splines::LinearSpline,
     light::{
-        Atmosphere, AtmosphereEnvironmentMapLight, EnvironmentMapLight,
+        Atmosphere, AtmosphereEnvironmentMapLight, CascadeShadowConfigBuilder, EnvironmentMapLight,
         GeneratedEnvironmentMapLight, atmosphere::ScatteringMedium, light_consts::lux,
     },
     material::OpaqueRendererMethod,
@@ -61,15 +61,31 @@ use std::sync::{
 const MAP_SIZE: UVec2 = UVec2::new(512, 512);
 // Controls how much to under-expose (in F-stops). Negative values = under-expose, positive = over-expose
 const UNDER_EXPOSURE_AMOUNT: f32 = -2.0;
-/// Water shallower than this (world units) is not drawn, so the terrain shows on dry ground and
-/// under thin films: `WET_DEPTH` in `water.wgsl` (0.0005 height units) at the terrain's height scale.
-const DRY_DEPTH: f32 = 0.025;
+/// Water shallower than this (height units) is not drawn, so the terrain shows on dry ground and
+/// under thin films: `WET_DEPTH` in `water.wgsl`.
+const DRY_DEPTH: f32 = 0.0005;
+/// Width of the scene the camera, shadow and framing distances below were tuned for (world
+/// units); they scale with the map's width in metres.
+const TUNED_WIDTH: f32 = 256.0;
 /// Render-ready frames the atmosphere environment map gets to bake before it is frozen.
 const ENV_MAP_BAKE_FRAMES: u32 = 6;
 
 fn simple_mode() -> bool {
     std::env::args().any(|a| a == "--simple")
         || std::env::var("EROSION_SIMPLE").is_ok_and(|v| v != "0")
+}
+
+/// `EROSION_METRES_PER_TEXEL=<dx>` sets the map's texel size (default 10 m, a 5 km map).
+fn world_scale() -> WorldScale {
+    let mut scale = WorldScale::default();
+    if let Some(dx) = std::env::var("EROSION_METRES_PER_TEXEL")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|dx| *dx > 0.0)
+    {
+        scale.metres_per_texel = dx;
+    }
+    scale
 }
 
 fn bench_seconds() -> Option<f32> {
@@ -112,8 +128,11 @@ fn main() {
         PresentMode::AutoVsync
     };
     let ready_frames = RenderReadyFrames::default();
+    let scale = world_scale();
+    let map_metres = scale.map_metres(MAP_SIZE).x;
     let mut app = App::new();
     app.insert_resource(ClearColor(Color::BLACK))
+        .insert_resource(scale)
         .insert_resource(ready_frames.clone())
         .insert_resource(ErosionConfig {
             map_size: MAP_SIZE,
@@ -153,13 +172,14 @@ fn main() {
         );
     if !simple {
         // No FFT ocean underneath, so the water LOD data starts each frame empty. Five slices of
-        // 1/8 m texels reach 512 m, the whole map from anywhere on it; the foam sim costs per slice.
+        // 256 texels, each twice the last, reach twice the map's width, the whole map from
+        // anywhere on it; the foam sim costs per slice.
         app.add_plugins(WaterPlugin)
             .insert_resource(WaterLodClear)
             .insert_resource(WaterLodSettings {
                 slice_count: 5,
                 resolution: 256,
-                base_texel_size: 1.0 / 8.0,
+                base_texel_size: map_metres / 2048.0,
             });
     }
     app.sub_app_mut(RenderApp)
@@ -239,6 +259,7 @@ fn freeze_atmosphere_env_map(
 fn log_frame_times(
     time: Res<Time<Real>>,
     progress: Res<PyramidProgress>,
+    scale: Res<WorldScale>,
     mut water: ResMut<WaterControl>,
     mut brush: ResMut<WaterBrush>,
     mut exit: MessageWriter<AppExit>,
@@ -296,12 +317,15 @@ fn log_frame_times(
         // Look at the pour or the river's source from close by.
         if let Some(focus) = texel("EROSION_BENCH_TARGET").or(pour).or(river) {
             let size = progress.get().size.as_vec2();
-            let half = size.x * 0.25;
+            let width = scale.map_metres(size.as_uvec2()).x;
+            let half = width * 0.5;
+            // Distances are given for the tuned scene width.
+            let k = width / TUNED_WIDTH;
             let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok());
             for mut orbit in &mut cameras {
                 let xz = focus / size * 2.0 * half - half;
-                orbit.target = Vec3::new(xz.x, 20.0, xz.y);
-                orbit.distance = env("EROSION_BENCH_DISTANCE").unwrap_or(45.0);
+                orbit.target = Vec3::new(xz.x, 20.0 * k, xz.y);
+                orbit.distance = env("EROSION_BENCH_DISTANCE").unwrap_or(45.0) * k;
                 if let Some(pitch) = env("EROSION_BENCH_PITCH") {
                     orbit.pitch = pitch.to_radians();
                     orbit.target_pitch = orbit.pitch;
@@ -399,19 +423,22 @@ fn spawn_terrain(
     mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
     erosion_images: Res<ErosionImages>,
     config: Res<ErosionConfig>,
+    scale: Res<WorldScale>,
 ) {
-    // Spawn a subdivided plane with UVs (match map size for correct 1:1 UVs)
-    let size = config.map_size.x as f32;
-    let resolution = (config.map_size.x - 1) as u32; // subdivisions
-    let half_size = size * 0.5;
+    // A subdivided plane with one vertex per texel, in metres: the scene is the map at real
+    // scale, so the atmosphere, shadows and water optics see real distances.
+    let width = scale.map_metres(config.map_size).x;
+    let resolution = config.map_size.x - 1; // subdivisions
     let plane = Mesh::from(
         Plane3d::default()
             .mesh()
             .subdivisions(resolution)
-            .size(half_size, half_size),
+            .size(width, width),
     );
     let mesh_handle = meshes.add(plane);
-    let height_scale = 50.0;
+    let height_scale = scale.metres_per_height();
+    // Camera and shadow distances were tuned on a scene `TUNED_WIDTH` wide.
+    let k = width / TUNED_WIDTH;
 
     let mat_handle = materials.add(ExtendedMaterial {
         base: StandardMaterial {
@@ -429,7 +456,7 @@ fn spawn_terrain(
         commands.spawn(water_heightfield(
             &erosion_images,
             config.map_size,
-            half_size,
+            width,
             height_scale,
         ));
         // The surface samples the water LOD data by world position, so it reuses the terrain's
@@ -453,7 +480,7 @@ fn spawn_terrain(
                         ..WaterOpticsUniform::jerlov(JerlovWaterType::Coastal3)
                     },
                     settings: WaterSurfaceUniform {
-                        dry_depth: DRY_DEPTH,
+                        dry_depth: DRY_DEPTH * height_scale,
                         ..WaterSurfaceExtension::default().settings
                     },
                     ..default()
@@ -471,7 +498,7 @@ fn spawn_terrain(
         MeshMaterial3d(mat_handle),
         Transform::from_xyz(0.0, 0.0, 0.0),
         TerrainSurface {
-            size: Vec2::splat(half_size),
+            size: Vec2::splat(width),
             height_scale,
         },
     ));
@@ -504,10 +531,18 @@ fn spawn_terrain(
     // 3D camera
     let mut camera = commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(150.0, 50.0, 150.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Projection::Perspective(PerspectiveProjection {
+            near: 0.1 * k,
+            far: 4000.0 * k,
+            ..default()
+        }),
+        Transform::from_xyz(150.0 * k, 50.0 * k, 150.0 * k).looking_at(Vec3::ZERO, Vec3::Y),
         OrbitController {
             target: Vec3::ZERO,
-            distance: 225.0,
+            distance: 225.0 * k,
+            min_distance: 30.0 * k,
+            max_distance: 2000.0 * k,
+            zoom_sensitivity: 2.0 * k,
             ..Default::default()
         },
     ));
@@ -542,6 +577,13 @@ fn spawn_terrain(
             illuminance: lux::RAW_SUNLIGHT,
             ..default()
         },
+        CascadeShadowConfigBuilder {
+            minimum_distance: 0.1 * k,
+            first_cascade_far_bound: 10.0 * k,
+            maximum_distance: 150.0 * k,
+            ..default()
+        }
+        .build(),
         Transform::from_translation(initial_sun_pos).looking_at(Vec3::ZERO, Vec3::Y),
         Sun,
         SunController::new(initial_sun_dir),

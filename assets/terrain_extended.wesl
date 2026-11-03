@@ -21,6 +21,8 @@ import bevy_pbr::render::{
 struct TerrainParams {
     height_scale: f32,
 }
+// Height units per two texels of run: half of `CELLS_PER_HEIGHT` in `lib.rs`.
+const NORMAL_SLOPE_SCALE: f32 = 50.0;
 @group(constants::MATERIAL_BIND_GROUP) @binding(106) var<uniform> terrain_params: TerrainParams;
 
 // `PreviewMode` and a linear gain on the debug fields.
@@ -84,8 +86,10 @@ fn vertex(v: VertexIn) -> VertexOutput {
     let h_r = surface_at(v.uv + vec2(texel.x, 0.0));
     let h_d = surface_at(v.uv - vec2(0.0, texel.y));
     let h_u = surface_at(v.uv + vec2(0.0, texel.y));
-    let d_hx = (h_r - h_l) * terrain_params.height_scale;
-    let d_hz = (h_u - h_d) * terrain_params.height_scale;
+    // Rise over the two texels' run: heights are isotropic with the grid (100 texels per
+    // height unit), so this does not depend on the scene's scale.
+    let d_hx = (h_r - h_l) * NORMAL_SLOPE_SCALE;
+    let d_hz = (h_u - h_d) * NORMAL_SLOPE_SCALE;
     let n_local = normalize(vec3<f32>(-d_hx, 1.0, -d_hz));
     let nmat = mat3x3<f32>(
         world_from_local[0].xyz,

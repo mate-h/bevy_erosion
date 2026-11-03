@@ -670,12 +670,14 @@ fn draw_brush(
         return;
     }
     let map = config.map_size.as_vec2();
+    // Lines float just over the surface: 0.6 texels.
+    let lift = 0.6 * surface.size.x / map.x;
     let mut ring = |center: Vec2, radius: f32, color: Color| {
         let points = (0..=64).map(|i| {
             let a = i as f32 / 64.0 * std::f32::consts::TAU;
             let texel = center + Vec2::new(a.cos(), a.sin()) * radius;
             let xz = (texel / map - 0.5) * surface.size;
-            let y = cache.surface(texel) * surface.height_scale + 0.3;
+            let y = cache.surface(texel) * surface.height_scale + lift;
             tf.transform_point(Vec3::new(xz.x, y, xz.y))
         });
         gizmos.linestrip(points, color);
@@ -721,7 +723,7 @@ fn draw_brush(
         }
         let points = preview.1.iter().map(|&texel| {
             let xz = (texel / map - 0.5) * surface.size;
-            let y = cache.surface(texel) * surface.height_scale + 0.3;
+            let y = cache.surface(texel) * surface.height_scale + lift;
             tf.transform_point(Vec3::new(xz.x, y, xz.y))
         });
         gizmos.linestrip(points, Color::srgb(0.35, 0.85, 0.95));

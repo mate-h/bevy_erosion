@@ -1419,6 +1419,51 @@ impl ErosionConfig {
     }
 }
 
+/// Map texels per height unit: heights are isotropic with the grid, so a slope of 1 height unit
+/// per 100 texels is 45°. The shaders count water depths and the bed in cells of this size.
+pub const CELLS_PER_HEIGHT: f32 = 100.0;
+
+/// The physical size of the map (see `docs/UNIFIED_PLAN.md`). The simulation works in texels and
+/// height units; settings, the scene and the physics constants are converted with this.
+///
+/// Set it before the app starts: the scene and the settings panel are built from it once.
+#[derive(Resource, Clone, Copy, Debug, PartialEq, ExtractResource)]
+#[extract_app(RenderApp)]
+pub struct WorldScale {
+    /// Texel size (dx) in metres.
+    pub metres_per_texel: f32,
+}
+
+impl Default for WorldScale {
+    fn default() -> Self {
+        Self {
+            metres_per_texel: 10.0,
+        }
+    }
+}
+
+impl WorldScale {
+    /// Metres per height unit ([`CELLS_PER_HEIGHT`] texels).
+    pub fn metres_per_height(&self) -> f32 {
+        CELLS_PER_HEIGHT * self.metres_per_texel
+    }
+
+    /// Metres to texels.
+    pub fn texels(&self, metres: f32) -> f32 {
+        metres / self.metres_per_texel
+    }
+
+    /// Metres to height units.
+    pub fn heights(&self, metres: f32) -> f32 {
+        metres / self.metres_per_height()
+    }
+
+    /// Width and depth of the map in metres.
+    pub fn map_metres(&self, size: UVec2) -> Vec2 {
+        size.as_vec2() * self.metres_per_texel
+    }
+}
+
 /// Plugin for erosion compute simulation
 pub struct ErosionComputePlugin;
 
@@ -1449,8 +1494,10 @@ impl Plugin for ErosionComputePlugin {
     fn build(&self, app: &mut App) {
         let progress = PyramidProgress::default();
         app.init_resource::<ErosionConfig>()
+            .init_resource::<WorldScale>()
             .insert_resource(progress.clone())
             .add_plugins((
+                ExtractResourcePlugin::<WorldScale>::default(),
                 ExtractResourcePlugin::<ErosionImages>::default(),
                 ExtractResourcePlugin::<WaterFields>::default(),
                 ExtractResourcePlugin::<ErodeParams>::default(),

@@ -11,6 +11,8 @@ import bevy_pbr::prepass::io::{Vertex, VertexOutput};
 struct TerrainParams {
     height_scale: f32,
 }
+// Height units per two texels of run: half of `CELLS_PER_HEIGHT` in `lib.rs`.
+const NORMAL_SLOPE_SCALE: f32 = 50.0;
 @group(constants::MATERIAL_BIND_GROUP) @binding(106) var<uniform> terrain_params: TerrainParams;
 
 fn height_at(uv: vec2<f32>) -> f32 {
@@ -37,8 +39,9 @@ fn vertex(v: Vertex) -> VertexOutput {
 @if(NORMAL_PREPASS_OR_DEFERRED_PREPASS) {
     let dims = vec2<f32>(textureDimensions(height_tex, 0));
     let texel = 1.0 / max(dims, vec2(1.0));
-    let d_hx = (height_at(uv + vec2(texel.x, 0.0)) - height_at(uv - vec2(texel.x, 0.0))) * terrain_params.height_scale;
-    let d_hz = (height_at(uv + vec2(0.0, texel.y)) - height_at(uv - vec2(0.0, texel.y))) * terrain_params.height_scale;
+    // Rise over the two texels' run (see `terrain_extended.wesl`).
+    let d_hx = (height_at(uv + vec2(texel.x, 0.0)) - height_at(uv - vec2(texel.x, 0.0))) * NORMAL_SLOPE_SCALE;
+    let d_hz = (height_at(uv + vec2(0.0, texel.y)) - height_at(uv - vec2(0.0, texel.y))) * NORMAL_SLOPE_SCALE;
     let nmat = mat3x3<f32>(world_from_local[0].xyz, world_from_local[1].xyz, world_from_local[2].xyz);
     out.world_normal = normalize(nmat * vec3<f32>(-d_hx, 1.0, -d_hz));
 }

@@ -32,8 +32,8 @@ use bevy::{
 
 use crate::camera::OrbitInputBlocked;
 use crate::{
-    ErodeParams, MAX_BANK_WIDTH, MAX_SPRINGS, PreviewMode, PyramidProgress, ResetSim, SimControl,
-    TerrainView, WaterControl, WaterSolver,
+    CELLS_PER_HEIGHT, ErodeParams, MAX_BANK_WIDTH, MAX_SPRINGS, PreviewMode, PyramidProgress,
+    ResetSim, SimControl, TerrainView, WaterControl, WaterSolver, WorldScale,
     brush::{BrushMode, TerrainTool, WaterBrush},
 };
 
@@ -198,7 +198,68 @@ enum ErosionSliderFieldKind {
     ViewGain,
 }
 
+/// How a slider shows its setting. Settings are stored in the simulation's units (texels and
+/// height units) and shown in metres through [`WorldScale`].
+#[derive(Clone, Copy, PartialEq)]
+enum Shown {
+    /// As stored.
+    Plain,
+    /// Texels, shown in metres.
+    Length,
+    /// Height units, shown in metres.
+    Height,
+    /// Height units per texel, shown in percent.
+    Slope,
+    /// A frequency per texel, shown as its wavelength in metres.
+    Wavelength,
+}
+
+impl Shown {
+    /// The stored value as shown.
+    fn show(self, world: WorldScale, v: f32) -> f32 {
+        match self {
+            Self::Plain => v,
+            Self::Length => v * world.metres_per_texel,
+            Self::Height => v * world.metres_per_height(),
+            Self::Slope => v * CELLS_PER_HEIGHT * 100.0,
+            Self::Wavelength => world.metres_per_texel / v.max(1e-9),
+        }
+    }
+
+    /// The shown value as stored.
+    fn store(self, world: WorldScale, v: f32) -> f32 {
+        match self {
+            Self::Plain => v,
+            Self::Length => v / world.metres_per_texel,
+            Self::Height => v / world.metres_per_height(),
+            Self::Slope => v / (CELLS_PER_HEIGHT * 100.0),
+            Self::Wavelength => world.metres_per_texel / v.max(1e-9),
+        }
+    }
+}
+
 impl ErosionSliderFieldKind {
+    fn shown(&self) -> Shown {
+        match self {
+            Self::FeatureSize
+            | Self::FlowLength
+            | Self::HydroSearchDistance
+            | Self::OutflowBorder
+            | Self::BrushRadius
+            | Self::BedBankWidth
+            | Self::BedRiverWidth => Shown::Length,
+            Self::NoiseScale
+            | Self::OutflowSeaLevel
+            | Self::BedrockDepth
+            | Self::BedMaxDepth
+            | Self::BedRiverDepth
+            | Self::RiverBrushBreach => Shown::Height,
+            Self::BedShoreSlope => Shown::Slope,
+            Self::NoiseFrequency | Self::MaskFrequency => Shown::Wavelength,
+            _ => Shown::Plain,
+        }
+    }
+
     fn apply(
         &self,
         params: &mut ErodeParams,
@@ -265,7 +326,7 @@ impl ErosionSliderFieldKind {
             Self::RiverBrushDischarge => brush.river.discharge = value,
             Self::RiverBrushArmour => brush.river.armour = value,
             Self::RiverBrushDetail => brush.river.bed_detail = value,
-            Self::RiverBrushBreach => brush.river.breach_depth = value / 100.0,
+            Self::RiverBrushBreach => brush.river.breach_depth = value,
             Self::BrushStrength => brush.strength = value,
             Self::WaterErosion => water.sediment_capacity = value,
             // Shown in % per second.
@@ -339,8 +400,6 @@ impl ErosionSliderFieldKind {
             Self::RidgeErosionSteps
                 | Self::NoiseSeed
                 | Self::IterationsPerFrame
-                | Self::BrushRadius
-                | Self::BedBankWidth
                 | Self::WaterGravity
                 | Self::BedLoadRefineSteps
         )
@@ -518,9 +577,10 @@ impl Plugin for ErosionParamsPlugin {
 fn spawn_erosion_params_panel(
     params: Res<ErodeParams>,
     sim: Res<SimControl>,
+    world: Res<WorldScale>,
     mut commands: Commands,
 ) {
-    commands.spawn_scene(erosion_params_panel(params.clone(), sim.clone()));
+    commands.spawn_scene(erosion_params_panel(params.clone(), sim.clone(), *world));
 }
 
 /// Keep every checkbox in step with its setting.
@@ -691,7 +751,7 @@ fn update_section_chevrons(
     }
 }
 
-fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
+fn erosion_params_panel(params: ErodeParams, sim: SimControl, world: WorldScale) -> impl Scene {
     let water = WaterControl::default();
     let brush = WaterBrush::default();
     bsn! {
@@ -783,21 +843,21 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         @note_text("")
                         BrushHintText
                         --
-                        @slider_row("Radius (texels)", 2.0, 128.0, brush.radius, ErosionSliderFieldKind::BrushRadius)
+                        @slider_row(world, "Radius (m)", 2.0, 128.0, brush.radius, ErosionSliderFieldKind::BrushRadius)
                         --
-                        @slider_row("Strength", 0.01, 5.0, brush.strength, ErosionSliderFieldKind::BrushStrength)
+                        @slider_row(world, "Strength", 0.01, 5.0, brush.strength, ErosionSliderFieldKind::BrushStrength)
                     })
                     --
                     @section("River Brush", true, bsn_list! {
                         @note_text("Click the terrain: a river routes itself downhill from there, with a carved bed and a spring.")
                         --
-                        @slider_row("Discharge", 0.1, 8.0, brush.river.discharge, ErosionSliderFieldKind::RiverBrushDischarge)
+                        @slider_row(world, "Discharge", 0.1, 8.0, brush.river.discharge, ErosionSliderFieldKind::RiverBrushDischarge)
                         --
-                        @slider_row("Armour", 0.0, 1.0, brush.river.armour, ErosionSliderFieldKind::RiverBrushArmour)
+                        @slider_row(world, "Armour", 0.0, 1.0, brush.river.armour, ErosionSliderFieldKind::RiverBrushArmour)
                         --
-                        @slider_row("Bed Detail", 0.0, 2.0, brush.river.bed_detail, ErosionSliderFieldKind::RiverBrushDetail)
+                        @slider_row(world, "Bed Detail", 0.0, 2.0, brush.river.bed_detail, ErosionSliderFieldKind::RiverBrushDetail)
                         --
-                        @slider_row("Breach Depth (cells)", 0.0, 10.0, brush.river.breach_depth * 100.0, ErosionSliderFieldKind::RiverBrushBreach)
+                        @slider_row(world, "Breach Depth (m)", 0.0, 0.1, brush.river.breach_depth, ErosionSliderFieldKind::RiverBrushBreach)
                         --
                         @button_row(bsn_list! {
                             @FeathersButton {
@@ -812,21 +872,21 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                     --
                     @tab_page(Tab::Water, bsn_list! {
                     @section("Water", true, bsn_list! {
-                        @slider_row("Erosion", 0.0, 0.01, water.sediment_capacity, ErosionSliderFieldKind::WaterErosion)
+                        @slider_row(world, "Erosion", 0.0, 0.01, water.sediment_capacity, ErosionSliderFieldKind::WaterErosion)
                         --
-                        @slider_row("Evaporation %/s", 0.0, 10.0, water.evaporation * 100.0, ErosionSliderFieldKind::WaterEvaporation)
+                        @slider_row(world, "Evaporation %/s", 0.0, 10.0, water.evaporation * 100.0, ErosionSliderFieldKind::WaterEvaporation)
                         --
-                        @slider_row("Rainfall ‰/s", 0.0, 1.0, water.rainfall * 1000.0, ErosionSliderFieldKind::WaterRainfall)
+                        @slider_row(world, "Rainfall ‰/s", 0.0, 1.0, water.rainfall * 1000.0, ErosionSliderFieldKind::WaterRainfall)
                         --
-                        @slider_row("Rain Water (per 1000 trail steps)", 0.0, 2.0, water.rain_water * 1000.0, ErosionSliderFieldKind::WaterRainWater)
+                        @slider_row(world, "Rain Water (per 1000 trail steps)", 0.0, 2.0, water.rain_water * 1000.0, ErosionSliderFieldKind::WaterRainWater)
                         --
                         @toggle_row("Momentum Flow (SWE)", ToggleKind::MomentumFlow)
                         --
                         @toggle_row("Second-Order Depth Flux", ToggleKind::SecondOrderDepth)
                         --
-                        @slider_row("Bed Friction (Manning n)", 0.002, 0.1, water.manning_n, ErosionSliderFieldKind::WaterManning)
+                        @slider_row(world, "Bed Friction (Manning n)", 0.002, 0.1, water.manning_n, ErosionSliderFieldKind::WaterManning)
                         --
-                        @slider_row("Gravity (cells/s²)", 250.0, 8000.0, water.gravity, ErosionSliderFieldKind::WaterGravity)
+                        @slider_row(world, "Gravity (cells/s²)", 250.0, 8000.0, water.gravity, ErosionSliderFieldKind::WaterGravity)
                         --
                         @note_text("Springs: 0")
                         SpringCountText
@@ -859,21 +919,21 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                             water.shape_generation = water.shape_generation.wrapping_add(1);
                         })
                         --
-                        @slider_row("River Depth", 0.0, 0.03, water.bed.river_depth, ErosionSliderFieldKind::BedRiverDepth)
+                        @slider_row(world, "River Depth (m)", 0.0, 0.03, water.bed.river_depth, ErosionSliderFieldKind::BedRiverDepth)
                         --
-                        @slider_row("River Width", 1.0, 16.0, water.bed.river_width, ErosionSliderFieldKind::BedRiverWidth)
+                        @slider_row(world, "River Half-Width (m)", 1.0, 16.0, water.bed.river_width, ErosionSliderFieldKind::BedRiverWidth)
                         --
-                        @slider_row("Channel Discharge", 0.0, 0.2, water.bed.channel_discharge, ErosionSliderFieldKind::BedChannelDischarge)
+                        @slider_row(world, "Channel Discharge", 0.0, 0.2, water.bed.channel_discharge, ErosionSliderFieldKind::BedChannelDischarge)
                         --
-                        @slider_row("Max Depth", 0.0, 0.1, water.bed.max_depth, ErosionSliderFieldKind::BedMaxDepth)
+                        @slider_row(world, "Max Depth (m)", 0.0, 0.1, water.bed.max_depth, ErosionSliderFieldKind::BedMaxDepth)
                         --
-                        @slider_row("Shore Slope", 0.0, 0.01, water.bed.shore_slope, ErosionSliderFieldKind::BedShoreSlope)
+                        @slider_row(world, "Shore Slope (%)", 0.0, 0.01, water.bed.shore_slope, ErosionSliderFieldKind::BedShoreSlope)
                         --
-                        @slider_row("River Profile", 0.2, 3.0, water.bed.profile, ErosionSliderFieldKind::BedProfile)
+                        @slider_row(world, "River Profile", 0.2, 3.0, water.bed.profile, ErosionSliderFieldKind::BedProfile)
                         --
-                        @slider_row("Strength", 0.0, 1.0, water.bed.strength, ErosionSliderFieldKind::BedStrength)
+                        @slider_row(world, "Strength", 0.0, 1.0, water.bed.strength, ErosionSliderFieldKind::BedStrength)
                         --
-                        @slider_row("Bank Width", 1.0, MAX_BANK_WIDTH, water.bed.bank_width, ErosionSliderFieldKind::BedBankWidth)
+                        @slider_row(world, "Bank Width (m)", 1.0, MAX_BANK_WIDTH, water.bed.bank_width, ErosionSliderFieldKind::BedBankWidth)
                     })
                     --
                     @section("Bed Load", true, bsn_list! {
@@ -888,31 +948,31 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                             water.refine_generation = water.refine_generation.wrapping_add(1);
                         })
                         --
-                        @slider_row("Grain", 0.02, 2.0, water.bed_load.grain, ErosionSliderFieldKind::BedLoadGrain)
+                        @slider_row(world, "Grain", 0.02, 2.0, water.bed_load.grain, ErosionSliderFieldKind::BedLoadGrain)
                         --
-                        @slider_row("Bed Load K", 0.0, 20.0, water.bed_load.k, ErosionSliderFieldKind::BedLoadK)
+                        @slider_row(world, "Bed Load K", 0.0, 20.0, water.bed_load.k, ErosionSliderFieldKind::BedLoadK)
                         --
-                        @slider_row("Critical Shields", 0.0, 0.2, water.bed_load.critical_shields, ErosionSliderFieldKind::BedLoadCriticalShields)
+                        @slider_row(world, "Critical Shields", 0.0, 0.2, water.bed_load.critical_shields, ErosionSliderFieldKind::BedLoadCriticalShields)
                         --
-                        @slider_row("Rock Hardness", 0.0, 20.0, water.bed_load.rock_hardness, ErosionSliderFieldKind::BedLoadRockHardness)
+                        @slider_row(world, "Rock Hardness", 0.0, 20.0, water.bed_load.rock_hardness, ErosionSliderFieldKind::BedLoadRockHardness)
                         --
-                        @slider_row("Slope Effect", 0.1, 5.0, water.bed_load.slope_effect, ErosionSliderFieldKind::BedLoadSlopeEffect)
+                        @slider_row(world, "Slope Effect", 0.1, 5.0, water.bed_load.slope_effect, ErosionSliderFieldKind::BedLoadSlopeEffect)
                         --
-                        @slider_row("Helical Strength", 0.0, 60.0, water.bed_load.helical_strength, ErosionSliderFieldKind::BedLoadHelical)
+                        @slider_row(world, "Helical Strength", 0.0, 60.0, water.bed_load.helical_strength, ErosionSliderFieldKind::BedLoadHelical)
                         --
-                        @slider_row("Morph. Factor", 1.0, 100.0, water.bed_load.morph_factor, ErosionSliderFieldKind::BedLoadMorphFactor)
+                        @slider_row(world, "Morph. Factor", 1.0, 100.0, water.bed_load.morph_factor, ErosionSliderFieldKind::BedLoadMorphFactor)
                         --
-                        @slider_row("Refine Steps", 50.0, 4000.0, water.bed_load.refine_steps as f32, ErosionSliderFieldKind::BedLoadRefineSteps)
+                        @slider_row(world, "Refine Steps", 50.0, 4000.0, water.bed_load.refine_steps as f32, ErosionSliderFieldKind::BedLoadRefineSteps)
                     })
                     })
                     --
                     @tab_page(Tab::Erosion, bsn_list! {
                     @section("Terrain Source", false, bsn_list! {
-                        @slider_row("Noise Freq", 0.001, 0.05, params.noise_frequency, ErosionSliderFieldKind::NoiseFrequency)
+                        @slider_row(world, "Noise Wavelength (m)", 0.001, 0.05, params.noise_frequency, ErosionSliderFieldKind::NoiseFrequency)
                         --
-                        @slider_row("Noise Scale", 0.5, 5.0, params.noise_scale, ErosionSliderFieldKind::NoiseScale)
+                        @slider_row(world, "Relief (m)", 0.5, 5.0, params.noise_scale, ErosionSliderFieldKind::NoiseScale)
                         --
-                        @slider_row("Seed", 0.0, 100.0, params.noise_seed as f32, ErosionSliderFieldKind::NoiseSeed)
+                        @slider_row(world, "Seed", 0.0, 100.0, params.noise_seed as f32, ErosionSliderFieldKind::NoiseSeed)
                         --
                         @FeathersButton {
                             @caption: bsn! { Text("Reset Terrain Edits (X)") ThemedText },
@@ -923,122 +983,122 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                     })
                     --
                     @section("Erosion", true, bsn_list! {
-                        @slider_row("Erosion Strength", 0.0, 1.0, params.erosion_strength, ErosionSliderFieldKind::ErosionStrength)
+                        @slider_row(world, "Erosion Strength", 0.0, 1.0, params.erosion_strength, ErosionSliderFieldKind::ErosionStrength)
                         --
-                        @slider_row("Rock Softness", 0.0, 1.0, params.rock_softness, ErosionSliderFieldKind::RockSoftness)
+                        @slider_row(world, "Rock Softness", 0.0, 1.0, params.rock_softness, ErosionSliderFieldKind::RockSoftness)
                         --
-                        @slider_row("Erosion Amount", 0.0, 1.0, params.erosion_amount, ErosionSliderFieldKind::ErosionAmount)
+                        @slider_row(world, "Erosion Amount", 0.0, 1.0, params.erosion_amount, ErosionSliderFieldKind::ErosionAmount)
                         --
-                        @slider_row("Detail Scale", 0.25, 4.0, params.detail_scale, ErosionSliderFieldKind::ReferenceDetailScale)
+                        @slider_row(world, "Detail Scale", 0.25, 4.0, params.detail_scale, ErosionSliderFieldKind::ReferenceDetailScale)
                     })
                     --
                     @section("Pyramid", false, bsn_list! {
                         @note_text(format!("Pyramid Levels: {}", params.pyramid_levels().len()))
                         PyramidLevelCountText
                         --
-                        @slider_row("Feature Size", 0.5, 128.0, params.feature_size, ErosionSliderFieldKind::FeatureSize)
+                        @slider_row(world, "Feature Size (m)", 0.5, 128.0, params.feature_size, ErosionSliderFieldKind::FeatureSize)
                         --
-                        @slider_row("Detail Smoothing", 0.0, 4.0, params.source_detail_smoothing, ErosionSliderFieldKind::SourceDetailSmoothing)
+                        @slider_row(world, "Detail Smoothing", 0.0, 4.0, params.source_detail_smoothing, ErosionSliderFieldKind::SourceDetailSmoothing)
                         --
-                        @slider_row("Geological Age", 0.0, 50.0, params.geological_age, ErosionSliderFieldKind::GeologicalAge)
+                        @slider_row(world, "Geological Age", 0.0, 50.0, params.geological_age, ErosionSliderFieldKind::GeologicalAge)
                         --
-                        @slider_row("Granularity Amount", 0.0, 10.0, params.granularity_amount, ErosionSliderFieldKind::GranularityAmount)
+                        @slider_row(world, "Granularity Amount", 0.0, 10.0, params.granularity_amount, ErosionSliderFieldKind::GranularityAmount)
                         --
-                        @slider_row("Granularity Scale", 0.0, 2.0, params.granularity_scale, ErosionSliderFieldKind::GranularityScale)
+                        @slider_row(world, "Granularity Scale", 0.0, 2.0, params.granularity_scale, ErosionSliderFieldKind::GranularityScale)
                         --
-                        @slider_row("Granularity Strength", 0.0, 1.0, params.granularity_strength, ErosionSliderFieldKind::GranularityStrength)
+                        @slider_row(world, "Granularity Strength", 0.0, 1.0, params.granularity_strength, ErosionSliderFieldKind::GranularityStrength)
                         --
-                        @slider_row("Iterations / Frame", 1.0, 64.0, sim.iterations_per_frame as f32, ErosionSliderFieldKind::IterationsPerFrame)
+                        @slider_row(world, "Iterations / Frame", 1.0, 64.0, sim.iterations_per_frame as f32, ErosionSliderFieldKind::IterationsPerFrame)
                         --
                         @toggle_row("Continue At Finest", ToggleKind::ContinueAfterCascade)
                     })
                     --
                     @section("Angles (deg)", false, bsn_list! {
-                        @slider_row("Wear Angle", 0.0, 90.0, params.wear_angle, ErosionSliderFieldKind::WearAngle)
+                        @slider_row(world, "Wear Angle", 0.0, 90.0, params.wear_angle, ErosionSliderFieldKind::WearAngle)
                         --
-                        @slider_row("Talus Angle", 0.0, 90.0, params.talus_angle, ErosionSliderFieldKind::TalusAngle)
+                        @slider_row(world, "Talus Angle", 0.0, 90.0, params.talus_angle, ErosionSliderFieldKind::TalusAngle)
                         --
-                        @slider_row("Max Deposit Angle", 0.0, 90.0, params.max_deposit_angle, ErosionSliderFieldKind::MaxDepositAngle)
+                        @slider_row(world, "Max Deposit Angle", 0.0, 90.0, params.max_deposit_angle, ErosionSliderFieldKind::MaxDepositAngle)
                         --
-                        @slider_row("Erosion Cutoff", 0.0, 90.0, params.erosion_cutoff_angle, ErosionSliderFieldKind::ErosionCutoffAngle)
+                        @slider_row(world, "Erosion Cutoff", 0.0, 90.0, params.erosion_cutoff_angle, ErosionSliderFieldKind::ErosionCutoffAngle)
                     })
                     --
                     @section("Ridge Erosion", false, bsn_list! {
                         @toggle_row("Do Ridge Erosion", ToggleKind::RidgeErosion)
                         --
-                        @slider_row("Steps", 1.0, 100.0, params.ridge_erosion_steps as f32, ErosionSliderFieldKind::RidgeErosionSteps)
+                        @slider_row(world, "Steps", 1.0, 100.0, params.ridge_erosion_steps as f32, ErosionSliderFieldKind::RidgeErosionSteps)
                         --
-                        @slider_row("Amount", 0.0, 2.0, params.ridge_erosion_amount, ErosionSliderFieldKind::RidgeErosionAmount)
+                        @slider_row(world, "Amount", 0.0, 2.0, params.ridge_erosion_amount, ErosionSliderFieldKind::RidgeErosionAmount)
                         --
-                        @slider_row("Softening", 0.0, 5.0, params.ridge_softening_amount, ErosionSliderFieldKind::RidgeSofteningAmount)
+                        @slider_row(world, "Softening", 0.0, 5.0, params.ridge_softening_amount, ErosionSliderFieldKind::RidgeSofteningAmount)
                     })
                     --
                     @section("Flow", false, bsn_list! {
-                        @slider_row("Flow Length", 16.0, 512.0, params.flow_length, ErosionSliderFieldKind::FlowLength)
+                        @slider_row(world, "Flow Length (m)", 16.0, 512.0, params.flow_length, ErosionSliderFieldKind::FlowLength)
                         --
-                        @slider_row("Flow Volume", 0.0, 2.0, params.flow_volume, ErosionSliderFieldKind::FlowVolume)
+                        @slider_row(world, "Flow Volume", 0.0, 2.0, params.flow_volume, ErosionSliderFieldKind::FlowVolume)
                         --
-                        @slider_row("Sediment Friction", 0.0, 1.0, params.friction, ErosionSliderFieldKind::SedimentFriction)
+                        @slider_row(world, "Sediment Friction", 0.0, 1.0, params.friction, ErosionSliderFieldKind::SedimentFriction)
                         --
-                        @slider_row("Rock Friction", 0.0, 1.0, params.rock_friction, ErosionSliderFieldKind::RockFriction)
+                        @slider_row(world, "Rock Friction", 0.0, 1.0, params.rock_friction, ErosionSliderFieldKind::RockFriction)
                         --
-                        @slider_row("Velocity Random", 0.0, 1.0, params.velocity_randomness, ErosionSliderFieldKind::VelocityRandomness)
+                        @slider_row(world, "Velocity Random", 0.0, 1.0, params.velocity_randomness, ErosionSliderFieldKind::VelocityRandomness)
                         --
-                        @slider_row("Random Refinement", 0.0, 1.0, params.velocity_randomness_refinement, ErosionSliderFieldKind::VelocityRandomnessRefinement)
+                        @slider_row(world, "Random Refinement", 0.0, 1.0, params.velocity_randomness_refinement, ErosionSliderFieldKind::VelocityRandomnessRefinement)
                     })
                     --
                     @section("Sediment", false, bsn_list! {
-                        @slider_row("Compaction", 0.0, 1.0, params.sediment_compaction, ErosionSliderFieldKind::SedimentCompaction)
+                        @slider_row(world, "Compaction", 0.0, 1.0, params.sediment_compaction, ErosionSliderFieldKind::SedimentCompaction)
                         --
-                        @slider_row("Compaction Threshold", 0.0, 1.0, params.compaction_threshold, ErosionSliderFieldKind::CompactionThreshold)
+                        @slider_row(world, "Compaction Threshold", 0.0, 1.0, params.compaction_threshold, ErosionSliderFieldKind::CompactionThreshold)
                         --
-                        @slider_row("Suspended Load", 0.0, 1.0, params.suspended_load, ErosionSliderFieldKind::SuspendedSediment)
+                        @slider_row(world, "Suspended Load", 0.0, 1.0, params.suspended_load, ErosionSliderFieldKind::SuspendedSediment)
                     })
                     --
                     @section("Effects", false, bsn_list! {
-                        @slider_row("Channeling", 0.0, 1.0, params.channeling, ErosionSliderFieldKind::Channeling)
+                        @slider_row(world, "Channeling", 0.0, 1.0, params.channeling, ErosionSliderFieldKind::Channeling)
                         --
-                        @slider_row("Channeling Character", 0.0, 2.0, params.channeling_character, ErosionSliderFieldKind::ChannelingCharacter)
+                        @slider_row(world, "Channeling Character", 0.0, 2.0, params.channeling_character, ErosionSliderFieldKind::ChannelingCharacter)
                         --
-                        @slider_row("Sediment Removal", 0.0, 1.0, params.sediment_removal, ErosionSliderFieldKind::SedimentRemoval)
+                        @slider_row(world, "Sediment Removal", 0.0, 1.0, params.sediment_removal, ErosionSliderFieldKind::SedimentRemoval)
                         --
-                        @slider_row("Removal Character", 0.0, 2.0, params.removal_character, ErosionSliderFieldKind::RemovalCharacter)
+                        @slider_row(world, "Removal Character", 0.0, 2.0, params.removal_character, ErosionSliderFieldKind::RemovalCharacter)
                         --
-                        @slider_row("Uplift", 0.0, 0.01, params.uplift, ErosionSliderFieldKind::UpliftAmount)
+                        @slider_row(world, "Uplift", 0.0, 0.01, params.uplift, ErosionSliderFieldKind::UpliftAmount)
                     })
                     --
                     @section("Rivers", false, bsn_list! {
                         @toggle_row("Do Rivers", ToggleKind::Rivers)
                         --
-                        @slider_row("River Scale", 0.0, 1.0, params.river_scale, ErosionSliderFieldKind::RiverScale)
+                        @slider_row(world, "River Scale", 0.0, 1.0, params.river_scale, ErosionSliderFieldKind::RiverScale)
                         --
-                        @slider_row("River Threshold", 0.0, 200.0, params.river_threshold, ErosionSliderFieldKind::RiverThreshold)
+                        @slider_row(world, "River Threshold", 0.0, 200.0, params.river_threshold, ErosionSliderFieldKind::RiverThreshold)
                         --
-                        @slider_row("Trail Damping", 0.0, 1.0, params.trail_damping, ErosionSliderFieldKind::TrailDamping)
+                        @slider_row(world, "Trail Damping", 0.0, 1.0, params.trail_damping, ErosionSliderFieldKind::TrailDamping)
                         --
-                        @slider_row("River Character", 0.0, 2.0, params.river_character, ErosionSliderFieldKind::RiverCharacter)
+                        @slider_row(world, "River Character", 0.0, 2.0, params.river_character, ErosionSliderFieldKind::RiverCharacter)
                         --
-                        @slider_row("River Volume", 0.0, 2.0, params.river_volume, ErosionSliderFieldKind::RiverVolume)
+                        @slider_row(world, "River Volume", 0.0, 2.0, params.river_volume, ErosionSliderFieldKind::RiverVolume)
                         --
-                        @slider_row("Friction Reduction", 0.0, 2.0, params.river_friction_reduction, ErosionSliderFieldKind::RiverFrictionReduction)
+                        @slider_row(world, "Friction Reduction", 0.0, 2.0, params.river_friction_reduction, ErosionSliderFieldKind::RiverFrictionReduction)
                         --
-                        @slider_row("River Channeling", 0.0, 1.0, params.river_channeling, ErosionSliderFieldKind::RiverChanneling)
+                        @slider_row(world, "River Channeling", 0.0, 1.0, params.river_channeling, ErosionSliderFieldKind::RiverChanneling)
                         --
                         @toggle_row("Clamp River Channeling", ToggleKind::ClampRiverChanneling)
                         --
-                        @slider_row("Meander Longevity", 0.0, 1.0, params.meander_longevity, ErosionSliderFieldKind::MeanderLongevity)
+                        @slider_row(world, "Meander Longevity", 0.0, 1.0, params.meander_longevity, ErosionSliderFieldKind::MeanderLongevity)
                         --
-                        @slider_row("Momentum Coherence", 0.0, 10.0, params.momentum_coherence, ErosionSliderFieldKind::MomentumCoherence)
+                        @slider_row(world, "Momentum Coherence", 0.0, 10.0, params.momentum_coherence, ErosionSliderFieldKind::MomentumCoherence)
                         --
-                        @slider_row("Uplift River Carving", 0.0, 2.0, params.uplift_river_carving, ErosionSliderFieldKind::UpliftRiverCarving)
+                        @slider_row(world, "Uplift River Carving", 0.0, 2.0, params.uplift_river_carving, ErosionSliderFieldKind::UpliftRiverCarving)
                         --
                         @toggle_row("Hydro Conditioning", ToggleKind::HydroConditioning)
                         --
-                        @slider_row("Search Distance", 1.0, 64.0, params.hydro_conditioning_search_distance, ErosionSliderFieldKind::HydroSearchDistance)
+                        @slider_row(world, "Search Distance (m)", 1.0, 64.0, params.hydro_conditioning_search_distance, ErosionSliderFieldKind::HydroSearchDistance)
                     })
                     --
                     @section("Masks & Outflow", false, bsn_list! {
-                        @slider_row("Mask Noise Freq", 0.001, 0.05, params.mask_frequency, ErosionSliderFieldKind::MaskFrequency)
+                        @slider_row(world, "Mask Wavelength (m)", 0.001, 0.05, params.mask_frequency, ErosionSliderFieldKind::MaskFrequency)
                         --
                         @toggle_row("Softness Mask", ToggleKind::SoftnessMask)
                         --
@@ -1050,9 +1110,9 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         --
                         @toggle_row("Accumulate Outflow", ToggleKind::AccumulateOutflow)
                         --
-                        @slider_row("Sea Level", 0.0, 1.5, params.outflow_sea_level, ErosionSliderFieldKind::OutflowSeaLevel)
+                        @slider_row(world, "Sea Level (m)", 0.0, 1.5, params.outflow_sea_level, ErosionSliderFieldKind::OutflowSeaLevel)
                         --
-                        @slider_row("Border Width", 0.0, 64.0, params.outflow_border, ErosionSliderFieldKind::OutflowBorder)
+                        @slider_row(world, "Border Width (m)", 0.0, 64.0, params.outflow_border, ErosionSliderFieldKind::OutflowBorder)
                     })
                     --
                     @section("Bedrock", false, bsn_list! {
@@ -1064,7 +1124,7 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         --
                         @toggle_row("Additive Sediment", ToggleKind::AdditiveSediment)
                         --
-                        @slider_row("Bedrock Depth", 0.0, 1.5, params.bedrock_depth, ErosionSliderFieldKind::BedrockDepth)
+                        @slider_row(world, "Bedrock Depth (m)", 0.0, 1.5, params.bedrock_depth, ErosionSliderFieldKind::BedrockDepth)
                     })
                     })
                     --
@@ -1079,7 +1139,7 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                         @note_text("")
                         ViewDescriptionText
                         --
-                        @slider_row("Gain (log10)", -3.0, 3.0, 0.0, ErosionSliderFieldKind::ViewGain)
+                        @slider_row(world, "Gain (log10)", -3.0, 3.0, 0.0, ErosionSliderFieldKind::ViewGain)
                         --
                         @note_text("Debug views scale their field by the gain before colouring.")
                     })
@@ -1157,7 +1217,7 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl) -> impl Scene {
                     })
                     --
                     @section("Age View", false, bsn_list! {
-                        @slider_row("Age Strength", -4.0, 2.0, params.age_strength, ErosionSliderFieldKind::AgeStrength)
+                        @slider_row(world, "Age Strength", -4.0, 2.0, params.age_strength, ErosionSliderFieldKind::AgeStrength)
                         --
                         @toggle_row("Normalize Age", ToggleKind::NormalizeAge)
                     })
@@ -1455,7 +1515,10 @@ fn slider_step(min: f32, max: f32, int: bool) -> (f32, i32) {
     (10f32.powi(exp), (-exp).max(0))
 }
 
+/// A slider over `min..=max` starting at `value`, all in the setting's stored units; it shows
+/// them as `field.shown()` says.
 fn slider_row(
+    world: WorldScale,
     label: &str,
     min: f32,
     max: f32,
@@ -1463,6 +1526,10 @@ fn slider_row(
     field: ErosionSliderFieldKind,
 ) -> impl Scene {
     let label = label.to_string();
+    let shown = field.shown();
+    let (a, b) = (shown.show(world, min), shown.show(world, max));
+    let (min, max) = (a.min(b), a.max(b));
+    let value = shown.show(world, value);
     let (step, precision) = slider_step(min, max, field.is_int());
     // Shown at the field's precision, so 0.2 does not read 0.19999999.
     let scale = 10f32.powi(precision);
@@ -1504,7 +1571,8 @@ fn slider_row(
                 on(move |change: On<ValueChange<f32>>, mut params: ResMut<ErodeParams>, mut sim: ResMut<SimControl>, mut brush: ResMut<WaterBrush>, mut water: ResMut<WaterControl>, mut view: ResMut<TerrainView>, mut reset: ResMut<ResetSim>, mut commands: Commands| {
                     let value = if field.is_int() { change.value.round() } else { change.value };
                     commands.entity(change.source).insert(NumberInputValue::F32(value));
-                    field.apply(&mut params, &mut sim, &mut brush, &mut water, &mut view, value);
+                    let stored = shown.store(world, value);
+                    field.apply(&mut params, &mut sim, &mut brush, &mut water, &mut view, stored);
                     if field.resets_sim() {
                         reset.generation = reset.generation.wrapping_add(1);
                     }
