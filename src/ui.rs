@@ -197,12 +197,14 @@ enum ErosionSliderFieldKind {
     BedLoadBoulderRock,
     BedLoadBoulderScree,
     BedLoadHiding,
+    BedLoadAbrasion,
     BedLoadRockHardness,
     RiverBrushCatchment,
     RiverBrushArmour,
     RiverBrushDetail,
     RiverBrushBreach,
     ViewGain,
+    ViewGrainColour,
 }
 
 /// How a slider shows its setting. Settings are stored in the simulation's units (texels and
@@ -281,6 +283,7 @@ impl ErosionSliderFieldKind {
     ) {
         match self {
             Self::ViewGain => view.gain = value,
+            Self::ViewGrainColour => view.grain_colour = value,
             Self::ErosionStrength => params.erosion_strength = value,
             Self::RockSoftness => params.rock_softness = value,
             Self::ErosionAmount => params.erosion_amount = value,
@@ -369,6 +372,7 @@ impl ErosionSliderFieldKind {
             Self::BedLoadBoulderRock => water.bed_load.boulder_rock = value,
             Self::BedLoadBoulderScree => water.bed_load.boulder_scree = value,
             Self::BedLoadHiding => water.bed_load.hiding = value,
+            Self::BedLoadAbrasion => water.bed_load.abrasion = value,
             Self::BedLoadRockHardness => water.bed_load.rock_hardness = value,
         }
     }
@@ -380,6 +384,7 @@ impl ErosionSliderFieldKind {
             self,
             Self::IterationsPerFrame
                 | Self::ViewGain
+                | Self::ViewGrainColour
                 | Self::AgeStrength
                 | Self::BrushRadius
                 | Self::BrushStrength
@@ -411,6 +416,7 @@ impl ErosionSliderFieldKind {
                 | Self::BedLoadBoulderRock
                 | Self::BedLoadBoulderScree
                 | Self::BedLoadHiding
+                | Self::BedLoadAbrasion
                 | Self::BedLoadRockHardness
                 // New rivers take the discharge; armour re-sends the existing beds.
                 | Self::RiverBrushCatchment
@@ -989,6 +995,8 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl, world: WorldScale)
                         --
                         @slider_row(world, "Hiding γ", 0.0, 1.0, water.bed_load.hiding, ErosionSliderFieldKind::BedLoadHiding)
                         --
+                        @slider_row(world, "Abrasion (per km)", 0.0, 1.0, water.bed_load.abrasion, ErosionSliderFieldKind::BedLoadAbrasion)
+                        --
                         @slider_row(world, "Bed Load K (Wong-Parker 3.97)", 0.0, 20.0, water.bed_load.k, ErosionSliderFieldKind::BedLoadK)
                         --
                         @slider_row(world, "Critical Shields", 0.0, 0.2, water.bed_load.critical_shields, ErosionSliderFieldKind::BedLoadCriticalShields)
@@ -1181,6 +1189,10 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl, world: WorldScale)
                         @slider_row(world, "Gain (log10)", -3.0, 3.0, 0.0, ErosionSliderFieldKind::ViewGain)
                         --
                         @note_text("Debug views scale their field by the gain before colouring.")
+                        --
+                        @slider_row(world, "Grain Colour", 0.0, 2.0, 1.0, ErosionSliderFieldKind::ViewGrainColour)
+                        --
+                        @note_text("Tints the terrain light grey where the bed is boulders (armour and scree), from the water's bed load.")
                     })
                     --
                     @section("Terrain", true, bsn_list! {

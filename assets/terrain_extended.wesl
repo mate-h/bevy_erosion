@@ -29,6 +29,8 @@ const NORMAL_SLOPE_SCALE: f32 = 50.0;
 struct PreviewParams {
     mode: u32,
     gain: f32,
+    // Strength of the grain size tint on the terrain colour (0 = off).
+    grain_colour: f32,
 }
 @group(constants::MATERIAL_BIND_GROUP) @binding(107) var<uniform> preview_params: PreviewParams;
 // Water solver output: R = depth, GB = velocity (texels per solver step), A = suspended sediment.
@@ -199,6 +201,24 @@ fn load(tex: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {
     return textureLoad(tex, px, 0);
 }
 
+// Bilinear `load`, for the fields the terrain colour uses (the debug images have no sampler).
+fn bilinear(tex: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {
+    let dims = vec2<i32>(textureDimensions(tex, 0));
+    let pos = vec2<f32>(dims) * uv - 0.5;
+    let p0 = vec2<i32>(floor(pos));
+    let f = pos - floor(pos);
+    let top = dims - 1;
+    let a = textureLoad(tex, clamp(p0, vec2<i32>(0), top), 0);
+    let b = textureLoad(tex, clamp(p0 + vec2<i32>(1, 0), vec2<i32>(0), top), 0);
+    let c = textureLoad(tex, clamp(p0 + vec2<i32>(0, 1), vec2<i32>(0), top), 0);
+    let d = textureLoad(tex, clamp(p0 + vec2<i32>(1, 1), vec2<i32>(0), top), 0);
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// Bare rock colour of boulder beds and scree, and how far a bed of boulders only moves toward it.
+const BOULDER_COLOUR: vec3<f32> = vec3<f32>(0.66, 0.65, 0.62);
+const BOULDER_TINT: f32 = 0.6;
+
 // Blue for negative, white at zero, red for positive; `v` in [-1, 1].
 fn diverging(v: f32) -> vec3<f32> {
     let t = clamp(v, -1.0, 1.0);
@@ -336,8 +356,11 @@ fn get_preview_color(mode: u32, uv: vec2<f32>, world_normal: vec3<f32>) -> vec4<
             return heat((log2(max(a, 1.0)) / 3.3219 - 2.0) / 6.0 * g);
         }
         default: {
-            // PBR, simple and albedo: the computed colour bands with linear sampling.
-            return textureSample(color_tex, ao_sampler, uv);
+            // PBR, simple and albedo: the computed colour bands with linear sampling, lighter
+            // and greyer where the bed is boulders (armour, scree).
+            let base = textureSample(color_tex, ao_sampler, uv);
+            let boulders = clamp(preview_params.grain_colour * bilinear(debug_bed_tex, uv).w, 0.0, 1.0);
+            return vec4<f32>(mix(base.rgb, BOULDER_COLOUR, BOULDER_TINT * boulders), base.a);
         }
     }
 }

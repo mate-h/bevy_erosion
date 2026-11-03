@@ -667,6 +667,9 @@ pub struct TerrainView {
     pub mode: PreviewMode,
     /// Multiplies the field before colouring, as a power of ten.
     pub gain: f32,
+    /// How strongly the terrain colour shows the bed's grain size (0 = off): boulder beds and
+    /// scree turn a lighter grey.
+    pub grain_colour: f32,
 }
 
 impl Default for TerrainView {
@@ -674,6 +677,7 @@ impl Default for TerrainView {
         Self {
             mode: PreviewMode::Pbr,
             gain: 0.0,
+            grain_colour: 1.0,
         }
     }
 }
@@ -684,6 +688,8 @@ pub struct TerrainViewUniform {
     pub mode: u32,
     /// Linear gain (10^[`TerrainView::gain`]).
     pub gain: f32,
+    /// [`TerrainView::grain_colour`].
+    pub grain_colour: f32,
 }
 
 impl From<TerrainView> for TerrainViewUniform {
@@ -691,6 +697,7 @@ impl From<TerrainView> for TerrainViewUniform {
         Self {
             mode: view.mode as u32,
             gain: 10f32.powf(view.gain),
+            grain_colour: view.grain_colour,
         }
     }
 }
@@ -1256,6 +1263,9 @@ pub struct BedLoad {
     /// γ in θ_c,i = θ_c (D_i / D_m)^(−γ): 0 lets each size move on its own; toward 1 all sizes
     /// start moving at the same flow (Parker 1990: about 0.9).
     pub hiding: f32,
+    /// Sternberg abrasion coefficient α (per km): moving boulders wear into fines as
+    /// e^(−α · distance travelled). Hard rock measures 0.01–0.1 per km, weak rock up to 1.
+    pub abrasion: f32,
 }
 
 impl Default for BedLoad {
@@ -1275,6 +1285,7 @@ impl Default for BedLoad {
             boulder_rock: 0.3,
             boulder_scree: 0.3,
             hiding: 0.85,
+            abrasion: 0.05,
         }
     }
 }
@@ -1308,6 +1319,11 @@ impl BedLoad {
             diameter: self.boulder_diameter,
             ..*self
         }
+    }
+
+    /// Fraction of the boulder load that wears into fines crossing one texel.
+    pub fn abrasion_per_texel(&self, scale: &WorldScale) -> f32 {
+        1.0 - (-self.abrasion.max(0.0) * scale.metres_per_texel / 1000.0).exp()
     }
 
     /// Water steps one refine runs, at `step` seconds a step.
@@ -1571,6 +1587,8 @@ struct MorphoParams {
     boulder_scree: f32,
     hiding: f32,
     active_layer: f32,
+    abrasion: f32,
+    reset_boulders: u32,
 }
 
 /// Floats per cell in the morpho state (`STATE_STRIDE` in `water_morpho.wgsl`).
@@ -2452,6 +2470,8 @@ impl WaterBuffers {
                 boulder_scree: 0.0,
                 hiding: 0.0,
                 active_layer: 2.0,
+                abrasion: 0.0,
+                reset_boulders: 0,
             }),
             river: StorageBuffer::from(vec![Vec4::new(river::NO_RIVER, 1.0, 0.0, 0.0); n]),
             river_band: StorageBuffer::from(vec![Vec2::ZERO; n]),
@@ -2921,6 +2941,8 @@ struct ErosionState {
     refine_left: u32,
     /// Helical flow slot holding the latest intensity.
     helical_parity: u32,
+    /// Boulder settings the bed's surface layer was set from (base, rock, scree).
+    boulder_settings: [f32; 3],
     /// Cascade was finished last frame (AO refresh on the frame it finishes).
     was_finished: bool,
     /// Finest-level displays since AO was last computed (`None` before the first one).
@@ -3212,6 +3234,13 @@ fn plan_erosion_frame(
             steps
         };
         let bed_load = &water.bed_load;
+        // New boulder settings: the bed's surface layer starts again from its substrate.
+        let boulders = [bed_load.boulder_base, bed_load.boulder_rock, bed_load.boulder_scree];
+        // (The discharge pass that applies it runs only on frames with steps.)
+        let reset_boulders = steps > 0 && boulders != state.boulder_settings;
+        if steps > 0 {
+            state.boulder_settings = boulders;
+        }
         let mor_fac = if refining {
             bed_load.morph_factor.max(0.0)
         } else if bed_load.live {
@@ -3250,6 +3279,8 @@ fn plan_erosion_frame(
             boulder_scree: bed_load.boulder_scree,
             hiding: bed_load.hiding,
             active_layer: ACTIVE_LAYER,
+            abrasion: bed_load.abrasion_per_texel(&scale),
+            reset_boulders: u32::from(reset_boulders),
         });
         buffers
             .water

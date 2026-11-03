@@ -78,6 +78,11 @@ struct MorphoParams {
     hiding: f32,
     // Active layer thickness in mean grain diameters.
     active_layer: f32,
+    // Fraction of the boulder load that wears into fines crossing one face (Sternberg).
+    abrasion: f32,
+    // 1 for one frame after the boulder settings changed: the surface layer starts again from
+    // the substrate.
+    reset_boulders: u32,
 }
 
 @group(0) @binding(0) var<storage, read_write> height: array<atomic<u32>>;
@@ -94,7 +99,8 @@ struct MorphoParams {
 @group(0) @binding(5) var<storage, read_write> bed_load: array<vec4<f32>>;
 // `STATE_STRIDE` floats per cell: helical intensity in two slots (ping-pong), the bed change not
 // yet written to the heights (height units), the height when the water frame began
-// (`water_splat.wgsl`), and the surface boulder fraction less the substrate's.
+// (`water_splat.wgsl`), and the surface and substrate boulder fractions plus one (0 until the
+// first water frame sets them from the terrain).
 @group(0) @binding(6) var<storage, read_write> state: array<f32>;
 @group(0) @binding(7) var<uniform> params: MorphoParams;
 // KTT's per-cell masks (x = softness, 1 where unused) and layers (x = bedrock) of the finest work
@@ -108,8 +114,9 @@ struct MorphoParams {
 
 // Floats per cell in `state` (must match `MORPHO_STATE_STRIDE` in `lib.rs`).
 const STATE_STRIDE: u32 = 8u;
-// Slot of the boulder fraction's departure from the substrate's.
+// Slots of the surface and substrate boulder fractions (plus one).
 const BOULDER_SLOT: u32 = 4u;
+const SUBSTRATE_SLOT: u32 = 5u;
 
 const DIRS = array<vec2<i32>, 4>(vec2<i32>(-1, 0), vec2<i32>(1, 0), vec2<i32>(0, -1), vec2<i32>(0, 1));
 
@@ -139,8 +146,9 @@ fn flow(p: vec2<i32>) -> vec2<f32> {
     return velocity[widx(p)] / params.step_seconds;
 }
 
-// Boulder fraction of the substrate under `p`: more on hard rock and on steep slopes.
-fn substrate_boulders(p: vec2<i32>) -> f32 {
+// Boulder fraction of the material under `p` from the terrain as it is: more on hard rock and on
+// steep slopes.
+fn initial_boulders(p: vec2<i32>) -> f32 {
     let soft = clamp(masks[gidx(p)].x, 0.0, 1.0);
     let gx = terrain(clamp_map(p + DIRS[1])) - terrain(clamp_map(p + DIRS[0]));
     let gy = terrain(clamp_map(p + DIRS[3])) - terrain(clamp_map(p + DIRS[2]));
@@ -153,9 +161,19 @@ fn substrate_boulders(p: vec2<i32>) -> f32 {
     );
 }
 
-// Boulder fraction of the active layer at `p`.
+// Boulder fraction of the substrate under `p`, as the first water frame found it: the material of
+// a riser stays scree after the flow rounds it.
+fn substrate_boulders(p: vec2<i32>) -> f32 {
+    let stored = state[STATE_STRIDE * widx(p) + SUBSTRATE_SLOT];
+    return clamp(select(initial_boulders(p), stored - 1.0, stored >= 0.5), 0.0, 1.0);
+}
+
+// Boulder fraction of the active layer at `p`. It is set from the substrate on the first water
+// frame and from then on belongs to the bed, so a riser that the flow rounds below the talus
+// keeps the boulders it had.
 fn surface_boulders(p: vec2<i32>) -> f32 {
-    return clamp(substrate_boulders(p) + state[STATE_STRIDE * widx(p) + BOULDER_SLOT], 0.0, 1.0);
+    let stored = state[STATE_STRIDE * widx(p) + BOULDER_SLOT];
+    return clamp(select(substrate_boulders(p), stored - 1.0, stored >= 0.5), 0.0, 1.0);
 }
 
 fn helical(p: vec2<i32>, slot: u32) -> f32 {
@@ -185,6 +203,12 @@ fn morpho_discharge(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     d.w = params.ktt_scale * max(river, 0.0);
     discharge[i] = d;
+    let slot = STATE_STRIDE * i + BOULDER_SLOT;
+    if (params.reset_boulders != 0u || state[slot] < 0.5) {
+        let initial = initial_boulders(p) + 1.0;
+        state[slot] = initial;
+        state[STATE_STRIDE * i + SUBSTRATE_SLOT] = initial;
+    }
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -369,18 +393,25 @@ fn morpho_exner(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (p.x > 0) { div -= bed_load[widx(p + DIRS[0])].xz; }
     if (p.y > 0) { div -= bed_load[widx(p + DIRS[2])].yw; }
     if (is_sink(p)) { return; }
+    // Abrasion (Sternberg): of the boulders arriving through a face, a part has worn into fines
+    // on the way across the texel. The total is kept.
+    var arriving = max(-out.z, 0.0) + max(-out.w, 0.0);
+    if (p.x > 0) { arriving += max(bed_load[widx(p + DIRS[0])].z, 0.0); }
+    if (p.y > 0) { arriving += max(bed_load[widx(p + DIRS[2])].w, 0.0); }
+    let worn = params.abrasion * arriving;
+    div += vec2<f32>(-worn, worn);
     let change = -params.mor_fac * params.step_seconds * div;
     let dz = (change.x + change.y) / CELLS_PER_HEIGHT;
     // Active layer (Hirano): its boulder fraction gains the boulders that arrive less those
     // leaving, and trades with what lies below as the bed moves through it: its own mix when
     // the bed rises, the substrate's when it cuts.
     let substrate = substrate_boulders(p);
-    let fb = clamp(substrate + state[STATE_STRIDE * i + BOULDER_SLOT], 0.0, 1.0);
+    let fb = surface_boulders(p);
     let d_mean = mix(params.grain, params.boulder_grain, fb) / SUBMERGED_DENSITY;
     let layer = max(params.active_layer * d_mean, 1e-4);
     let traded = select(substrate, fb, change.x + change.y > 0.0);
     let fb_new = clamp(fb + (change.y - traded * (change.x + change.y)) / layer, 0.0, 1.0);
-    state[STATE_STRIDE * i + BOULDER_SLOT] = fb_new - substrate;
+    state[STATE_STRIDE * i + BOULDER_SLOT] = fb_new + 1.0;
     var pending = state[STATE_STRIDE * i + 2u] + dz;
     let quanta = i32(round(pending * HEIGHT_SCALE));
     let g = gidx(p);

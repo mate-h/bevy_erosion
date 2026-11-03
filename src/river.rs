@@ -732,7 +732,7 @@ pub fn reprofile(river: &mut River, heights: &[f32], size: UVec2, breach_depth: 
 
 /// `field` at a point in texels, between texel centres.
 pub fn bilinear(field: &[f32], size: UVec2, p: Vec2) -> f32 {
-    if field.len() != (size.x * size.y) as usize {
+    if field.is_empty() || field.len() != (size.x * size.y) as usize {
         return 0.0;
     }
     let q = (p - 0.5).clamp(Vec2::ZERO, (size - 1).as_vec2());
@@ -753,8 +753,8 @@ mod tests {
 
     fn shape() -> ChannelShape {
         ChannelShape {
-            river_depth: 0.008,
-            river_width: 3.0,
+            model: ChannelModel::default(),
+            scale: WorldScale::default(),
             profile: 0.8,
             max_depth: 0.025,
             bank_width: 4.0,
@@ -845,9 +845,12 @@ mod tests {
     #[test]
     fn steep_rivers_get_steps_and_pools() {
         let path: Vec<Vec2> = (0..200).map(|i| Vec2::new(i as f32 + 0.5, 32.5)).collect();
+        // 100 km² upstream.
+        let q = shape().model.discharge(1e8);
         let steep = |s: f32| River {
             source: path[0],
-            discharge: 1.0,
+            catchment: 1e8,
+            flow: vec![q; path.len()],
             seed: 7,
             path: path.clone(),
             // `s` cells per texel.
@@ -859,7 +862,7 @@ mod tests {
         let depths = |r: &River| -> Vec<f32> {
             sections(r, &shape(), 1.0).iter().map(|s| s.extra).collect()
         };
-        let base = shape().river_depth;
+        let base = shape().section(q).1;
         // From the shallowest lip to the deepest pool.
         let spread = |d: &[f32]| {
             d.iter().fold(f32::MIN, |m, &v| m.max(v)) - d.iter().fold(f32::MAX, |m, &v| m.min(v))
@@ -891,6 +894,7 @@ mod tests {
             0.0,
             &settings,
             &shape(),
+            &DrainageArea::default(),
             1,
         )
         .unwrap();

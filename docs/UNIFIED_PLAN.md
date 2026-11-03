@@ -385,16 +385,29 @@ rock is smaller than a cell.
 - **Shown**: a Grain Size view, and later the terrain colour (rock on boulder beds).
 - Later: abrasion downstream (Sternberg: D shrinks by e^(−α·distance)), and more fractions.
 
-Status (Phase 7, first part): built. The fraction lives in the morpho state (8 floats per cell,
-since the bed load kernels are at eight storage buffers), the face bed load carries both
-fractions, and the Boulders view shows the surface fraction. `boulders_armour_the_bed`: in a
-gentle valley the eroding head coarsens from 0.30 to 0.34, a coarse lag sits just downstream of
-it and the deposits beyond are finer (0.28), and the bed moves 17 % less than with fines alone.
-Far above the threshold (the steep flume, Shields 0.7) transport barely depends on grain size and
-there is no armour, as Wong & Parker predicts. Defaults: 1.5 m fines (the old look) and 4 m
-boulders, +0.3 on hard rock (with the softness mask on) and +0.3 on scree. Not yet: terrain
-colour by grain size, abrasion, and checking that boulder lines hold step-pools without the
-river brush's armour band.
+Status (Phase 7): built. The fractions live in the morpho state (8 floats per cell, since the
+bed load kernels are at eight storage buffers), the face bed load carries both fractions, and the
+Boulders view shows the surface fraction.
+
+- **The bed's material is set once.** The first water frame sets each cell's surface and
+  substrate boulder fractions from the terrain (hard rock, scree) and they belong to the bed from
+  then on, so a riser the flow rounds below the talus keeps its boulders. Changing a boulder
+  setting starts them again from the terrain.
+- **Armour**: `boulders_armour_the_bed`: in a gentle valley the eroding head coarsens from 0.30 to
+  0.34, and the bed moves 17 % less than with fines alone. Far above the threshold (the steep
+  flume, Shields 0.7) transport barely depends on grain size and there is no armour, as Wong &
+  Parker predicts.
+- **Abrasion** (Sternberg, `abrasion` per km, default 0.05): of the boulders arriving through a
+  face, a share 1 − e^(−α·dx) arrives as fines. `abrasion_fines_the_deposits`: at 20 per km the
+  deposits below the cut fall from 0.30 to 0.13 boulders.
+- **Terrain colour**: boulder beds and scree tint toward light grey (View → Grain Colour).
+- **Step-pools: not held.** `inspect_boulder_steps` runs a 17 % staircase with scree risers.
+  The steps grade out with or without boulders (relief −0.13 with fines, −0.09 with 4× boulders,
+  −0.01 with 10×): far above the threshold and with hiding near equal mobility, boulders move
+  almost as freely as fines. Real step-pools hold because boulders jam against each other, which
+  a fraction cannot express. That is Phase 8's job (or the river brush's armour band).
+- Defaults: 1.5 m fines (the old look) and 4 m boulders, +0.3 on hard rock (with the softness mask
+  on) and +0.3 on scree.
 
 ### Phase 8: boulders as bodies
 

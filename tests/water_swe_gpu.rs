@@ -2870,7 +2870,8 @@ fn inspect_river_brush() {
 /// where its thalweg cut, after 20 s of bed load with `boulders` of the bed four times the fines'
 /// size (where it cut by over 0.001). The valley's sides rise at 0.03, far below the slump angle, so clean water from the
 /// spring cuts its floor instead of burying it under slumped banks.
-fn boulder_flume(slope: f32, boulders: f32) -> (f32, f32) {
+/// Bed moved, and the mean surface boulder fraction where the bed cut and where it filled.
+fn boulder_flume(slope: f32, boulders: f32, abrasion: f32) -> (f32, f32, f32) {
     let bed = move |x: u32, y: u32| {
         0.02 + slope * (N - 1 - x) as f32 + 0.0003 * (y as f32 + 0.5 - N as f32 / 2.0).abs()
     };
@@ -2881,6 +2882,7 @@ fn boulder_flume(slope: f32, boulders: f32) -> (f32, f32) {
         water.bed_load.boulder_rock = 0.0;
         water.bed_load.boulder_scree = 0.0;
         water.bed_load.boulder_base = boulders;
+        water.bed_load.abrasion = abrasion;
         water.springs.push(Spring {
             center: Vec2::new(12.0, N as f32 / 2.0),
             radius: 6.0,
@@ -2902,8 +2904,13 @@ fn boulder_flume(slope: f32, boulders: f32) -> (f32, f32) {
         .map(|i| (after[i] - before[i]).abs())
         .sum();
     let cut: Vec<usize> = xs
+        .clone()
         .flat_map(|x| (mid - 9..mid + 9).map(move |y| idx(x, y)))
         .filter(|&i| after[i] < before[i] - 1e-3)
+        .collect();
+    let filled: Vec<usize> = xs
+        .flat_map(|x| (mid - 9..mid + 9).map(move |y| idx(x, y)))
+        .filter(|&i| after[i] > before[i] + 1e-3)
         .collect();
     if std::env::var("TEST_PROFILE").is_ok() {
         for y in (mid - 9..mid + 9).step_by(2) {
@@ -2917,12 +2924,14 @@ fn boulder_flume(slope: f32, boulders: f32) -> (f32, f32) {
             println!("y {y}: {}", row.join(" "));
         }
     }
-    let surface = cut.iter().map(|&i| fraction[i]).sum::<f32>() / cut.len().max(1) as f32;
+    let mean = |cells: &[usize]| {
+        cells.iter().map(|&i| fraction[i]).sum::<f32>() / cells.len().max(1) as f32
+    };
     assert!(
         fraction.iter().all(|f| (0.0..=1.0).contains(f)),
         "boulder fraction out of range"
     );
-    (moved, surface)
+    (moved, mean(&cut), mean(&filled))
 }
 
 /// Boulders armour a bed: near the threshold of motion the flow carries the fines off first, so
@@ -2936,8 +2945,8 @@ fn boulders_armour_the_bed() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.0008);
-    let (fine_moved, fine_surface) = boulder_flume(slope, 0.0);
-    let (armoured_moved, surface) = boulder_flume(slope, 0.3);
+    let (fine_moved, fine_surface, _) = boulder_flume(slope, 0.0, 0.0);
+    let (armoured_moved, surface, _) = boulder_flume(slope, 0.3, 0.0);
     println!(
         "boulders: bed moved {fine_moved:.3} with fines only (surface {fine_surface:.2}), \
          {armoured_moved:.3} with 30% boulders, whose surface where it cut coarsened to {surface:.3}"
@@ -2949,4 +2958,99 @@ fn boulders_armour_the_bed() {
         armoured_moved < fine_moved,
         "boulders did not slow the bed ({armoured_moved} against {fine_moved})"
     );
+}
+
+/// Abrasion (Sternberg): boulders wear into fines on their way, so the deposits downstream of
+/// the cut are finer than without it.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn abrasion_fines_the_deposits() {
+    // 20 per km: a fifth of the boulder load wears down per 10 m texel, so the effect shows
+    // within the flume (rivers measure 0.01 to 1 per km).
+    let (_, _, plain) = boulder_flume(0.0008, 0.3, 0.0);
+    let (_, _, worn) = boulder_flume(0.0008, 0.3, 20.0);
+    println!("abrasion: deposits {plain:.3} boulders without, {worn:.3} with");
+    assert!(worn < plain - 0.01, "abrasion did not fine the deposits ({worn} against {plain})");
+}
+
+/// A staircase valley: steps of `STEP_DROP` every `STEP_LENGTH` texels, falling toward +x.
+const STEP_LENGTH: u32 = 12;
+const STEP_DROP: f32 = 0.02;
+
+/// Step relief left along the valley floor after the water and bed load ran on the staircase,
+/// with `scree` boulders on the risers: the mean drop across a riser, over its initial drop.
+fn step_relief(scree: f32) -> f32 {
+    let steps = move |x: u32| (N - 1 - x) / STEP_LENGTH;
+    let bed = move |x: u32, y: u32| {
+        0.02 + STEP_DROP * steps(x) as f32 + 0.0005 * (y as f32 + 0.5 - N as f32 / 2.0).abs()
+    };
+    let mut h = Harness::new(WaterSolver::Swe, &bed);
+    {
+        let mut water = h.water();
+        let ratio: f32 = std::env::var("TEST_BOULDER_RATIO")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4.0);
+        water.bed_load.boulder_diameter = ratio * water.bed_load.diameter;
+        water.bed_load.boulder_rock = 0.0;
+        water.bed_load.boulder_base = 0.0;
+        water.bed_load.boulder_scree = scree;
+        water.bed_load.abrasion = 0.0;
+        water.springs.push(Spring {
+            center: Vec2::new(8.0, N as f32 / 2.0),
+            radius: 6.0,
+            rate: 0.05 / TIME,
+        });
+    }
+    h.run(6.0);
+    let before = h.read_heights();
+    h.water().bed_load.live = std::env::var("TEST_NO_BED").is_err();
+    h.run(20.0);
+    let after = h.read_heights();
+    let mid = N / 2;
+    if std::env::var("TEST_PROFILE").is_ok() {
+        let row: Vec<String> = (0..N).step_by(2).map(|x| format!("{:.3}", before[idx(x, mid)])).collect();
+        println!("before {scree}: {}", row.join(" "));
+        let row: Vec<String> = (0..N).step_by(2).map(|x| format!("{:.3}", bed(x, mid))).collect();
+        println!("start {scree}: {}", row.join(" "));
+        let handle = h.app.world().resource::<ErosionImages>().debug_bed.clone();
+        let fraction: Vec<f32> = h.read(handle).iter().map(|t| t[3]).collect();
+        let row: Vec<String> = (0..N).step_by(2).map(|x| format!("{:.3}", fraction[idx(x, mid)])).collect();
+        println!("boulders {scree}: {}", row.join(" "));
+    }
+    // Each riser between x0 (last texel of the upper step) and x0 + 1, measured across a few
+    // texels so a riser that has spread still counts; the first and last steps are left out.
+    let floor = |x: u32| (mid - 2..mid + 3).map(|y| after[idx(x, y)]).sum::<f32>() / 5.0;
+    let risers: Vec<u32> = (1..N - 1)
+        .filter(|&x| steps(x) != steps(x + 1))
+        .filter(|&x| x > 16 && x < N - 16)
+        .collect();
+    let drops: Vec<f32> = risers
+        .iter()
+        .map(|&x| floor(x - 2) - floor(x + 3))
+        .collect();
+    if std::env::var("TEST_PROFILE").is_ok() {
+        let row: Vec<String> = (0..N).step_by(2).map(|x| format!("{:.3}", floor(x))).collect();
+        println!("scree {scree}: {}", row.join(" "));
+    }
+    // Over five texels the even slope of a riser washed out entirely would still drop
+    // 5 / STEP_LENGTH of a step; relief counts what is above that.
+    let even = STEP_DROP * 5.0 / STEP_LENGTH as f32;
+    drops.iter().map(|d| (d - even) / (STEP_DROP - even)).sum::<f32>() / drops.len() as f32
+}
+
+/// Do boulder lips hold step-pools? On a staircase the steep risers are scree, and the boulders
+/// they shed into the active layer might keep the steps from washing out. They do not at this
+/// resolution: far above the threshold of motion and with hiding close to equal mobility, the
+/// boulders move nearly as freely as the fines, and the steps grade out either way (relief about
+/// −0.13 with fines, −0.09 with 4× boulders, −0.01 with 10×). Holding steps takes boulders that
+/// jam (Phase 8), or the river brush's armour band. Reports only; `TEST_BOULDER_RATIO` sets the
+/// boulder size over the fines', `TEST_PROFILE` prints the floor, `TEST_NO_BED` turns bed load
+/// off.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn inspect_boulder_steps() {
+    let fines = step_relief(0.0);
+    let boulders = step_relief(1.0);
+    println!("steps: relief {fines:.3} of the initial with fines, {boulders:.3} with boulder lips");
 }
