@@ -31,6 +31,7 @@ use bevy::{
 };
 
 use crate::camera::OrbitInputBlocked;
+use crate::scenes::{SceneKind, SceneRequest};
 use crate::{
     CELLS_PER_HEIGHT, ErodeParams, MAX_BANK_WIDTH, MAX_SPRINGS, PreviewMode, PyramidProgress,
     ResetSim, SimControl, TerrainView, WaterControl, WaterSolver, WorldScale,
@@ -73,6 +74,7 @@ enum Tab {
     Water,
     Erosion,
     View,
+    Scenes,
 }
 
 #[derive(Resource, Default)]
@@ -1255,6 +1257,31 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl, world: WorldScale)
                     })
                     })
                     --
+                    @tab_page(Tab::Scenes, bsn_list! {
+                    @section("Scenes", true, bsn_list! {
+                        @note_text("Each scene finds its sites on the eroded map and plays with captions and a moving camera. Escape stops it.")
+                        --
+                        @scene_button(SceneKind::Tour)
+                        --
+                        @scene_button(SceneKind::Terrain)
+                        --
+                        @scene_button(SceneKind::River)
+                        --
+                        @scene_button(SceneKind::Boulders)
+                        --
+                        @scene_button(SceneKind::Landslide)
+                        --
+                        @button_row(bsn_list! {
+                            @FeathersButton {
+                                @caption: bsn! { Text("Stop") ThemedText },
+                            }
+                            on(|_: On<Activate>, mut request: ResMut<SceneRequest>| {
+                                request.stop = true;
+                            })
+                        })
+                    })
+                    })
+                    --
                     @tab_page(Tab::View, bsn_list! {
                     @section("Render Mode", true, bsn_list! {
                         @button_row(bsn_list! {
@@ -1426,6 +1453,8 @@ fn header_controls() -> impl Scene {
                 @tab_button("Erosion", Tab::Erosion)
                 --
                 @tab_button("View", Tab::View)
+                --
+                @tab_button("Scenes", Tab::Scenes)
             })
         ]
     }
@@ -1458,6 +1487,26 @@ fn tab_button(label: &str, tab: Tab) -> impl Scene {
         on(move |_: On<Activate>, mut active: ResMut<ActiveTab>| {
             active.0 = tab;
         })
+    }
+}
+
+/// Starts `scene`, with its description under the button.
+fn scene_button(scene: SceneKind) -> impl Scene {
+    bsn! {
+        Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: px(4.0),
+        }
+        Children [
+            @FeathersButton {
+                @caption: bsn! { Text({scene.label().to_string()}) ThemedText },
+            }
+            on(move |_: On<Activate>, mut request: ResMut<SceneRequest>| {
+                request.start = Some(scene);
+            })
+            --
+            @note_text(scene.description())
+        ]
     }
 }
 

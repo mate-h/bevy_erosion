@@ -45,6 +45,7 @@ use bevy_erosion::{
     boulders::{Boulder, BoulderEdits, BoulderList},
     drainage::DrainageArea,
     landslide::Landslides,
+    scenes::{SceneKind, SceneRequest, SceneStatus},
     brush::{BrushMode, TerrainSurface, WaterBrush, WaterBrushPlugin},
     camera::{OrbitCameraPlugin, OrbitController},
     sun::{Sun, SunController, SunPlugin},
@@ -86,6 +87,59 @@ fn world_scale() -> WorldScale {
         scale.metres_per_texel = dx;
     }
     scale
+}
+
+/// `--showcase` (or `EROSION_SHOWCASE=1`) plays the full tour of the Scenes tab once the terrain
+/// is eroded; `EROSION_SHOWCASE=landslide` (any scene's label) plays that scene. `EROSION_SHOWCASE_SHOTS=<dir>` saves a screenshot halfway through each stage and
+/// quits after the last.
+fn showcase() -> bool {
+    std::env::args().any(|a| a == "--showcase")
+        || std::env::var("EROSION_SHOWCASE").is_ok_and(|v| v != "0")
+}
+
+fn start_showcase(mut request: ResMut<SceneRequest>) {
+    if !showcase() {
+        return;
+    }
+    // `EROSION_SHOWCASE=<scene>` plays one scene, by its label (any case, spaces optional).
+    let key = |s: &str| s.to_lowercase().replace([' ', '&'], "");
+    let named = std::env::var("EROSION_SHOWCASE").ok().and_then(|name| {
+        SceneKind::ALL
+            .into_iter()
+            .find(|scene| key(scene.label()).contains(&key(&name)))
+    });
+    request.start = Some(named.unwrap_or(SceneKind::Tour));
+}
+
+/// Screenshots of the showcase, one per stage (`EROSION_SHOWCASE_SHOTS`).
+fn showcase_shots(
+    mut commands: Commands,
+    status: Res<SceneStatus>,
+    mut taken: Local<Option<usize>>,
+    mut started: Local<bool>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let Ok(dir) = std::env::var("EROSION_SHOWCASE_SHOTS") else {
+        return;
+    };
+    if status.scene.is_none() {
+        // Over once it has played.
+        if *started {
+            exit.write(AppExit::Success);
+        }
+        return;
+    }
+    *started = true;
+    let halfway = status.seconds.is_finite() && status.time >= 0.5 * status.seconds;
+    if halfway && *taken != Some(status.index) {
+        *taken = Some(status.index);
+        let name = status.stage.to_lowercase().replace([' ', '&'], "_");
+        let path = format!("{dir}/{:02}_{name}.png", status.index);
+        info!("Showcase shot {path}");
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path));
+    }
 }
 
 fn bench_seconds() -> Option<f32> {
@@ -156,7 +210,10 @@ fn main() {
             ErosionParamsPlugin,
         ))
         .add_systems(Startup, (setup, print_controls))
-        .add_systems(PostStartup, (spawn_terrain, seed_from_env, view_from_env))
+        .add_systems(
+            PostStartup,
+            (spawn_terrain, seed_from_env, view_from_env, start_showcase),
+        )
         .add_systems(
             Update,
             (
@@ -168,6 +225,7 @@ fn main() {
                 sync_sea_level,
                 freeze_atmosphere_env_map,
                 log_frame_times,
+                showcase_shots,
             ),
         );
     if !simple {
@@ -435,6 +493,7 @@ fn print_controls() {
     println!("  C - clear water and springs   X - reset terrain edits");
     println!("  G - shape lake and river beds under the current water");
     println!("  M - refine beds: fast-forward bed load under the current flow");
+    println!("  Esc - stop a scene (Scenes tab; --showcase plays the full tour)");
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -37,6 +37,7 @@ pub mod camera;
 pub mod drainage;
 pub mod landslide;
 pub mod river;
+pub mod scenes;
 pub mod sun;
 
 #[cfg(feature = "ui")]
@@ -1823,6 +1824,7 @@ impl Plugin for ErosionComputePlugin {
                 drainage::DrainagePlugin,
                 boulders::BoulderPlugin,
                 landslide::LandslidePlugin,
+                scenes::ScenesPlugin,
             ))
             .init_resource::<TerrainView>()
             .add_systems(Startup, setup_erosion_resources)

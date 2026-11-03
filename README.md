@@ -134,6 +134,30 @@ is higher on hard rock (KTT's softness mask).
 | Duration, Speed | Slide seconds per event, and per real second |
 | Slope Friction, Cohesion | Strength of intact slopes in the stability check |
 
+## Scenes
+
+The Scenes tab of the panel plays scripted scenes that show the features, each with captions
+and a camera that moves to the action. A scene first finds its sites on the eroded map: a river
+source with a good catchment, a stretch of that river, and the steepest slope above it that
+faces the river.
+
+| Scene | What it shows |
+|---|---|
+| Full Tour | Everything below in turn (about 90 s) |
+| Terrain & Drainage | The eroded terrain, and the drainage area that sizes its channels |
+| River & Rain | A river placed at the source, then rain, the shallow-water solver and bed load |
+| Boulders | Rocks dropped into the river, and the bed's boulder fraction |
+| Landslide | The slope above the river lets go and runs into the valley; then slopes failing on their own |
+
+Escape (or Stop) ends a scene and restores the view, rainfall and automatic landslides. The demo
+plays the full tour on startup with `--showcase` (or `EROSION_SHOWCASE=1`), or one scene with
+`EROSION_SHOWCASE=landslide`; `EROSION_SHOWCASE_SHOTS=<dir>` saves a screenshot halfway through
+each stage and quits when it ends.
+
+```bash
+cargo run --release --example demo -- --showcase
+```
+
 ## KTT rivers
 
 **Do Rivers** turns on KTT's river momentum: every trail leaves momentum behind it, and where it
