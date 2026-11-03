@@ -354,6 +354,68 @@ drainage and carving after it).
   duplicate `CELLS_PER_HEIGHT` constants (`river.rs`, five shaders) in favour of one uniform.
 - Update `README.md` (keys, River brush) and `VALIDATION.md` (units line).
 
+## Rocks and boulders
+
+Rocks matter at three scales, and each wants a different model. At 10 m texels nearly every
+rock is smaller than a cell.
+
+| Scale | Example | Model | Phase |
+|---|---|---|---|
+| Below a cell | gravel, cobbles, boulders on a 10 m grid | grain-size fractions in a bed surface layer | 7 |
+| About a cell | 1–10 m boulders (more texels on finer grids) | rigid bodies on the heightfield, moved by the flow | 8 |
+| Many cells | landslides, rockfall, debris flows | MPM granular continuum, as local events | 9 |
+
+### Phase 7: grain sizes in the bed
+
+- **Two fractions**, fine (the grain size the bed load uses now) and boulders. Each cell keeps
+  the boulder fraction F_b of an active surface layer (Hirano 1971) about two mean grain
+  diameters thick. Below it lies a substrate of fixed composition.
+- **Transport per fraction**: q_i = F_i · K √(R g D_i³) (θ_i − θ_c,i)^1.5 (Wong & Parker), with
+  θ_i from each grain's own diameter. **Hiding**: θ_c,i = θ_c (D_i / D_m)^(−γ), γ = 0.85, so
+  boulders among fines move more easily than alone and fines among boulders less (Parker 1990;
+  Wilcock & Crowe 2003 for the shape).
+- **Exner per fraction**: (1 − p)(L_a ∂F_i/∂t + F_i^I ∂η/∂t) = −∇·q_i, where the interface
+  fraction F_i^I is the active layer's when the bed rises and the substrate's when it cuts.
+  Fines leave first, so beds coarsen into an armour, and boulder lines hold step-pools: the
+  physics behind the river brush's armour band.
+- **Where the boulders come from**: the substrate boulder fraction grows with KTT's rock
+  hardness (1 − softness), and steep slopes above the talus angle shed boulders.
+- **Unchanged without boulders**: with a boulder fraction of 0 everywhere the model is the
+  single-grain bed load, so the GPU tests still hold.
+- **Shown**: a Grain Size view, and later the terrain colour (rock on boulder beds).
+- Later: abrasion downstream (Sternberg: D shrinks by e^(−α·distance)), and more fractions.
+
+Status (Phase 7, first part): built. The fraction lives in the morpho state (8 floats per cell,
+since the bed load kernels are at eight storage buffers), the face bed load carries both
+fractions, and the Boulders view shows the surface fraction. `boulders_armour_the_bed`: in a
+gentle valley the eroding head coarsens from 0.30 to 0.34, a coarse lag sits just downstream of
+it and the deposits beyond are finer (0.28), and the bed moves 17 % less than with fines alone.
+Far above the threshold (the steep flume, Shields 0.7) transport barely depends on grain size and
+there is no armour, as Wong & Parker predicts. Defaults: 1.5 m fines (the old look) and 4 m
+boulders, +0.3 on hard rock (with the softness mask on) and +0.3 on scree. Not yet: terrain
+colour by grain size, abrasion, and checking that boulder lines hold step-pools without the
+river brush's armour band.
+
+### Phase 8: boulders as bodies
+
+- GPU particles with position, radius and mass, sitting on the heightfield.
+- They move when the flow's drag and lift (from the water's depth and velocity) beat their
+  friction, and roll or slide where the slope exceeds their angle of repose.
+- Each adds its shape to the bed, so the water flows around it and scours beside it.
+- Drawn as instanced rock meshes. Rigid-body contacts between boulders (Rapier, or Dimforge's
+  GPU nexus) only if they must stack.
+
+### Phase 9: mass movement with MPM
+
+- MPM with a Drucker–Prager granular model handles collapse and runout. A 3D domain over the
+  whole map (5 km × 5 km × 1 km) is far too costly, so it runs as a local event: where a slope
+  fails, the patch turns into particles, the slide runs, and the deposit goes back into the
+  heights.
+- Candidate: Dimforge's nexus (Rust and Slang, "rapier on the GPU", early), whose
+  `nexus_mpm3d` crate comes from their earlier MPM work (wgsparkl, slosh). Check first that its
+  wgpu matches Bevy's and that it can share the device with the erosion passes; otherwise
+  prototype it standalone.
+
 ## How it was built
 
 Decisions taken while implementing, where they differ from or sharpen the plan above.

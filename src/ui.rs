@@ -192,6 +192,11 @@ enum ErosionSliderFieldKind {
     BedLoadHelical,
     BedLoadMorphFactor,
     BedLoadRefineHours,
+    BedLoadBoulderDiameter,
+    BedLoadBoulderBase,
+    BedLoadBoulderRock,
+    BedLoadBoulderScree,
+    BedLoadHiding,
     BedLoadRockHardness,
     RiverBrushCatchment,
     RiverBrushArmour,
@@ -358,6 +363,12 @@ impl ErosionSliderFieldKind {
             Self::BedLoadHelical => water.bed_load.helical_strength = value,
             Self::BedLoadMorphFactor => water.bed_load.morph_factor = value,
             Self::BedLoadRefineHours => water.bed_load.refine_hours = value,
+            // Shown in mm.
+            Self::BedLoadBoulderDiameter => water.bed_load.boulder_diameter = value / 1000.0,
+            Self::BedLoadBoulderBase => water.bed_load.boulder_base = value,
+            Self::BedLoadBoulderRock => water.bed_load.boulder_rock = value,
+            Self::BedLoadBoulderScree => water.bed_load.boulder_scree = value,
+            Self::BedLoadHiding => water.bed_load.hiding = value,
             Self::BedLoadRockHardness => water.bed_load.rock_hardness = value,
         }
     }
@@ -395,6 +406,11 @@ impl ErosionSliderFieldKind {
                 | Self::BedLoadHelical
                 | Self::BedLoadMorphFactor
                 | Self::BedLoadRefineHours
+                | Self::BedLoadBoulderDiameter
+                | Self::BedLoadBoulderBase
+                | Self::BedLoadBoulderRock
+                | Self::BedLoadBoulderScree
+                | Self::BedLoadHiding
                 | Self::BedLoadRockHardness
                 // New rivers take the discharge; armour re-sends the existing beds.
                 | Self::RiverBrushCatchment
@@ -961,7 +977,17 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl, world: WorldScale)
                             water.refine_generation = water.refine_generation.wrapping_add(1);
                         })
                         --
-                        @slider_row(world, "Grain Size (mm)", 0.5, 2000.0, water.bed_load.diameter * 1000.0, ErosionSliderFieldKind::BedLoadDiameter)
+                        @slider_row(world, "Fine Grain (mm)", 0.5, 2000.0, water.bed_load.diameter * 1000.0, ErosionSliderFieldKind::BedLoadDiameter)
+                        --
+                        @slider_row(world, "Boulder Size (mm)", 100.0, 5000.0, water.bed_load.boulder_diameter * 1000.0, ErosionSliderFieldKind::BedLoadBoulderDiameter)
+                        --
+                        @slider_row(world, "Boulders", 0.0, 1.0, water.bed_load.boulder_base, ErosionSliderFieldKind::BedLoadBoulderBase)
+                        --
+                        @slider_row(world, "Boulders on Hard Rock", 0.0, 1.0, water.bed_load.boulder_rock, ErosionSliderFieldKind::BedLoadBoulderRock)
+                        --
+                        @slider_row(world, "Scree Boulders", 0.0, 1.0, water.bed_load.boulder_scree, ErosionSliderFieldKind::BedLoadBoulderScree)
+                        --
+                        @slider_row(world, "Hiding γ", 0.0, 1.0, water.bed_load.hiding, ErosionSliderFieldKind::BedLoadHiding)
                         --
                         @slider_row(world, "Bed Load K (Wong-Parker 3.97)", 0.0, 20.0, water.bed_load.k, ErosionSliderFieldKind::BedLoadK)
                         --
@@ -1228,6 +1254,8 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl, world: WorldScale)
                             @view_button(PreviewMode::Helical)
                             --
                             @view_button(PreviewMode::BedChange)
+                            --
+                            @view_button(PreviewMode::Boulders)
                         })
                     })
                     --

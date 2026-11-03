@@ -18,6 +18,8 @@
 
 const HEIGHT_SCALE: f32 = 1000000.0;
 const CELLS_PER_HEIGHT: f32 = 100.0;
+// (ρ_s − ρ) / ρ: `grain` is R·D in cells.
+const SUBMERGED_DENSITY: f32 = 1.65;
 // Most of the shallower side's depth one face may move per step (keeps a large morphological
 // factor from emptying a cell in one step; four faces can take at most 40%).
 const MAX_FACE_CUT: f32 = 0.1;
@@ -64,6 +66,18 @@ struct MorphoParams {
     use_bedrock: u32,
     // Critical Shields multiplier on the hardest rock (softness mask 0) is 1 + rock_hardness.
     rock_hardness: f32,
+    // Boulders: R·D (cells) and bed load coefficient (cells² per second) as for the fines.
+    boulder_grain: f32,
+    boulder_k: f32,
+    // Substrate boulder fraction: `boulder_base`, plus `boulder_rock` on the hardest rock, plus
+    // `boulder_scree` on slopes past the talus (tangent 0.6 to 1).
+    boulder_base: f32,
+    boulder_rock: f32,
+    boulder_scree: f32,
+    // γ in θ_c,i = θ_c (D_i / D_m)^(−γ).
+    hiding: f32,
+    // Active layer thickness in mean grain diameters.
+    active_layer: f32,
 }
 
 @group(0) @binding(0) var<storage, read_write> height: array<atomic<u32>>;
@@ -75,21 +89,27 @@ struct MorphoParams {
 @group(0) @binding(3) var<storage, read_write> discharge: array<vec4<f32>>;
 // KTT river momentum of the finest work set, x and y per cell (f32 bits; see `erosion.wgsl`).
 @group(0) @binding(4) var<storage, read_write> m: array<u32>;
-// Bed load through the +x (x) and +y (y) faces of each cell (cells² per second).
-@group(0) @binding(5) var<storage, read_write> bed_load: array<vec2<f32>>;
-// Four floats per cell: helical intensity in two slots (ping-pong), the bed change not yet
-// written to the heights (height units), and the height when the water frame began
-// (`water_splat.wgsl`).
+// Bed load through the +x and +y faces of each cell (cells² per second): x, y fines, z, w
+// boulders.
+@group(0) @binding(5) var<storage, read_write> bed_load: array<vec4<f32>>;
+// `STATE_STRIDE` floats per cell: helical intensity in two slots (ping-pong), the bed change not
+// yet written to the heights (height units), the height when the water frame began
+// (`water_splat.wgsl`), and the surface boulder fraction less the substrate's.
 @group(0) @binding(6) var<storage, read_write> state: array<f32>;
 @group(0) @binding(7) var<uniform> params: MorphoParams;
 // KTT's per-cell masks (x = softness, 1 where unused) and layers (x = bedrock) of the finest work
-// set. Only the bed load kernels bind these, and they leave out `discharge` and `m`, so each
-// pipeline stays within eight storage buffers.
+// set. Only the bed load kernels bind the layers and the river band, and they leave out
+// `discharge` and `m`, so each pipeline stays within eight storage buffers.
 @group(0) @binding(8) var<storage, read> masks: array<vec4<f32>>;
 @group(0) @binding(9) var<storage, read> layers: array<vec2<f32>>;
 // Armour band around the river brush's beds (`river.wgsl`), per texel: x = floor, y = ceiling;
 // (0, 0) holds nothing.
 @group(0) @binding(10) var<storage, read> river_band: array<vec2<f32>>;
+
+// Floats per cell in `state` (must match `MORPHO_STATE_STRIDE` in `lib.rs`).
+const STATE_STRIDE: u32 = 8u;
+// Slot of the boulder fraction's departure from the substrate's.
+const BOULDER_SLOT: u32 = 4u;
 
 const DIRS = array<vec2<i32>, 4>(vec2<i32>(-1, 0), vec2<i32>(1, 0), vec2<i32>(0, -1), vec2<i32>(0, 1));
 
@@ -119,8 +139,27 @@ fn flow(p: vec2<i32>) -> vec2<f32> {
     return velocity[widx(p)] / params.step_seconds;
 }
 
+// Boulder fraction of the substrate under `p`: more on hard rock and on steep slopes.
+fn substrate_boulders(p: vec2<i32>) -> f32 {
+    let soft = clamp(masks[gidx(p)].x, 0.0, 1.0);
+    let gx = terrain(clamp_map(p + DIRS[1])) - terrain(clamp_map(p + DIRS[0]));
+    let gy = terrain(clamp_map(p + DIRS[3])) - terrain(clamp_map(p + DIRS[2]));
+    let slope = 0.5 * length(vec2<f32>(gx, gy)) * CELLS_PER_HEIGHT;
+    let scree = smoothstep(0.6, 1.0, slope);
+    return clamp(
+        params.boulder_base + params.boulder_rock * (1.0 - soft) + params.boulder_scree * scree,
+        0.0,
+        1.0,
+    );
+}
+
+// Boulder fraction of the active layer at `p`.
+fn surface_boulders(p: vec2<i32>) -> f32 {
+    return clamp(substrate_boulders(p) + state[STATE_STRIDE * widx(p) + BOULDER_SLOT], 0.0, 1.0);
+}
+
 fn helical(p: vec2<i32>, slot: u32) -> f32 {
-    return state[4u * widx(p) + slot];
+    return state[STATE_STRIDE * widx(p) + slot];
 }
 
 // The map border ring and the ocean drain water; bed load that reaches them leaves the map.
@@ -200,7 +239,7 @@ fn morpho_helical(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = widx(p);
     let h = depth[i];
     if (h < params.wet_depth) {
-        state[4u * i + dst] = 0.0;
+        state[STATE_STRIDE * i + dst] = 0.0;
         return;
     }
     let u = flow(p);
@@ -214,18 +253,19 @@ fn morpho_helical(@builtin(global_invocation_id) gid: vec3<u32>) {
         mean += helical(clamp_map(p + DIRS[k]), src);
     }
     s = mix(s, 0.25 * mean, 0.05);
-    state[4u * i + dst] = clamp(s, -1.0, 1.0);
+    state[STATE_STRIDE * i + dst] = clamp(s, -1.0, 1.0);
 }
 
-// Bed load (cells² per second) through the face from `a` to its neighbour `a + e`, along `e`.
-// Its size and direction come from the upwind cell (first-order upwind Exner): averaging the two
-// cells instead is a central scheme, which grows two-texel oscillations in the bed.
-fn face_load(a: vec2<i32>, e: vec2<i32>) -> f32 {
+// Bed load (cells² per second) through the face from `a` to its neighbour `a + e`, along `e`:
+// x fines, y boulders. Its size and direction come from the upwind cell (first-order upwind
+// Exner): averaging the two cells instead is a central scheme, which grows two-texel
+// oscillations in the bed.
+fn face_load(a: vec2<i32>, e: vec2<i32>) -> vec2<f32> {
     let b = a + e;
-    if (!inside(b)) { return 0.0; }
+    if (!inside(b)) { return vec2<f32>(0.0); }
     let ha = depth[widx(a)];
     let hb = depth[widx(b)];
-    if (min(ha, hb) < params.wet_depth) { return 0.0; }
+    if (min(ha, hb) < params.wet_depth) { return vec2<f32>(0.0); }
     let ua = flow(a);
     let ub = flow(b);
     let downwind = dot(ua + ub, vec2<f32>(e)) >= 0.0;
@@ -234,18 +274,27 @@ fn face_load(a: vec2<i32>, e: vec2<i32>) -> f32 {
     let u = select(ub, ua, downwind);
     // Thin sheet flow keeps the capacity model of `water_erode`.
     let w = smoothstep(0.5 * params.full_depth, params.full_depth, h);
-    if (w <= 0.0) { return 0.0; }
+    if (w <= 0.0) { return vec2<f32>(0.0); }
     let speed = length(u);
-    if (speed < params.min_speed) { return 0.0; }
+    if (speed < params.min_speed) { return vec2<f32>(0.0); }
     let h_cells = h * CELLS_PER_HEIGHT;
     let n = params.manning_n;
-    let theta = n * n * speed * speed / (max(params.grain, 1e-6) * pow(h_cells, 1.0 / 3.0));
+    // Bed shear over the submerged weight, per grain size: θ_i = τ* / (R D_i).
+    let tau = n * n * speed * speed / pow(h_cells, 1.0 / 3.0);
+    let theta = tau / vec2<f32>(max(params.grain, 1e-6), max(params.boulder_grain, 1e-6));
     // Hard rock (KTT's softness mask) takes a stronger flow to move, so steps and pools lock
-    // onto it instead of cutting evenly everywhere.
+    // onto it instead of cutting evenly everywhere. Hiding: grains finer than the mean are
+    // sheltered by the coarser, and coarser ones stick out into the flow.
     let soft = clamp(masks[gidx(up)].x, 0.0, 1.0);
-    let excess = theta - params.critical_shields * (1.0 + params.rock_hardness * (1.0 - soft));
-    if (excess <= 0.0) { return 0.0; }
-    let q = params.bed_load_k * pow(excess, 1.5) * w;
+    let fb = surface_boulders(up);
+    let fractions = vec2<f32>(1.0 - fb, fb);
+    let d = vec2<f32>(params.grain, params.boulder_grain);
+    let d_mean = dot(fractions, d);
+    let critical = params.critical_shields * (1.0 + params.rock_hardness * (1.0 - soft))
+        * pow(max(d, vec2<f32>(1e-6)) / max(d_mean, 1e-6), vec2<f32>(-params.hiding));
+    let excess = max(theta - critical, vec2<f32>(0.0));
+    if (all(excess <= vec2<f32>(0.0))) { return vec2<f32>(0.0); }
+    let q = fractions * vec2<f32>(params.bed_load_k, params.boulder_k) * pow(excess, vec2<f32>(1.5)) * w;
 
     // Direction: along the flow, turned toward the inner bank by the helical flow.
     let delta = clamp(
@@ -266,24 +315,25 @@ fn face_load(a: vec2<i32>, e: vec2<i32>) -> f32 {
     let tangent_grad = 0.25 * (ga + gb);
     let grad = (vec2<f32>(e) * normal_grad + vec2<f32>(perp) * tangent_grad) * CELLS_PER_HEIGHT;
     let across = vec2<f32>(-dir.y, dir.x);
-    let pull = q / (max(params.slope_effect, 1e-3) * sqrt(theta)) * dot(grad, across);
-    let load = q * dir - pull * across;
+    let pull = q / (max(params.slope_effect, 1e-3) * sqrt(max(theta, vec2<f32>(1e-6))))
+        * dot(grad, across);
+    let qn = q * dot(dir, vec2<f32>(e)) - pull * dot(across, vec2<f32>(e));
 
-    let qn = dot(load, vec2<f32>(e));
     let per_step = max(params.mor_fac * params.step_seconds, 1e-9);
     var most = MAX_FACE_CUT * min(ha, hb) * CELLS_PER_HEIGHT / per_step;
+    let total = qn.x + qn.y;
     if (params.use_bedrock != 0u) {
         // The cell the load leaves keeps a quarter of its loose layer above the bedrock per
         // face, so no step cuts below it (and the load is still conserved).
-        let source = select(b, a, qn > 0.0);
+        let source = select(b, a, total > 0.0);
         let g = gidx(source);
         let loose = max(terrain(source) - layers[g].x, 0.0);
         most = min(most, 0.25 * loose * CELLS_PER_HEIGHT / per_step);
     }
     // The same for the armour band of a brushed river bed: the cell the load leaves keeps above
     // its floor, and the cell it enters stays below its ceiling.
-    let source = select(b, a, qn > 0.0);
-    let target_cell = select(a, b, qn > 0.0);
+    let source = select(b, a, total > 0.0);
+    let target_cell = select(a, b, total > 0.0);
     let leaving = river_band[widx(source)];
     if (leaving.y > 0.0) {
         let loose = max(terrain(source) - leaving.x, 0.0);
@@ -294,14 +344,18 @@ fn face_load(a: vec2<i32>, e: vec2<i32>) -> f32 {
         let room = max(entering.y - terrain(target_cell), 0.0);
         most = min(most, 0.25 * room * CELLS_PER_HEIGHT / per_step);
     }
-    return clamp(qn, -most, most);
+    // Both fractions scale down together, so the limit keeps their mix.
+    let size = abs(qn.x) + abs(qn.y);
+    return qn * min(1.0, most / max(size, 1e-12));
 }
 
 @compute @workgroup_size(8, 8, 1)
 fn morpho_flux(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec2<i32>(gid.xy);
     if (!inside(p)) { return; }
-    bed_load[widx(p)] = vec2<f32>(face_load(p, DIRS[1]), face_load(p, DIRS[3]));
+    let x = face_load(p, DIRS[1]);
+    let y = face_load(p, DIRS[3]);
+    bed_load[widx(p)] = vec4<f32>(x.x, y.x, x.y, y.y);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -310,12 +364,24 @@ fn morpho_exner(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (!inside(p)) { return; }
     let i = widx(p);
     let out = bed_load[i];
-    var div = out.x + out.y;
-    if (p.x > 0) { div -= bed_load[widx(p + DIRS[0])].x; }
-    if (p.y > 0) { div -= bed_load[widx(p + DIRS[2])].y; }
+    // Divergence per fraction: x fines, y boulders.
+    var div = out.xz + out.yw;
+    if (p.x > 0) { div -= bed_load[widx(p + DIRS[0])].xz; }
+    if (p.y > 0) { div -= bed_load[widx(p + DIRS[2])].yw; }
     if (is_sink(p)) { return; }
-    let dz = -params.mor_fac * params.step_seconds * div / CELLS_PER_HEIGHT;
-    var pending = state[4u * i + 2u] + dz;
+    let change = -params.mor_fac * params.step_seconds * div;
+    let dz = (change.x + change.y) / CELLS_PER_HEIGHT;
+    // Active layer (Hirano): its boulder fraction gains the boulders that arrive less those
+    // leaving, and trades with what lies below as the bed moves through it: its own mix when
+    // the bed rises, the substrate's when it cuts.
+    let substrate = substrate_boulders(p);
+    let fb = clamp(substrate + state[STATE_STRIDE * i + BOULDER_SLOT], 0.0, 1.0);
+    let d_mean = mix(params.grain, params.boulder_grain, fb) / SUBMERGED_DENSITY;
+    let layer = max(params.active_layer * d_mean, 1e-4);
+    let traded = select(substrate, fb, change.x + change.y > 0.0);
+    let fb_new = clamp(fb + (change.y - traded * (change.x + change.y)) / layer, 0.0, 1.0);
+    state[STATE_STRIDE * i + BOULDER_SLOT] = fb_new - substrate;
+    var pending = state[STATE_STRIDE * i + 2u] + dz;
     let quanta = i32(round(pending * HEIGHT_SCALE));
     let g = gidx(p);
     var h = i32(atomicLoad(&height[g]));
@@ -338,7 +404,7 @@ fn morpho_exner(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (h != old) {
         atomicStore(&height[g], u32(h));
     }
-    state[4u * i + 2u] = pending;
+    state[STATE_STRIDE * i + 2u] = pending;
 }
 
 // Debug views (`TerrainView`), on the water grid.
@@ -355,11 +421,15 @@ fn morpho_debug(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = widx(p);
     textureStore(discharge_out, p, discharge[i]);
     // Face fluxes averaged onto the cell centre.
-    let qb = 0.5 * (bed_load[i] + vec2<f32>(
-        bed_load[widx(clamp_map(p + DIRS[0]))].x,
-        bed_load[widx(clamp_map(p + DIRS[2]))].y,
-    ));
+    let out = bed_load[i].xy + bed_load[i].zw;
+    let left = bed_load[widx(clamp_map(p + DIRS[0]))];
+    let below = bed_load[widx(clamp_map(p + DIRS[2]))];
+    let qb = 0.5 * (out + vec2<f32>(left.x + left.z, below.y + below.w));
     // The helical pass this frame wrote the slot the parity does not name.
-    let helical_now = state[4u * i + 1u - params.parity];
-    textureStore(bed_out, p, vec4<f32>(length(qb), helical_now, state[4u * i + 2u], 1.0));
+    let helical_now = state[STATE_STRIDE * i + 1u - params.parity];
+    textureStore(
+        bed_out,
+        p,
+        vec4<f32>(length(qb), helical_now, state[STATE_STRIDE * i + 2u], surface_boulders(p)),
+    );
 }

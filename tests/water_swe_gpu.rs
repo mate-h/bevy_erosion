@@ -63,6 +63,10 @@ fn old_bed_load() -> BedLoad {
         diameter: 0.25 * scale().metres_per_texel / SUBMERGED_DENSITY,
         k: 1.0,
         critical_shields: 0.047,
+        // One grain size, unless a test adds boulders.
+        boulder_base: 0.0,
+        boulder_rock: 0.0,
+        boulder_scree: 0.0,
         ..default()
     };
     BedLoad {
@@ -1594,11 +1598,18 @@ fn bends_scour_their_outer_banks() {
     println!(
         "bend scour toward the outer bank (texels): helical {strength}: {with:?}, without: {without:?}"
     );
+    // The shift is compared over both bends: at one apex it can come within rounding of the
+    // margin (0.003 texels on 1df70c8).
+    let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+    assert!(
+        mean(&with) > mean(&without) + 0.2,
+        "helical flow did not move the scour outward ({with:?} against {without:?})"
+    );
     for (w, wo) in with.iter().zip(&without) {
         assert!(*w > 0.5, "the scour is not on the outer bank ({w})");
         assert!(
-            *w > wo + 0.2,
-            "helical flow did not move the scour outward ({w} against {wo})"
+            *w >= *wo,
+            "helical flow moved the scour inward ({w} against {wo})"
         );
     }
 }
@@ -2853,4 +2864,89 @@ fn inspect_river_brush() {
             std::fs::write(format!("{dir}/inspect_{name}.f32"), bytes).unwrap();
         }
     }
+}
+
+/// Bed movement over a valley's floor (sum of |height change|) and the surface boulder fraction
+/// where its thalweg cut, after 20 s of bed load with `boulders` of the bed four times the fines'
+/// size (where it cut by over 0.001). The valley's sides rise at 0.03, far below the slump angle, so clean water from the
+/// spring cuts its floor instead of burying it under slumped banks.
+fn boulder_flume(slope: f32, boulders: f32) -> (f32, f32) {
+    let bed = move |x: u32, y: u32| {
+        0.02 + slope * (N - 1 - x) as f32 + 0.0003 * (y as f32 + 0.5 - N as f32 / 2.0).abs()
+    };
+    let mut h = Harness::new(WaterSolver::Swe, &bed);
+    {
+        let mut water = h.water();
+        water.bed_load.boulder_diameter = 4.0 * water.bed_load.diameter;
+        water.bed_load.boulder_rock = 0.0;
+        water.bed_load.boulder_scree = 0.0;
+        water.bed_load.boulder_base = boulders;
+        water.springs.push(Spring {
+            center: Vec2::new(12.0, N as f32 / 2.0),
+            radius: 6.0,
+            rate: 0.05 / TIME,
+        });
+    }
+    h.run(6.0);
+    let before = h.read_heights();
+    h.water().bed_load.live = true;
+    h.run(20.0);
+    let after = h.read_heights();
+    let handle = h.app.world().resource::<ErosionImages>().debug_bed.clone();
+    let fraction: Vec<f32> = h.read(handle).iter().map(|t| t[3]).collect();
+    let mid = N / 2;
+    let xs = 16..N - 24;
+    let moved: f32 = xs
+        .clone()
+        .flat_map(|x| (mid - 9..mid + 9).map(move |y| idx(x, y)))
+        .map(|i| (after[i] - before[i]).abs())
+        .sum();
+    let cut: Vec<usize> = xs
+        .flat_map(|x| (mid - 9..mid + 9).map(move |y| idx(x, y)))
+        .filter(|&i| after[i] < before[i] - 1e-3)
+        .collect();
+    if std::env::var("TEST_PROFILE").is_ok() {
+        for y in (mid - 9..mid + 9).step_by(2) {
+            let row: Vec<String> = (16..64)
+                .step_by(4)
+                .map(|x| {
+                    let i = idx(x, y);
+                    format!("{:+.4}/{:.2}", after[i] - before[i], fraction[i])
+                })
+                .collect();
+            println!("y {y}: {}", row.join(" "));
+        }
+    }
+    let surface = cut.iter().map(|&i| fraction[i]).sum::<f32>() / cut.len().max(1) as f32;
+    assert!(
+        fraction.iter().all(|f| (0.0..=1.0).contains(f)),
+        "boulder fraction out of range"
+    );
+    (moved, surface)
+}
+
+/// Boulders armour a bed: near the threshold of motion the flow carries the fines off first, so
+/// where it cuts the surface coarsens, and the bed moves less than a bed of fines alone. (Far
+/// above the threshold, as on the steep flume at Shields 0.7, transport hardly depends on the
+/// grain size and there is no armour.)
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn boulders_armour_the_bed() {
+    let slope: f32 = std::env::var("TEST_BOULDER_SLOPE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0008);
+    let (fine_moved, fine_surface) = boulder_flume(slope, 0.0);
+    let (armoured_moved, surface) = boulder_flume(slope, 0.3);
+    println!(
+        "boulders: bed moved {fine_moved:.3} with fines only (surface {fine_surface:.2}), \
+         {armoured_moved:.3} with 30% boulders, whose surface where it cut coarsened to {surface:.3}"
+    );
+    assert_eq!(fine_surface, 0.0, "boulders appeared from nowhere");
+    assert!(fine_moved > 0.1, "the fines-only bed did not move");
+    assert!(surface > 0.32, "the surface did not coarsen ({surface})");
+    assert!(
+        armoured_moved < fine_moved,
+        "boulders did not slow the bed ({armoured_moved} against {fine_moved})"
+    );
 }

@@ -13,6 +13,8 @@ const SPLAT_SCALE: f32 = 100000000.0;
 const DEPOSITION_SCALE: f32 = 100000.0;
 const EROSION_SCALE: f32 = 100000.0;
 const CELLS_PER_HEIGHT: f32 = 100.0;
+// Floats per cell in the morpho state (`water_morpho.wgsl`).
+const STATE_STRIDE: u32 = 8u;
 
 // Must match `MAX_WATER_SOURCES` in `lib.rs`.
 const MAX_SOURCES: u32 = 17u;
@@ -87,7 +89,7 @@ fn water_splat(@builtin(global_invocation_id) gid: vec3<u32>) {
         sediment[i] += load;
     }
     // Baseline for `water_record`, less what is still unrecorded.
-    state[4u * i + 3u] = ground - state[4u * i + 3u];
+    state[STATE_STRIDE * i + 3u] = ground - state[STATE_STRIDE * i + 3u];
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -96,7 +98,7 @@ fn water_record(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (!inside(p)) { return; }
     let i = widx(p);
     let g = gidx(p);
-    let dh = terrain(g) - state[4u * i + 3u];
+    let dh = terrain(g) - state[STATE_STRIDE * i + 3u];
     // Whole deposition quanta only; the rest waits for the next frame.
     let quanta = i32(round(dh * DEPOSITION_SCALE));
     if (quanta > 0) {
@@ -107,5 +109,5 @@ fn water_record(@builtin(global_invocation_id) gid: vec3<u32>) {
         atomicSub(&deposition[g], min(-quanta, loose));
         atomicAdd(&erosion_buffer[g], u32(-quanta) * u32(EROSION_SCALE / DEPOSITION_SCALE));
     }
-    state[4u * i + 3u] = dh - f32(quanta) / DEPOSITION_SCALE;
+    state[STATE_STRIDE * i + 3u] = dh - f32(quanta) / DEPOSITION_SCALE;
 }

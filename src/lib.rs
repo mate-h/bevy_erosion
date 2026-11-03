@@ -521,10 +521,12 @@ pub enum PreviewMode {
     BedChange = 27,
     /// Drainage area, log scale.
     Drainage = 28,
+    /// Boulder fraction of the bed surface.
+    Boulders = 29,
 }
 
 impl PreviewMode {
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::Pbr,
         Self::Simple,
         Self::Albedo,
@@ -554,6 +556,7 @@ impl PreviewMode {
         Self::Helical,
         Self::BedChange,
         Self::Drainage,
+        Self::Boulders,
     ];
 
     /// Shaded views draw the atmosphere and water; the rest show the bare field.
@@ -603,6 +606,7 @@ impl PreviewMode {
             Self::Helical => "Helical",
             Self::BedChange => "Bed Change",
             Self::Drainage => "Drainage",
+            Self::Boulders => "Boulders",
         }
     }
 
@@ -645,6 +649,10 @@ impl PreviewMode {
             Self::BedLoad => "Bed load through each cell (heat).",
             Self::Helical => "Helical (secondary) flow intensity: blue one way, red the other.",
             Self::BedChange => "Bed change not yet written: blue scour, red deposit.",
+            Self::Boulders => {
+                "Boulder fraction of the bed surface: black none, white all. Flow carries the fines \
+                 off first and armours the bed."
+            }
             Self::Drainage => {
                 "Drainage area (heat, log scale: 100 m² to 100 km²), after the cascade finishes."
             }
@@ -1237,6 +1245,17 @@ pub struct BedLoad {
     /// number is (1 + this) times Critical Shields. Bed load also never cuts below KTT's
     /// bedrock layer (with Use Bedrock on).
     pub rock_hardness: f32,
+    /// Boulders: a second grain size in the bed (m). [`Self::diameter`] is the fines.
+    pub boulder_diameter: f32,
+    /// Boulder fraction of the bed everywhere (0 to 1).
+    pub boulder_base: f32,
+    /// Boulder fraction added on the hardest rock of KTT's softness mask.
+    pub boulder_rock: f32,
+    /// Boulder fraction added on slopes past the talus (scree), from tan 0.6 to 1.
+    pub boulder_scree: f32,
+    /// γ in θ_c,i = θ_c (D_i / D_m)^(−γ): 0 lets each size move on its own; toward 1 all sizes
+    /// start moving at the same flow (Parker 1990: about 0.9).
+    pub hiding: f32,
 }
 
 impl Default for BedLoad {
@@ -1251,6 +1270,11 @@ impl Default for BedLoad {
             morph_factor: 20.0,
             refine_hours: 0.2,
             rock_hardness: 4.0,
+            boulder_diameter: 4.0,
+            boulder_base: 0.0,
+            boulder_rock: 0.3,
+            boulder_scree: 0.3,
+            hiding: 0.85,
         }
     }
 }
@@ -1261,6 +1285,8 @@ pub const WONG_PARKER_K: f32 = 3.97;
 pub const SUBMERGED_DENSITY: f32 = 1.65;
 /// Pore space of the bed: deposited load builds 1 / (1 − this) times its volume of bed.
 const POROSITY: f32 = 0.4;
+/// Active surface layer of the bed (Hirano 1971), in mean grain diameters.
+const ACTIVE_LAYER: f32 = 2.0;
 
 impl BedLoad {
     /// Submerged grain weight R·D in cells, for θ = n²|u|² / (R D h^(1/3)) in cells.
@@ -1274,6 +1300,14 @@ impl BedLoad {
         self.k * (SUBMERGED_DENSITY * gravity * d * d * d).sqrt()
             / (1.0 - POROSITY)
             / (scale.metres_per_texel * scale.metres_per_texel)
+    }
+
+    /// The boulders, as a bed load of their own size.
+    pub fn boulders(&self) -> Self {
+        Self {
+            diameter: self.boulder_diameter,
+            ..*self
+        }
     }
 
     /// Water steps one refine runs, at `step` seconds a step.
@@ -1530,7 +1564,17 @@ struct MorphoParams {
     parity: u32,
     use_bedrock: u32,
     rock_hardness: f32,
+    boulder_grain: f32,
+    boulder_k: f32,
+    boulder_base: f32,
+    boulder_rock: f32,
+    boulder_scree: f32,
+    hiding: f32,
+    active_layer: f32,
 }
+
+/// Floats per cell in the morpho state (`STATE_STRIDE` in `water_morpho.wgsl`).
+const MORPHO_STATE_STRIDE: usize = 8;
 
 /// Seconds the shared discharge field averages over, so roll waves do not make it flicker.
 const DISCHARGE_TIME: f32 = 3.0 * LEGACY_SECONDS;
@@ -1973,9 +2017,10 @@ fn init_erosion_pipeline(
                 storage_buffer_read_only::<Vec2>(false), // velocity
                 storage_buffer::<Vec4>(false), // discharge
                 storage_buffer::<f32>(false), // work set river momentum
-                storage_buffer::<Vec2>(false), // face bed load
-                storage_buffer::<f32>(false), // helical intensity and pending bed change
+                storage_buffer::<Vec4>(false), // face bed load, fines and boulders
+                storage_buffer::<f32>(false), // helical, pending bed change, boulder fraction
                 uniform_buffer::<MorphoParams>(false),
+                storage_buffer_read_only::<Vec4>(false), // work set masks (softness)
             ),
         ),
     );
@@ -2007,8 +2052,8 @@ fn init_erosion_pipeline(
                 (0, storage_buffer::<u32>(false)), // work set height (atomic, fixed-point)
                 (1, storage_buffer_read_only::<f32>(false)), // water depth
                 (2, storage_buffer_read_only::<Vec2>(false)), // velocity
-                (5, storage_buffer::<Vec2>(false)), // face bed load
-                (6, storage_buffer::<f32>(false)), // helical intensity and pending bed change
+                (5, storage_buffer::<Vec4>(false)), // face bed load, fines and boulders
+                (6, storage_buffer::<f32>(false)), // helical, pending bed change, boulder fraction
                 (7, uniform_buffer::<MorphoParams>(false)),
                 (8, storage_buffer_read_only::<Vec4>(false)), // work set masks (softness)
                 (9, storage_buffer_read_only::<Vec2>(false)), // work set layers (bedrock)
@@ -2292,7 +2337,7 @@ struct WaterBuffers {
     bed_params: DynamicUniformBuffer<BedParams>,
     swe: SweGrid,
     /// Bed load through each cell's +x and +y faces.
-    bed_load: StorageBuffer<Vec<Vec2>>,
+    bed_load: StorageBuffer<Vec<Vec4>>,
     /// Per cell: helical intensity (two slots) and the bed change not yet written.
     morpho_state: StorageBuffer<Vec<f32>>,
     morpho_params: UniformBuffer<MorphoParams>,
@@ -2374,8 +2419,8 @@ impl WaterBuffers {
             shore: [0, 1].map(|_| StorageBuffer::from(vec![Vec2::ZERO; n])),
             bed_params: DynamicUniformBuffer::default(),
             swe: SweGrid::new(size, device),
-            bed_load: StorageBuffer::from(vec![Vec2::ZERO; n]),
-            morpho_state: StorageBuffer::from(vec![0f32; 4 * n]),
+            bed_load: StorageBuffer::from(vec![Vec4::ZERO; n]),
+            morpho_state: StorageBuffer::from(vec![0f32; MORPHO_STATE_STRIDE * n]),
             morpho_params: UniformBuffer::from(MorphoParams {
                 size,
                 pad_offset: UVec2::ZERO,
@@ -2400,6 +2445,13 @@ impl WaterBuffers {
                 parity: 0,
                 use_bedrock: 0,
                 rock_hardness: 0.0,
+                boulder_grain: 1.0,
+                boulder_k: 0.0,
+                boulder_base: 0.0,
+                boulder_rock: 0.0,
+                boulder_scree: 0.0,
+                hiding: 0.0,
+                active_layer: 2.0,
             }),
             river: StorageBuffer::from(vec![Vec4::new(river::NO_RIVER, 1.0, 0.0, 0.0); n]),
             river_band: StorageBuffer::from(vec![Vec2::ZERO; n]),
@@ -2675,6 +2727,7 @@ fn prepare_erosion_bind_groups(
                     w.bed_load.binding().unwrap(),
                     w.morpho_state.binding().unwrap(),
                     w.morpho_params.binding().unwrap(),
+                    set.masks.binding().unwrap(),
                 )),
             )
         }),
@@ -2914,6 +2967,16 @@ fn plan_erosion_frame(
     if reset.generation != state.last_reset_gen {
         state.last_reset_gen = reset.generation;
         state.cascade.restart(params.pyramid_levels());
+        // A new terrain: the bed's surface layer starts again from its substrate.
+        let n = (params.map_size.x * params.map_size.y) as usize;
+        buffers
+            .water
+            .morpho_state
+            .set(vec![0.0; MORPHO_STATE_STRIDE * n]);
+        buffers
+            .water
+            .morpho_state
+            .write_buffer(&render_device, &queue);
         state.displays_since_ao = None;
         state.was_finished = false;
     }
@@ -3180,6 +3243,13 @@ fn plan_erosion_frame(
             parity: state.helical_parity,
             use_bedrock: params.use_bedrock,
             rock_hardness: bed_load.rock_hardness,
+            boulder_grain: bed_load.boulders().grain_cells(&scale),
+            boulder_k: bed_load.boulders().k_cells(water.gravity, &scale),
+            boulder_base: bed_load.boulder_base,
+            boulder_rock: bed_load.boulder_rock,
+            boulder_scree: bed_load.boulder_scree,
+            hiding: bed_load.hiding,
+            active_layer: ACTIVE_LAYER,
         });
         buffers
             .water

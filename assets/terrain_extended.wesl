@@ -134,6 +134,7 @@ const MODE_BED_LOAD: u32 = 25u;
 const MODE_HELICAL: u32 = 26u;
 const MODE_BED_CHANGE: u32 = 27u;
 const MODE_DRAINAGE: u32 = 28u;
+const MODE_BOULDERS: u32 = 29u;
 
 // Convert HSV to RGB (hue, saturation, value all in [0, 1])
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
@@ -325,6 +326,9 @@ fn get_preview_color(mode: u32, uv: vec2<f32>, world_normal: vec3<f32>) -> vec4<
         }
         case MODE_BED_CHANGE: {
             return vec4<f32>(diverging(load(debug_bed_tex, uv).z * 100000.0 * g), 1.0);
+        }
+        case MODE_BOULDERS: {
+            return gray(load(debug_bed_tex, uv).w * g);
         }
         case MODE_DRAINAGE: {
             // 100 m² (one 10 m texel) to 100 km².
