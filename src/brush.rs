@@ -218,7 +218,8 @@ const SETTLED_READBACKS: u32 = 3;
 impl HeightCache {
     /// Whether the heights are in and real.
     fn settled(&self) -> bool {
-        self.readbacks >= SETTLED_READBACKS && self.heights.len() == (self.size.x * self.size.y) as usize
+        self.readbacks >= SETTLED_READBACKS
+            && self.heights.len() == (self.size.x * self.size.y) as usize
     }
 }
 

@@ -16,7 +16,9 @@
 //! terrain to it and writes the armour band (a floor and a ceiling around the carved bed) that
 //! water erosion, settling, slumping and bed load keep to.
 
-use crate::{BedShaping, ErosionConfig, ErosionImages, PyramidProgress, WaterControl, brush::WaterBrush};
+use crate::{
+    BedShaping, ErosionConfig, ErosionImages, PyramidProgress, WaterControl, brush::WaterBrush,
+};
 use bevy::{
     prelude::*,
     render::{
@@ -141,7 +143,13 @@ impl Rivers {
 }
 
 /// Rasterize `rivers` for the render world, which carves them on its next finished frame.
-pub fn rebuild(rivers: &Rivers, bed: &BedShaping, settings: &RiverSettings, size: UVec2, out: &mut RiverBed) {
+pub fn rebuild(
+    rivers: &Rivers,
+    bed: &BedShaping,
+    settings: &RiverSettings,
+    size: UVec2,
+    out: &mut RiverBed,
+) {
     out.cells = Arc::new(rasterize(&rivers.list, &bed.into(), settings, size));
     out.generation = out.generation.wrapping_add(1);
 }
@@ -260,7 +268,12 @@ pub fn route(
     let mut open = BinaryHeap::new();
     let mut order = 0u32;
     seen[at(start)] = true;
-    open.push(Reverse((heights[at(start)].to_bits(), order, start.x, start.y)));
+    open.push(Reverse((
+        heights[at(start)].to_bits(),
+        order,
+        start.x,
+        start.y,
+    )));
     let mut end = start;
     let mut lowest = f32::INFINITY;
     while let Some(Reverse((_, _, x, y))) = open.pop() {
@@ -276,7 +289,9 @@ pub fn route(
         for dy in -1i32..=1 {
             for dx in -1i32..=1 {
                 let q = c.as_ivec2() + IVec2::new(dx, dy);
-                if (dx, dy) == (0, 0) || q.cmplt(IVec2::ZERO).any() || q.cmpge(size.as_ivec2()).any()
+                if (dx, dy) == (0, 0)
+                    || q.cmplt(IVec2::ZERO).any()
+                    || q.cmpge(size.as_ivec2()).any()
                 {
                     continue;
                 }
@@ -285,7 +300,12 @@ pub fn route(
                     seen[at(q)] = true;
                     parent[at(q)] = at(c) as u32;
                     order += 1;
-                    open.push(Reverse((heights[at(q)].max(0.0).to_bits(), order, q.x, q.y)));
+                    open.push(Reverse((
+                        heights[at(q)].max(0.0).to_bits(),
+                        order,
+                        q.x,
+                        q.y,
+                    )));
                 }
             }
         }
@@ -328,7 +348,10 @@ pub fn smooth_path(cells: &[UVec2], radius: usize) -> Vec<Vec2> {
         }
         carry = len - (t - 1.0);
     }
-    if out.last().is_some_and(|p| p.distance(*points.last().unwrap()) > 0.25) {
+    if out
+        .last()
+        .is_some_and(|p| p.distance(*points.last().unwrap()) > 0.25)
+    {
         out.push(*points.last().unwrap());
     }
     out
@@ -414,7 +437,8 @@ fn sections(river: &River, shape: &ChannelShape, detail: f32) -> Vec<Section> {
         let m = shape.max_depth.max(1e-6);
         m * (1.0 - (-d / m).exp())
     };
-    let flow = |i: usize| river.discharge * (1.0 + i as f32 / DOUBLING_LENGTH) / REFERENCE_DISCHARGE;
+    let flow =
+        |i: usize| river.discharge * (1.0 + i as f32 / DOUBLING_LENGTH) / REFERENCE_DISCHARGE;
     let width = |i: usize| (shape.river_width * flow(i).max(1e-6).sqrt()).max(1.0);
     let base = |i: usize| soft_cap(shape.river_depth * flow(i).max(1e-6).powf(0.4));
     let tangent = |i: usize| {
@@ -549,7 +573,12 @@ fn sample(values: &[f32], at: f32) -> f32 {
 }
 
 /// The rivers' beds, banks and armour, one [`RiverCell`] per texel of a `size` map.
-pub fn rasterize(rivers: &[River], shape: &ChannelShape, settings: &RiverSettings, size: UVec2) -> Vec<RiverCell> {
+pub fn rasterize(
+    rivers: &[River],
+    shape: &ChannelShape,
+    settings: &RiverSettings,
+    size: UVec2,
+) -> Vec<RiverCell> {
     let n = (size.x * size.y) as usize;
     let mut cells = vec![Vec4::new(NO_RIVER, 1.0, 0.0, 0.0); n];
     let bank = shape.bank_width.max(1.0);
@@ -579,9 +608,7 @@ pub fn rasterize(rivers: &[River], shape: &ChannelShape, settings: &RiverSetting
             let d = Vec2::new((j as u32 % size.x) as f32, (j as u32 / size.x) as f32) + 0.5
                 - river.path[i];
             // Past either end of the river.
-            if d.dot(sec.tangent).abs() > 1.0
-                && (i == 0 || i == river.path.len() - 1)
-            {
+            if d.dot(sec.tangent).abs() > 1.0 && (i == 0 || i == river.path.len() - 1) {
                 continue;
             }
             // Across the channel from its centreline (+ to the left), and from the thalweg, which
@@ -660,7 +687,9 @@ pub fn place(
         taken[(c.y * size.x + c.x) as usize] = true;
     }
     let cells = route(heights, water, &taken, size, source, sea_level);
-    let radius = (shape.river_width * settings.discharge.max(1e-6).sqrt()).round().max(2.0) as usize;
+    let radius = (shape.river_width * settings.discharge.max(1e-6).sqrt())
+        .round()
+        .max(2.0) as usize;
     let path = smooth_path(&cells, radius);
     if path.len() < 4 {
         return None;
@@ -678,7 +707,11 @@ pub fn place(
 
 /// Bank level of `river` on the terrain `heights` (after the terrain changed under it).
 pub fn reprofile(river: &mut River, heights: &[f32], size: UVec2, breach_depth: f32) {
-    let ground: Vec<f32> = river.path.iter().map(|p| bilinear(heights, size, *p)).collect();
+    let ground: Vec<f32> = river
+        .path
+        .iter()
+        .map(|p| bilinear(heights, size, *p))
+        .collect();
     river.profile = long_profile(&ground, breach_depth);
 }
 
@@ -720,13 +753,22 @@ mod tests {
     }
 
     fn field(f: impl Fn(u32, u32) -> f32) -> Vec<f32> {
-        (0..SIZE.x * SIZE.y).map(|i| f(i % SIZE.x, i / SIZE.x)).collect()
+        (0..SIZE.x * SIZE.y)
+            .map(|i| f(i % SIZE.x, i / SIZE.x))
+            .collect()
     }
 
     #[test]
     fn route_runs_down_the_valley_to_the_edge() {
         let h = field(valley);
-        let cells = route(&h, &[], &vec![false; h.len()], SIZE, Vec2::new(5.5, 20.5), 0.0);
+        let cells = route(
+            &h,
+            &[],
+            &vec![false; h.len()],
+            SIZE,
+            Vec2::new(5.5, 20.5),
+            0.0,
+        );
         let end = *cells.last().unwrap();
         assert_eq!(end.x, SIZE.x - 1, "ended at {end}");
         // It reaches the valley floor and follows it.
@@ -738,7 +780,14 @@ mod tests {
     fn route_spills_out_of_a_hollow() {
         // A pit at x = 20 in the valley: the route crosses it and carries on.
         let h = field(|x, y| valley(x, y) - 0.01 * (-((x as f32 - 20.0).powi(2)) / 8.0).exp());
-        let cells = route(&h, &[], &vec![false; h.len()], SIZE, Vec2::new(5.5, 32.5), 0.0);
+        let cells = route(
+            &h,
+            &[],
+            &vec![false; h.len()],
+            SIZE,
+            Vec2::new(5.5, 32.5),
+            0.0,
+        );
         assert_eq!(cells.last().unwrap().x, SIZE.x - 1);
     }
 
@@ -747,7 +796,14 @@ mod tests {
         let h = field(valley);
         let mut water = vec![0.0; h.len()];
         water[(32 * SIZE.x + 40) as usize] = 0.01;
-        let cells = route(&h, &water, &vec![false; h.len()], SIZE, Vec2::new(5.5, 32.5), 0.0);
+        let cells = route(
+            &h,
+            &water,
+            &vec![false; h.len()],
+            SIZE,
+            Vec2::new(5.5, 32.5),
+            0.0,
+        );
         assert_eq!(*cells.last().unwrap(), UVec2::new(40, 32));
     }
 
@@ -780,7 +836,9 @@ mod tests {
             seed: 7,
             path: path.clone(),
             // `s` cells per texel.
-            profile: (0..200).map(|i| 1.0 - s * i as f32 / CELLS_PER_HEIGHT).collect(),
+            profile: (0..200)
+                .map(|i| 1.0 - s * i as f32 / CELLS_PER_HEIGHT)
+                .collect(),
         };
         // Depth the steps and pools add to the plain bed.
         let depths = |r: &River| -> Vec<f32> {
@@ -793,15 +851,34 @@ mod tests {
         };
         let step_pool = depths(&steep(0.1));
         let plain = depths(&steep(0.001));
-        assert!(spread(&step_pool) > 0.5 * base, "steps vary the depth: {}", spread(&step_pool));
-        assert!(spread(&plain) < 0.1 * base, "a gentle bed stays plain: {}", spread(&plain));
+        assert!(
+            spread(&step_pool) > 0.5 * base,
+            "steps vary the depth: {}",
+            spread(&step_pool)
+        );
+        assert!(
+            spread(&plain) < 0.1 * base,
+            "a gentle bed stays plain: {}",
+            spread(&plain)
+        );
     }
 
     #[test]
     fn raster_cuts_a_channel_with_graded_banks() {
         let h = field(valley);
         let settings = RiverSettings::default();
-        let river = place(&h, &[], &[], SIZE, Vec2::new(5.5, 32.5), 0.0, &settings, &shape(), 1).unwrap();
+        let river = place(
+            &h,
+            &[],
+            &[],
+            SIZE,
+            Vec2::new(5.5, 32.5),
+            0.0,
+            &settings,
+            &shape(),
+            1,
+        )
+        .unwrap();
         let cells = rasterize(&[river], &shape(), &settings, SIZE);
         let at = |x: u32, y: u32| cells[(y * SIZE.x + x) as usize];
         // On the thalweg: below the ground, fully armoured, no blend.

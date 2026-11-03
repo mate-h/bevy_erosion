@@ -957,7 +957,12 @@ fn shape_beds_converges() {
     let before = h.read_heights();
     let mid = N / 2;
     let q_mid = q[idx(N / 2, mid)].truncate().truncate().length();
-    let channel = h.app.world().resource::<WaterControl>().bed.channel_discharge;
+    let channel = h
+        .app
+        .world()
+        .resource::<WaterControl>()
+        .bed
+        .channel_discharge;
     let flowing = q
         .iter()
         .filter(|v| v.truncate().truncate().length() > channel)
@@ -981,7 +986,9 @@ fn shape_beds_converges() {
     if std::env::var("TEST_PROFILE").is_ok() {
         for x in (8..N - 8).step_by(16) {
             let w = q[idx(x, mid)];
-            let wet = (0..N).filter(|&y| q[idx(x, y)].truncate().truncate().length() > channel).count();
+            let wet = (0..N)
+                .filter(|&y| q[idx(x, y)].truncate().truncate().length() > channel)
+                .count();
             println!(
                 "x {x}: cut {:.4} q {:.3} depth {:.4} flowing width {wet}",
                 before[idx(x, mid)] - first[idx(x, mid)],
@@ -1001,8 +1008,18 @@ fn shape_beds_converges() {
         .iter()
         .zip(&second)
         .enumerate()
-        .fold((0.0f32, 0), |a, (i, (x, y))| if (x - y).abs() > a.0 { ((x - y).abs(), i) } else { a });
-    println!("largest second-press change at ({}, {})", at as u32 % N, at as u32 / N);
+        .fold((0.0f32, 0), |a, (i, (x, y))| {
+            if (x - y).abs() > a.0 {
+                ((x - y).abs(), i)
+            } else {
+                a
+            }
+        });
+    println!(
+        "largest second-press change at ({}, {})",
+        at as u32 % N,
+        at as u32 / N
+    );
     // Cross-section at the middle: the thalweg is the lowest point and the banks rise from it.
     let section: Vec<f32> = (mid - 6..=mid + 6)
         .map(|y| first[idx(N / 2, y)] - before[idx(N / 2, y)])
@@ -1010,7 +1027,10 @@ fn shape_beds_converges() {
     println!(
         "shape beds: thalweg cut mean {mean_cut:.4} min {min_cut:.4}, second press changes {again:.6}, \
          cross-section change {:?}",
-        section.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>()
+        section
+            .iter()
+            .map(|v| format!("{v:.4}"))
+            .collect::<Vec<_>>()
     );
     // Keep shaping with the water running between presses: the cut settles.
     h.pause(false);
@@ -1078,7 +1098,8 @@ fn discharge_matches_ktt() {
     let solver: Vec<f32> = d.iter().map(|v| v.truncate().truncate().length()).collect();
     // Cells the spring's water reaches.
     let cells: Vec<usize> = (0..d.len()).filter(|&i| solver[i] > 0.01).collect();
-    let mean = |f: &dyn Fn(usize) -> f32| cells.iter().map(|&i| f(i)).sum::<f32>() / cells.len() as f32;
+    let mean =
+        |f: &dyn Fn(usize) -> f32| cells.iter().map(|&i| f(i)).sum::<f32>() / cells.len() as f32;
     let (ms, mk) = (mean(&|i| solver[i]), mean(&|i| ktt[i]));
     let cov = mean(&|i| (solver[i] - ms) * (ktt[i] - mk));
     let (vs, vk) = (
@@ -1109,7 +1130,10 @@ fn discharge_matches_ktt() {
         100.0 * on_river
     );
     assert!(cells.len() > 100, "the spring did not flow");
-    assert!(on_river > 0.5, "the spring's water does not follow KTT's rivers");
+    assert!(
+        on_river > 0.5,
+        "the spring's water does not follow KTT's rivers"
+    );
     assert!(d.iter().all(|v| v.is_finite()), "discharge holds NaN");
 }
 
@@ -1138,7 +1162,10 @@ fn run_flume(bed: impl Fn(u32, u32) -> f32, radius: f32, rate: f32, seconds: f32
     {
         let mut water = h.water();
         water.bed_load.live = true;
-        if let Some(a) = std::env::var("TEST_SLOPE_EFFECT").ok().and_then(|v| v.parse().ok()) {
+        if let Some(a) = std::env::var("TEST_SLOPE_EFFECT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
             water.bed_load.slope_effect = a;
         }
         water.springs.push(Spring {
@@ -1153,7 +1180,10 @@ fn run_flume(bed: impl Fn(u32, u32) -> f32, radius: f32, rate: f32, seconds: f32
     let before = h.read_heights();
     h.water().bed_load.live = true;
     h.run(seconds);
-    if let Some(steps) = std::env::var("TEST_REFINE").ok().and_then(|v| v.parse().ok()) {
+    if let Some(steps) = std::env::var("TEST_REFINE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
         h.water().bed_load.refine_steps = steps;
         {
             let mut water = h.water();
@@ -1233,7 +1263,12 @@ fn bed_load_on_flumes() {
             .unwrap_or(20.0);
         // The spring fits inside the channel; narrower channels get a stronger one.
         let radius = (width / 2.0 - 1.0).min(6.0);
-        let r = run_flume(flume(slope, width), radius, 0.05 * 36.0 / (radius * radius), seconds);
+        let r = run_flume(
+            flume(slope, width),
+            radius,
+            0.05 * 36.0 / (radius * radius),
+            seconds,
+        );
         let xs = 48..N - 24;
         let cut: Vec<f32> = xs
             .clone()
@@ -1265,7 +1300,10 @@ fn bed_load_on_flumes() {
                 .step_by(2)
                 .map(|(z, x)| format!("{:.4}", z - r.before[idx(x, mid)]))
                 .collect();
-            println!("{name} bed change along the centreline: {}", detrended.join(" "));
+            println!(
+                "{name} bed change along the centreline: {}",
+                detrended.join(" ")
+            );
         }
         let (period, share, steps, relief) = dominant_period(&profile);
         // Deepest cell across the channel at the middle (the thalweg wanders between bars).
@@ -1296,7 +1334,10 @@ fn bed_load_on_flumes() {
             .fold(0.0f32, f32::max);
         assert_eq!(dry, 0.0, "{name}: dry ground changed");
         match name {
-            "gentle" => assert!(across < 0.0005, "grooves across the gentle flume ({across})"),
+            "gentle" => assert!(
+                across < 0.0005,
+                "grooves across the gentle flume ({across})"
+            ),
             "narrow" => assert!(
                 steps > 0.5 && relief > 0.002,
                 "no steps on the steep narrow flume"
@@ -1306,10 +1347,26 @@ fn bed_load_on_flumes() {
         if let Ok(dir) = std::env::var("TEST_IMAGE_DIR") {
             let d: Vec<f32> = r.after.iter().zip(&r.before).map(|(a, b)| a - b).collect();
             let m = d.iter().fold(1e-6f32, |a, b| a.max(b.abs()));
-            write_bmp(&format!("{dir}/flume_{name}_cut.bmp"), &d, N as usize, N as usize, -m, m, 2);
+            write_bmp(
+                &format!("{dir}/flume_{name}_cut.bmp"),
+                &d,
+                N as usize,
+                N as usize,
+                -m,
+                m,
+                2,
+            );
             let depth: Vec<f32> = r.water.iter().map(|w| w.depth).collect();
             let dm = depth.iter().fold(1e-6f32, |a, b| a.max(*b));
-            write_bmp(&format!("{dir}/flume_{name}_depth.bmp"), &depth, N as usize, N as usize, 0.0, dm, 2);
+            write_bmp(
+                &format!("{dir}/flume_{name}_depth.bmp"),
+                &depth,
+                N as usize,
+                N as usize,
+                0.0,
+                dm,
+                2,
+            );
         }
     }
 }
@@ -1352,11 +1409,25 @@ fn bed_load_conserves_and_builds_a_delta() {
     );
     if let Ok(dir) = std::env::var("TEST_IMAGE_DIR") {
         let m = dh.iter().fold(1e-6f32, |a, b| a.max(b.abs()));
-        write_bmp(&format!("{dir}/delta_change.bmp"), &dh, N as usize, N as usize, -m, m, 2);
+        write_bmp(
+            &format!("{dir}/delta_change.bmp"),
+            &dh,
+            N as usize,
+            N as usize,
+            -m,
+            m,
+            2,
+        );
     }
     assert!(moved > 0.05, "the flow moved no bed ({moved})");
-    assert!(net.abs() < 0.02 * moved, "bed volume changed by {net} of {moved} moved");
-    assert!(near > 2.0 * far.max(0.0) && near > 0.0, "no bar at the mouth");
+    assert!(
+        net.abs() < 0.02 * moved,
+        "bed volume changed by {net} of {moved} moved"
+    );
+    assert!(
+        near > 2.0 * far.max(0.0) && near > 0.0,
+        "no bar at the mouth"
+    );
 }
 
 /// Meandering channel: centreline y = N/2 + 24 sin(2π x / 128), 16 texels wide, falling toward
@@ -1375,7 +1446,10 @@ fn apex_scour(helical: f32) -> Vec<f32> {
         let mut water = h.water();
         water.bed_load.helical_strength = helical;
         water.springs.push(Spring {
-            center: Vec2::new(10.0, N as f32 / 2.0 + 24.0 * (2.0 * PI * 10.0 / 128.0).sin()),
+            center: Vec2::new(
+                10.0,
+                N as f32 / 2.0 + 24.0 * (2.0 * PI * 10.0 / 128.0).sin(),
+            ),
             radius: 6.0,
             rate: 0.05,
         });
@@ -1394,7 +1468,10 @@ fn apex_scour(helical: f32) -> Vec<f32> {
             let (mut moment, mut total) = (0.0, 0.0);
             // Inside the channel, relative to the section's mean change.
             let ys: Vec<u32> = ((c - 7.0).ceil() as u32..=(c + 6.0).floor() as u32).collect();
-            let dzs: Vec<f32> = ys.iter().map(|&y| after[idx(x, y)] - before[idx(x, y)]).collect();
+            let dzs: Vec<f32> = ys
+                .iter()
+                .map(|&y| after[idx(x, y)] - before[idx(x, y)])
+                .collect();
             let mean = dzs.iter().sum::<f32>() / dzs.len() as f32;
             let section: Vec<String> = dzs.iter().map(|d| format!("{d:.4}")).collect();
             for (&y, dz) in ys.iter().zip(&dzs) {
@@ -1402,7 +1479,11 @@ fn apex_scour(helical: f32) -> Vec<f32> {
                 moment += cut * (y as f32 + 0.5 - c) * s.signum();
                 total += cut;
             }
-            println!("apex x {x} (outer side {}): {}", if s > 0.0 { "+y" } else { "-y" }, section.join(" "));
+            println!(
+                "apex x {x} (outer side {}): {}",
+                if s > 0.0 { "+y" } else { "-y" },
+                section.join(" ")
+            );
             moment / total.max(1e-9)
         })
         .collect()
@@ -1413,7 +1494,10 @@ fn apex_scour(helical: f32) -> Vec<f32> {
 #[test]
 #[ignore = "needs a graphics adapter"]
 fn bends_scour_their_outer_banks() {
-    let strength = std::env::var("TEST_HELICAL").ok().and_then(|v| v.parse().ok()).unwrap_or(BedLoad::default().helical_strength);
+    let strength = std::env::var("TEST_HELICAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(BedLoad::default().helical_strength);
     let with = apex_scour(strength);
     let without = apex_scour(0.0);
     println!(
@@ -1436,7 +1520,10 @@ fn refine_fast_forwards_the_bed() {
     // Banks below the slumping angle, so only bed load moves the bed.
     let mut h = Harness::new(WaterSolver::Swe, s_bend);
     h.water().springs.push(Spring {
-        center: Vec2::new(10.0, N as f32 / 2.0 + 24.0 * (2.0 * PI * 10.0 / 128.0).sin()),
+        center: Vec2::new(
+            10.0,
+            N as f32 / 2.0 + 24.0 * (2.0 * PI * 10.0 / 128.0).sin(),
+        ),
         radius: 6.0,
         rate: 0.05,
     });
@@ -1491,12 +1578,20 @@ fn rain_wets_the_trails() {
     let mut volumes = Vec::new();
     for fps in [30.0, 120.0] {
         let mut h = Harness::new(WaterSolver::Swe, bowl(0.0));
-        rain(&mut h, Vec2::new(N as f32 / 2.0 + 60.0, N as f32 / 2.0), 1.0, fps);
+        rain(
+            &mut h,
+            Vec2::new(N as f32 / 2.0 + 60.0, N as f32 / 2.0),
+            1.0,
+            fps,
+        );
         h.run(0.5);
         let water = h.read_water();
         volumes.push(water.iter().map(|w| w.depth).sum::<f32>());
     }
-    println!("rain water: {:.4} at 30 fps, {:.4} at 120 fps", volumes[0], volumes[1]);
+    println!(
+        "rain water: {:.4} at 30 fps, {:.4} at 120 fps",
+        volumes[0], volumes[1]
+    );
     assert!(volumes[0] > 0.01, "the rain brush left no water");
     assert!(
         (volumes[0] - volumes[1]).abs() < 0.1 * volumes[0],
@@ -1522,7 +1617,12 @@ fn trail_sediment_reaches_the_lake() {
     h.run(4.0);
     let heights0 = h.read_heights();
     let lake: Vec<bool> = h.read_water().iter().map(|w| w.depth > 0.004).collect();
-    rain(&mut h, Vec2::new(N as f32 / 2.0 + 62.0, N as f32 / 2.0), 2.0, FPS);
+    rain(
+        &mut h,
+        Vec2::new(N as f32 / 2.0 + 62.0, N as f32 / 2.0),
+        2.0,
+        FPS,
+    );
     let read_sediment = |h: &mut Harness| -> Vec<f32> {
         let handle = h.app.world().resource::<ErosionImages>().water.clone();
         h.read(handle).iter().map(|t| t[3]).collect()
@@ -1530,7 +1630,11 @@ fn trail_sediment_reaches_the_lake() {
     let sediment = read_sediment(&mut h);
     let heights1 = h.read_heights();
     let suspended: f32 = sediment.iter().sum();
-    let cut: f32 = heights0.iter().zip(&heights1).map(|(a, b)| (a - b).max(0.0)).sum();
+    let cut: f32 = heights0
+        .iter()
+        .zip(&heights1)
+        .map(|(a, b)| (a - b).max(0.0))
+        .sum();
     let in_lake: f32 = (0..heights0.len())
         .filter(|&i| lake[i])
         .map(|i| (heights1[i] - heights0[i]).max(0.0))
@@ -1550,7 +1654,10 @@ fn trail_sediment_reaches_the_lake() {
         .map(|i| analysis[i][1])
         .sum();
     println!("loose sediment shown under the lake deposits: {shown:.3}");
-    assert!(shown > 0.0, "the water's deposits are not in KTT's deposition buffer");
+    assert!(
+        shown > 0.0,
+        "the water's deposits are not in KTT's deposition buffer"
+    );
     let before_clear: f32 = h.read_heights().iter().sum();
     {
         let mut water = h.water();
@@ -1570,7 +1677,10 @@ fn trail_sediment_reaches_the_lake() {
         settled + suspended2 > 0.3 * cut,
         "little of the carved sediment reached the lake"
     );
-    assert!(suspended2 > 0.001, "nothing stayed suspended to check Clear Water with");
+    assert!(
+        suspended2 > 0.001,
+        "nothing stayed suspended to check Clear Water with"
+    );
     // Heights read back as f16 (about 0.00024 apart here), so the sum of many small deposits is
     // only good to tens of percent; before this, Clear Water deleted the load (0 settled).
     assert!(
@@ -1619,7 +1729,10 @@ fn trail_cut_along_stream(steer: bool) -> (f32, f32) {
             }
         }
     }
-    (inside / n_in.max(1.0) / (outside / n_out.max(1.0)).max(1e-9), n_in)
+    (
+        inside / n_in.max(1.0) / (outside / n_out.max(1.0)).max(1e-9),
+        n_in,
+    )
 }
 
 /// With KTT's rivers on, the water's discharge steers the trails: they cut along the stream
@@ -1695,9 +1808,15 @@ fn bed_load_respects_rock() {
          {soft:.2} with the softness mask at hardness 0, {hard:.2} at hardness {}",
         BedLoad::default().rock_hardness
     );
-    assert!(free > 2.0 * depth, "the free bed did not cut deep enough to test the bedrock");
+    assert!(
+        free > 2.0 * depth,
+        "the free bed did not cut deep enough to test the bedrock"
+    );
     // f16 readback resolves about 0.00025 at these heights.
-    assert!(floored < depth + 0.0005, "bed load cut {floored} below the bedrock");
+    assert!(
+        floored < depth + 0.0005,
+        "bed load cut {floored} below the bedrock"
+    );
     assert!(hard < 0.8 * soft, "hard rock moved as much as soft");
 }
 
@@ -1752,7 +1871,10 @@ fn validate_roll_wave_onset() {
     );
     let g = WaterControl::default().gravity;
     let mid = N / 2;
-    for n in [0.016, 0.012, 0.0095, 0.008, 0.007, 0.006, 0.005, 0.0042, 0.0035, 0.0028, 0.0022, 0.0017, 0.0013] {
+    for n in [
+        0.016, 0.012, 0.0095, 0.008, 0.007, 0.006, 0.005, 0.0042, 0.0035, 0.0028, 0.0022, 0.0017,
+        0.0013,
+    ] {
         let mut h = Harness::new(WaterSolver::Swe, flume(0.002, 24.0));
         h.water().manning_n = n;
         h.water().second_order_depth = std::env::var("TEST_SECOND_ORDER").is_ok();
@@ -1853,9 +1975,8 @@ fn validate_step_migration() {
         let start = h.read_heights();
         h.water().bed_load.live = true;
         h.run(25.0);
-        let profile = |heights: &[f32]| -> Vec<f32> {
-            (x0..x1).map(|x| heights[idx(x, mid)]).collect()
-        };
+        let profile =
+            |heights: &[f32]| -> Vec<f32> { (x0..x1).map(|x| heights[idx(x, mid)]).collect() };
         let (_, slope_before) = detrend(&profile(&start));
         let mut prev = detrend(&profile(&h.read_heights())).0;
         let (period, ..) = dominant_period(&prev);
@@ -1898,7 +2019,10 @@ fn validate_hydraulic_geometry() {
     let mut points = Vec::new();
     for factor in [0.25f32, 0.5, 1.0, 2.0, 4.0] {
         let mut h = Harness::new(WaterSolver::Swe, tilted_plane);
-        if let Some(a) = std::env::var("TEST_SLOPE_EFFECT").ok().and_then(|v| v.parse().ok()) {
+        if let Some(a) = std::env::var("TEST_SLOPE_EFFECT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
             h.water().bed_load.slope_effect = a;
         }
         h.water().springs.push(Spring {
@@ -1930,13 +2054,27 @@ fn validate_hydraulic_geometry() {
             width += wet.len() as f32;
             // Channel: deeper than half the section's deepest water; cut: lowered by more than
             // half the section's deepest cut.
-            let top = wet.iter().map(|&y| water[idx(x, y)].depth).fold(0.0, f32::max);
-            channel += wet.iter().filter(|&&y| water[idx(x, y)].depth > 0.5 * top).count() as f32;
-            let cuts: Vec<f32> = (0..N).map(|y| before[idx(x, y)] - after[idx(x, y)]).collect();
+            let top = wet
+                .iter()
+                .map(|&y| water[idx(x, y)].depth)
+                .fold(0.0, f32::max);
+            channel += wet
+                .iter()
+                .filter(|&&y| water[idx(x, y)].depth > 0.5 * top)
+                .count() as f32;
+            let cuts: Vec<f32> = (0..N)
+                .map(|y| before[idx(x, y)] - after[idx(x, y)])
+                .collect();
             let most = cuts.iter().fold(0.0f32, |a, b| a.max(*b));
-            cut_width += cuts.iter().filter(|&&c| most > 0.0 && c > 0.5 * most).count() as f32;
+            cut_width += cuts
+                .iter()
+                .filter(|&&c| most > 0.0 && c > 0.5 * most)
+                .count() as f32;
             depth += wet.iter().map(|&y| water[idx(x, y)].depth).sum::<f32>() / wet.len() as f32;
-            deepest += wet.iter().map(|&y| water[idx(x, y)].depth).fold(0.0, f32::max);
+            deepest += wet
+                .iter()
+                .map(|&y| water[idx(x, y)].depth)
+                .fold(0.0, f32::max);
             incision += (0..N)
                 .map(|y| before[idx(x, y)] - after[idx(x, y)])
                 .fold(0.0, f32::max);
@@ -1962,7 +2100,10 @@ fn validate_hydraulic_geometry() {
             xs.iter().sum::<f32>() / xs.len() as f32,
             ys.iter().sum::<f32>() / ys.len() as f32,
         );
-        xs.iter().zip(&ys).map(|(x, y)| (x - xm) * (y - ym)).sum::<f32>()
+        xs.iter()
+            .zip(&ys)
+            .map(|(x, y)| (x - xm) * (y - ym))
+            .sum::<f32>()
             / xs.iter().map(|x| (x - xm).powi(2)).sum::<f32>()
     };
     println!(
@@ -2009,9 +2150,8 @@ fn validate_alternate_bars() {
             })
             .collect();
         let mean = thalweg.iter().sum::<f32>() / thalweg.len() as f32;
-        let spread = (thalweg.iter().map(|t| (t - mean).powi(2)).sum::<f32>()
-            / thalweg.len() as f32)
-            .sqrt();
+        let spread =
+            (thalweg.iter().map(|t| (t - mean).powi(2)).sum::<f32>() / thalweg.len() as f32).sqrt();
         if let Ok(dir) = std::env::var("TEST_IMAGE_DIR") {
             // Detrended bed of the channel, stretched across.
             let rows = 2 * half;
@@ -2054,8 +2194,8 @@ fn validate_alternate_bars() {
             .map(|w| w.velocity.length())
             .sum::<f32>()
             / wet.len().max(1) as f32;
-        let shields = g.manning_n.powi(2) * speed * speed
-            / (g.bed_load.grain * depth.max(1e-4).cbrt());
+        let shields =
+            g.manning_n.powi(2) * speed * speed / (g.bed_load.grain * depth.max(1e-4).cbrt());
         row(
             &mut f,
             &[
@@ -2088,7 +2228,8 @@ fn validate_cyclic_steps() {
         let profile: Vec<f32> = (48..N - 24).map(|x| r.after[idx(x, mid)]).collect();
         let (period, _, band, relief) = dominant_period(&profile);
         let line: Vec<Water> = (64..N - 24).map(|x| r.water[idx(x, mid)]).collect();
-        let depth = line.iter().map(|w| w.depth).sum::<f32>() / line.len() as f32 * CELLS_PER_HEIGHT;
+        let depth =
+            line.iter().map(|w| w.depth).sum::<f32>() / line.len() as f32 * CELLS_PER_HEIGHT;
         let speed = line.iter().map(|w| w.velocity.length()).sum::<f32>() / line.len() as f32;
         let froude = speed / (g * depth.max(1e-4)).sqrt();
         row(
@@ -2115,7 +2256,10 @@ fn detail(h: &[f32]) -> Vec<f32> {
             let mut sum = 0.0;
             for dy in -r..=r {
                 for dx in -r..=r {
-                    let (sx, sy) = ((x + dx).clamp(0, N as i32 - 1), (y + dy).clamp(0, N as i32 - 1));
+                    let (sx, sy) = (
+                        (x + dx).clamp(0, N as i32 - 1),
+                        (y + dy).clamp(0, N as i32 - 1),
+                    );
                     sum += h[idx(sx as u32, sy as u32)];
                 }
             }
@@ -2161,13 +2305,22 @@ fn validate_ktt_rivers() {
             let mut params = h.app.world_mut().resource_mut::<ErodeParams>();
             params.do_rivers = u32::from(rivers);
             params.river_scale = scale;
-            if let Some(t) = std::env::var("TEST_RIVER_THRESHOLD").ok().and_then(|v| v.parse().ok()) {
+            if let Some(t) = std::env::var("TEST_RIVER_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
                 params.river_threshold = t;
             }
-            if let Some(d) = std::env::var("TEST_TRAIL_DAMPING").ok().and_then(|v| v.parse().ok()) {
+            if let Some(d) = std::env::var("TEST_TRAIL_DAMPING")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
                 params.trail_damping = d;
             }
-            if let Some(a) = std::env::var("TEST_MAX_DEPOSIT").ok().and_then(|v| v.parse().ok()) {
+            if let Some(a) = std::env::var("TEST_MAX_DEPOSIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
                 params.max_deposit_angle = a;
             }
         }
@@ -2219,7 +2372,15 @@ fn validate_ktt_rivers() {
     if let Some(dir) = &dir {
         let log: Vec<f32> = momentum.iter().map(|v| (1.0 + v.max(0.0)).ln()).collect();
         let top = log.iter().cloned().fold(0.0, f32::max);
-        write_bmp(&format!("{dir}/ktt_momentum.bmp"), &log, N as usize, N as usize, 0.0, top, 2);
+        write_bmp(
+            &format!("{dir}/ktt_momentum.bmp"),
+            &log,
+            N as usize,
+            N as usize,
+            0.0,
+            top,
+            2,
+        );
     }
     let stats = |heights: &[f32]| {
         let d = detail(heights);
@@ -2238,13 +2399,26 @@ fn validate_ktt_rivers() {
             }
         }
         let k = CELLS_PER_HEIGHT;
-        ((hill / nh).sqrt() * k, (chan / nc).sqrt() * k, hill_low / nh, chan_low / nc)
+        (
+            (hill / nh).sqrt() * k,
+            (chan / nc).sqrt() * k,
+            hill_low / nh,
+            chan_low / nc,
+        )
     };
     let mut report = |name: &str, rivers: bool, scale: f32, heights: &[f32]| {
         let (a, b, c, d) = stats(heights);
         row(&mut f, &[f32::from(u8::from(rivers)), scale, a, b, c, d]);
         if let Some(dir) = &dir {
-            write_bmp(&format!("{dir}/ktt_{name}.bmp"), &hillshade(heights), N as usize, N as usize, 0.0, 1.0, 2);
+            write_bmp(
+                &format!("{dir}/ktt_{name}.bmp"),
+                &hillshade(heights),
+                N as usize,
+                N as usize,
+                0.0,
+                1.0,
+                2,
+            );
         }
     };
     report("off", false, 0.0, &off);
@@ -2302,13 +2476,31 @@ fn river_brush_keeps_its_steps() {
             let bytes: Vec<u8> = heights.iter().flat_map(|v| v.to_le_bytes()).collect();
             std::fs::write(format!("{dir}/river_heights.f32"), bytes).unwrap();
         }
-        let settings = RiverSettings { armour, ..default() };
+        let settings = RiverSettings {
+            armour,
+            ..default()
+        };
         let bed = h.water().bed;
         let size = UVec2::splat(N);
-        let placed = river::place(&heights, &[], &[], size, source, 0.0, &settings, &(&bed).into(), 1)
-            .expect("no route from the summit");
+        let placed = river::place(
+            &heights,
+            &[],
+            &[],
+            size,
+            source,
+            0.0,
+            &settings,
+            &(&bed).into(),
+            1,
+        )
+        .expect("no route from the summit");
         let spring = river::spring_for(&placed, &bed);
-        let cells = river::rasterize(std::slice::from_ref(&placed), &(&bed).into(), &settings, size);
+        let cells = river::rasterize(
+            std::slice::from_ref(&placed),
+            &(&bed).into(),
+            &settings,
+            size,
+        );
         h.water().springs.push(spring);
         {
             let mut out = h.app.world_mut().resource_mut::<RiverBed>();
@@ -2317,7 +2509,11 @@ fn river_brush_keeps_its_steps() {
         }
         h.run(0.2);
         let along = |heights: &[f32]| -> Vec<f32> {
-            placed.path.iter().map(|p| river::bilinear(heights, size, *p)).collect()
+            placed
+                .path
+                .iter()
+                .map(|p| river::bilinear(heights, size, *p))
+                .collect()
         };
         let carved = h.read_heights();
         let cut: f32 = placed
@@ -2330,9 +2526,20 @@ fn river_brush_keeps_its_steps() {
         let before = detail(&along(&carved));
         let image = |name: &str, heights: &[f32]| {
             if let Ok(dir) = std::env::var("TEST_IMAGE_DIR") {
-                write_bmp(&format!("{dir}/river_{name}.bmp"), &hillshade(heights), N as usize, N as usize, 0.0, 1.0, 3);
+                write_bmp(
+                    &format!("{dir}/river_{name}.bmp"),
+                    &hillshade(heights),
+                    N as usize,
+                    N as usize,
+                    0.0,
+                    1.0,
+                    3,
+                );
                 let profile = along(heights);
-                let csv: Vec<String> = profile.iter().map(|v| format!("{}", v * CELLS_PER_HEIGHT)).collect();
+                let csv: Vec<String> = profile
+                    .iter()
+                    .map(|v| format!("{}", v * CELLS_PER_HEIGHT))
+                    .collect();
                 std::fs::write(format!("{dir}/river_{name}_profile.csv"), csv.join("\n")).unwrap();
             }
         };
@@ -2504,9 +2711,30 @@ fn inspect_river_brush() {
         }
     }
     if let Ok(dir) = std::env::var("TEST_IMAGE_DIR") {
-        write_bmp(&format!("{dir}/inspect_carved.bmp"), &hillshade(&carved), N as usize, N as usize, 0.0, 1.0, 3);
-        write_bmp(&format!("{dir}/inspect_water.bmp"), &depth, N as usize, N as usize, 0.0, 0.02, 3);
-        for (name, field) in [("ground", &heights), ("carved", &carved), ("after", &after), ("depth", &depth)] {
+        write_bmp(
+            &format!("{dir}/inspect_carved.bmp"),
+            &hillshade(&carved),
+            N as usize,
+            N as usize,
+            0.0,
+            1.0,
+            3,
+        );
+        write_bmp(
+            &format!("{dir}/inspect_water.bmp"),
+            &depth,
+            N as usize,
+            N as usize,
+            0.0,
+            0.02,
+            3,
+        );
+        for (name, field) in [
+            ("ground", &heights),
+            ("carved", &carved),
+            ("after", &after),
+            ("depth", &depth),
+        ] {
             let bytes: Vec<u8> = field.iter().flat_map(|v| v.to_le_bytes()).collect();
             std::fs::write(format!("{dir}/inspect_{name}.f32"), bytes).unwrap();
         }

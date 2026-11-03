@@ -593,14 +593,18 @@ impl PreviewMode {
     pub fn description(self) -> &'static str {
         match self {
             Self::Pbr => "Lit terrain with atmosphere, shadows and the water surface.",
-            Self::Simple => "Lambert-shaded terrain colour with a flat water tint; no atmosphere or water optics.",
+            Self::Simple => {
+                "Lambert-shaded terrain colour with a flat water tint; no atmosphere or water optics."
+            }
             Self::Albedo => "Unlit terrain colour from the erosion's colour bands.",
             Self::Height => "Height with contour bands every 0.01.",
             Self::Slope => "Slope angle: black flat, white 60°+.",
             Self::Normals => "View-space normals.",
             Self::Curvature => "Laplacian of height: blue concave (valleys), red convex (ridges).",
             Self::AmbientOcclusion => "Baked ambient occlusion.",
-            Self::TerrainEdits => "Brush height offset: blue lowered, red raised; green flatten, white smooth weight.",
+            Self::TerrainEdits => {
+                "Brush height offset: blue lowered, red raised; green flatten, white smooth weight."
+            }
             Self::Flow => "KTT trail flow magnitude (heat).",
             Self::Sediment => "Loose deposited sediment (heat).",
             Self::Erosion => "Material removed by trails (heat).",
@@ -610,11 +614,15 @@ impl PreviewMode {
             Self::Outflow => "Outflow mask: white drains away (ocean, border).",
             Self::ErodeMask => "Erode mask: trails start only where white.",
             Self::Uplift => "Uplift map multiplier.",
-            Self::Bedrock => "Sediment above the bedrock (heat; black at bedrock). Needs Use Bedrock.",
+            Self::Bedrock => {
+                "Sediment above the bedrock (heat; black at bedrock). Needs Use Bedrock."
+            }
             Self::WaterDepth => "Water depth from the solver (heat), ocean in grey.",
             Self::WaterVelocity => "Water velocity: hue is direction, brightness is speed.",
             Self::SuspendedSediment => "Sediment carried by the water (heat).",
-            Self::Discharge => "Averaged unit discharge h·u: hue is direction, brightness magnitude.",
+            Self::Discharge => {
+                "Averaged unit discharge h·u: hue is direction, brightness magnitude."
+            }
             Self::MeanDepth => "Depth averaged over a few seconds (heat).",
             Self::RiverDischarge => "KTT river discharge in water units (heat).",
             Self::BedLoad => "Bed load through each cell (heat).",
@@ -659,10 +667,7 @@ impl From<TerrainView> for TerrainViewUniform {
     }
 }
 
-fn sync_terrain_view(
-    view: Res<TerrainView>,
-    materials: Option<ResMut<Assets<TerrainMaterial>>>,
-) {
+fn sync_terrain_view(view: Res<TerrainView>, materials: Option<ResMut<Assets<TerrainMaterial>>>) {
     let Some(mut materials) = materials else {
         return;
     };
