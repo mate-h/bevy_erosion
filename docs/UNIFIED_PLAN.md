@@ -354,6 +354,35 @@ drainage and carving after it).
   duplicate `CELLS_PER_HEIGHT` constants (`river.rs`, five shaders) in favour of one uniform.
 - Update `README.md` (keys, River brush) and `VALIDATION.md` (units line).
 
+## How it was built
+
+Decisions taken while implementing, where they differ from or sharpen the plan above.
+
+- **The solver stays in cells.** Rather than handing bevy_fft metres, the water keeps texels and
+  height units and receives SI-derived constants: g = 9.81 / dx cells/s², n · dx^(1/3) for
+  Manning, and the step in seconds. This is the same physics with no change to the solver
+  kernels (`WaterControl::gravity_cells`, `manning_cells`).
+- **The step follows CFL for deep lakes.** It is sized for a gravity wave over 20 texels of
+  water (200 m at 10 m texels) at Courant 0.4: 0.09 s at 10 m. A 20 m design depth was not
+  enough: lakes on the default terrain are deeper and sloshed.
+- **bevy_fft's depth limiter is not dimensionless.** It holds back water above β·dx/(g·dt),
+  which is not a length, so moving to SI seconds loosened it about 45×. The solver now runs in a
+  time unit (`WaterControl::solver_seconds`) that keeps the cap at the old 0.48 texels; g, dt, n,
+  the sources and the velocities are converted at its boundary.
+- **Wet depths stay relative to the grid.** Water is dry below 0.05 texels of depth and fully
+  wet from 0.4 (0.5 m and 4 m at 10 m texels). These set where KTT trails end, where banks slump
+  and where bed load takes over from sheet-flow erosion. Moving them to absolute centimetres was
+  tried: rain trails then ended in their own sheets, wet slumping flattened steps on the flumes,
+  and bed load in shallow margins stopped channels cutting. Absolute thresholds need their own
+  validation sweep.
+- **Shape Beds keeps its tuned thresholds** in metres at their old values (2 m lake depth,
+  0.44 and 1.8 m/s still and river speeds) until Phase 5 replaces its river sizing.
+- **The GPU tests run in old seconds.** The harness sets `time_scale` to `LEGACY_SECONDS` and
+  divides rates by it, and runs at the old-equivalent roughness and grain, so they hold the SI
+  solver to the old one. The app's defaults are separate.
+- **Defaults keep the look.** n = 0.2 and 1.5 m grains at 10 m texels reproduce the old water:
+  a boulder-bed mountain torrent, which is what the default terrain's 5–25 % slopes are.
+
 ## Acceptance
 
 Checked at dx = 2 m and dx = 10 m, against screenshots and the `validate_*` CSVs:

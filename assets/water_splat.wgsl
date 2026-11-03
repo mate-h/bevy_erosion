@@ -23,12 +23,16 @@ struct WaterParams {
     pad_offset: vec2<u32>,
     grid_size: vec2<u32>,
     clear: u32,
-    evaporation: f32,
     capacity: f32,
     sea_level: f32,
     rain: f32,
     step_seconds: f32,
     bed_load: u32,
+    wet_depth: f32,
+    full_depth: f32,
+    capacity_steps: f32,
+    // Seconds per time unit of bevy_fft's solver: its sources and velocities are in this unit.
+    solver_seconds: f32,
     source_count: u32,
     sources: array<vec4<f32>, MAX_SOURCES>,
 }

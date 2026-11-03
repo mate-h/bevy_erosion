@@ -184,6 +184,9 @@ pub struct PyramidResampleParams {
     /// Finest-level (padded base) size; level texel `p` covers base texel `p * padded / size - pad_offset`.
     pub padded_size: UVec2,
     pub pad_offset: UVec2,
+    /// [`WET_DEPTH`] and [`FULL_DEPTH`] in height units: water bodies count as outflow.
+    pub wet_depth: f32,
+    pub full_depth: f32,
 }
 
 /// One unit of GPU work produced by [`Cascade::advance`].
@@ -1059,8 +1062,10 @@ pub struct BrushStroke {
 /// sediment, still water drops it, and wet cells act as KTT outflow so trails drain into them.
 /// The optional ocean (`ErodeParams::outflow_sea_level`) is a sink for this water.
 ///
-/// The solver advances in fixed steps of [`WATER_STEP`] seconds of the frame time, so all rates
-/// here are per second and do not depend on the frame rate.
+/// The water runs in seconds and metres: the solver advances in steps of
+/// [`WaterControl::step_seconds`], sized by the CFL condition for the map's texel size, and
+/// [`WaterControl::time_scale`] simulated seconds pass per second of frame time. Rates are per
+/// simulated second and do not depend on the frame rate.
 #[derive(Resource, Clone, ExtractResource, Debug)]
 #[extract_app(RenderApp)]
 pub struct WaterControl {
@@ -1074,29 +1079,32 @@ pub struct WaterControl {
     pub rate: f32,
     /// Persistent water sources (at most [`MAX_SPRINGS`]); they keep rivers flowing.
     pub springs: Vec<Spring>,
-    /// Water depth added per second everywhere (height units).
+    /// Rain on the whole map (mm per hour).
     pub rainfall: f32,
     /// Water each rain brush trail leaves per step along its path (height units × texels²), so
     /// the rain brush wets the channels it carves (0 = it only carves).
     pub rain_water: f32,
     /// Bump to remove all water.
     pub clear_generation: u32,
-    /// Fraction of water lost per second.
-    pub evaporation: f32,
+    /// Water soaking into the ground wherever there is any (mm per hour). Rain below this runs
+    /// off nowhere (Horton), and thin films dry out.
+    pub infiltration: f32,
     /// Sediment carrying capacity of flowing water (0 = water never erodes).
     pub sediment_capacity: f32,
     /// Which flow model moves the water.
     pub solver: WaterSolver,
-    /// Manning roughness for [`WaterSolver::Swe`] (0 = no bed friction).
+    /// Manning roughness for [`WaterSolver::Swe`] in s/m^(1/3) (0 = no bed friction): about
+    /// 0.03 for a clean channel, 0.04–0.07 for mountain streams.
     pub manning_n: f32,
     /// Carries depth with a second-order flux in [`WaterSolver::Swe`] instead of first-order
     /// upwind, whose numerical diffusion damps roll waves.
     pub second_order_depth: bool,
-    /// Gravity for [`WaterSolver::Swe`] in cells per second², with heights in cells (×100).
-    /// Higher levels lakes faster; the solver's depth limiter caps the depth that carries flux at
-    /// about 2 / (g · step) cells, so lower lets deep water flow.
+    /// Gravity (m/s²).
     pub gravity: f32,
-    /// Seconds since the last frame (set from [`Time`]); the solver catches up by this much.
+    /// Simulated seconds per second of frame time.
+    pub time_scale: f32,
+    /// Seconds since the last frame (set from [`Time`]); the solver catches up by this much
+    /// times [`Self::time_scale`].
     pub dt: f32,
     /// Bed reconstruction settings (see [`BedShaping`]).
     pub bed: BedShaping,
@@ -1111,18 +1119,81 @@ pub struct WaterControl {
     pub steer_rivers: bool,
 }
 
+/// Standard gravity (m/s²).
+pub const GRAVITY: f32 = 9.81;
+/// SI seconds per second of the solver before it ran in metres (g = 2000 cells/s²), at 10 m per
+/// texel: the two are Froude-similar at this time stretch (`docs/UNIFIED_PLAN.md`). Defaults
+/// fitted in the old solver seconds are converted with it.
+pub const LEGACY_SECONDS: f32 = 45.0;
+/// Deepest water the time step is sized for, in texels of depth (200 m at 10 m texels: lakes
+/// can be as deep as a fifth of a height unit). Deeper water is held back by the solver's depth
+/// limiter.
+const CFL_DEPTH: f32 = 20.0;
+/// bevy_fft holds back water above β·dx/(g·dt) from moving (β = 2). The formula is not a length,
+/// so it moves with the time unit: the solver runs in a time unit of
+/// [`WaterControl::solver_seconds`] that puts the cap at this depth (texels), the old solver's.
+const LIMITER_DEPTH: f32 = 2.0 / (2000.0 / 480.0);
+/// bevy_fft's depth limiter β.
+const SWE_LIMITER_BETA: f32 = 2.0;
+/// Courant number of a gravity wave over [`CFL_DEPTH`].
+const COURANT: f32 = 0.4;
+/// The capacity model's rates (`water_erode`) are per this many seconds.
+const CAPACITY_STEP: f32 = 0.1;
+/// Water shallower than this (texels of depth) is dry: it is not drawn, and is not KTT outflow.
+/// Depths are relative to the grid: on 10 m texels this is 0.5 m. A thin film over a wide cell
+/// is sheet flow on the grid, whatever its depth in metres.
+pub const WET_DEPTH: f32 = 0.05;
+/// Water this deep (texels of depth) is fully wet: KTT outflow, bed load instead of sheet-flow
+/// erosion, and banks that slump (4 m on 10 m texels).
+pub const FULL_DEPTH: f32 = 0.4;
+/// Slowest flow (m/s) with a direction for bed load and curvature.
+const MIN_SPEED: f32 = 0.01;
+
+impl WaterControl {
+    /// Seconds per solver step: a Courant number of [`COURANT`] for a gravity wave over
+    /// [`CFL_DEPTH`] texels of water.
+    pub fn step_seconds(&self, scale: &WorldScale) -> f32 {
+        let depth = CFL_DEPTH * scale.metres_per_texel;
+        COURANT * scale.metres_per_texel / (self.gravity.max(0.1) * depth).sqrt()
+    }
+
+    /// Seconds per time unit of bevy_fft's solver (see [`LIMITER_DEPTH`]). Gravity, the step,
+    /// Manning n, sources and velocities are handed to it in this unit; the flow is the same in
+    /// any unit except for the depth limiter.
+    pub fn solver_seconds(&self, scale: &WorldScale) -> f32 {
+        SWE_LIMITER_BETA / (LIMITER_DEPTH * self.gravity_cells(scale) * self.step_seconds(scale))
+    }
+
+    /// Gravity in the solver's cells (texels) per second².
+    pub fn gravity_cells(&self, scale: &WorldScale) -> f32 {
+        self.gravity / scale.metres_per_texel
+    }
+
+    /// Manning n in the solver's cells: u = h^(2/3) S^(1/2) / n holds in metres with `n`, and in
+    /// cells with n · dx^(1/3).
+    pub fn manning_cells(&self, scale: &WorldScale) -> f32 {
+        self.manning_n * scale.metres_per_texel.cbrt()
+    }
+
+    /// Net water added everywhere per second (height units): rain less infiltration.
+    pub fn net_rain(&self, scale: &WorldScale) -> f32 {
+        scale.heights((self.rainfall - self.infiltration) / 3.6e6)
+    }
+}
+
 /// Bed load and Exner (`water_morpho.wgsl`): on water deeper than a thin sheet, the flow moves
-/// bed material along the bed (Shields and Meyer-Peter Müller), toward the inner banks of bends
-/// (helical flow) and down cross-slopes (Talmon), and the bed changes by its divergence. Units
-/// are the solver's: cells (heights × 100) and seconds.
+/// bed material along the bed (Shields and Wong & Parker), toward the inner banks of bends
+/// (helical flow) and down cross-slopes (Talmon), and the bed changes by its divergence
+/// ∂η/∂t = −∇·q / (1 − porosity). Settings are in metres and seconds.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BedLoad {
     /// Run bed load with every water step (morphological factor 1).
     pub live: bool,
-    /// Submerged grain weight R·D (cells) in the Shields number θ = n²|u|² / (grain · h^(1/3)):
-    /// coarser grains need faster flow to move.
-    pub grain: f32,
-    /// Meyer-Peter Müller coefficient: bed load K · (θ − θ_c)^1.5 in cells² per second.
+    /// Grain diameter D (m) in the Shields number θ = n²|u|² / (R · D · h^(1/3)): coarser grains
+    /// need faster flow to move. 0.02 is gravel, 0.1 cobbles, 1 boulders.
+    pub diameter: f32,
+    /// Wong & Parker (2006) coefficient: bed load q = K (θ − θ_c)^1.5 √(R g D³) in m² per second
+    /// (3.97 in flumes).
     pub k: f32,
     /// Shields number θ_c below which the bed does not move.
     pub critical_shields: f32,
@@ -1136,8 +1207,9 @@ pub struct BedLoad {
     pub helical_strength: f32,
     /// Morphological factor while refining (bed change per water step).
     pub morph_factor: f32,
-    /// Water steps one refine runs.
-    pub refine_steps: u32,
+    /// Hours of the bed changing under the current flow that one refine runs (water time ×
+    /// [`Self::morph_factor`]).
+    pub refine_hours: f32,
     /// How much harder the hardest rock of KTT's softness mask is to move: its critical Shields
     /// number is (1 + this) times Critical Shields. Bed load also never cuts below KTT's
     /// bedrock layer (with Use Bedrock on).
@@ -1148,15 +1220,42 @@ impl Default for BedLoad {
     fn default() -> Self {
         Self {
             live: true,
-            grain: 0.25,
-            k: 4.0,
-            critical_shields: 0.047,
+            diameter: 1.5,
+            k: WONG_PARKER_K,
+            critical_shields: 0.0495,
             slope_effect: 1.0,
             helical_strength: 20.0,
             morph_factor: 20.0,
-            refine_steps: 400,
+            refine_hours: 0.2,
             rock_hardness: 4.0,
         }
+    }
+}
+
+/// Wong & Parker's (2006) bed load coefficient.
+pub const WONG_PARKER_K: f32 = 3.97;
+/// Submerged specific gravity of quartz grains, (ρ_s − ρ) / ρ.
+pub const SUBMERGED_DENSITY: f32 = 1.65;
+/// Pore space of the bed: deposited load builds 1 / (1 − this) times its volume of bed.
+const POROSITY: f32 = 0.4;
+
+impl BedLoad {
+    /// Submerged grain weight R·D in cells, for θ = n²|u|² / (R D h^(1/3)) in cells.
+    pub fn grain_cells(&self, scale: &WorldScale) -> f32 {
+        SUBMERGED_DENSITY * self.diameter / scale.metres_per_texel
+    }
+
+    /// The bed load coefficient in cells² per second of bed: K √(R g D³) / (1 − porosity).
+    pub fn k_cells(&self, gravity: f32, scale: &WorldScale) -> f32 {
+        let d = self.diameter.max(1e-5);
+        self.k * (SUBMERGED_DENSITY * gravity * d * d * d).sqrt()
+            / (1.0 - POROSITY)
+            / (scale.metres_per_texel * scale.metres_per_texel)
+    }
+
+    /// Water steps one refine runs, at `step` seconds a step.
+    pub fn refine_steps(&self, step: f32) -> u32 {
+        (self.refine_hours.max(0.0) * 3600.0 / (step * self.morph_factor.max(1.0))).ceil() as u32
     }
 }
 
@@ -1201,7 +1300,7 @@ impl Default for BedShaping {
             bank_slope: 0.0015,
             river_depth: 0.008,
             river_width: 5.0,
-            channel_discharge: 0.02,
+            channel_discharge: 0.02 / LEGACY_SECONDS,
         }
     }
 }
@@ -1213,6 +1312,15 @@ const BED_TAU_SWEEPS: u32 = 400;
 /// Reach of the bank reference inside rivers (texels); wider rivers fall back to their surface.
 const BED_BANK_REACH: f32 = 32.0;
 const BED_SMOOTH_SWEEPS: u32 = 200;
+/// Still water deeper than this (m) is a lake for Shape Beds. Shape Beds was tuned on the old
+/// solver; this and the speeds below are its thresholds at 10 m texels.
+const DOMAIN_DEPTH: f32 = 2.0;
+/// Averaged speeds (m/s) below which water is still (a lake) and above which it is a river.
+const STILL_SPEED: f32 = 0.44;
+const RIVER_SPEED: f32 = 1.8;
+/// Channel discharge (height units × texels² per second) at which rivers get Shape Beds'
+/// `river_depth` and `river_width`: about a default demo spring, in the old solver seconds.
+pub const REFERENCE_DISCHARGE: f32 = 1.0 / LEGACY_SECONDS;
 const BED_OMEGA: f32 = 1.9;
 
 /// Uniform for `water_bed.wgsl` (one entry per red-black parity).
@@ -1232,6 +1340,11 @@ struct BedParams {
     river_depth: f32,
     river_width: f32,
     channel_discharge: f32,
+    domain_depth: f32,
+    wet_depth: f32,
+    still_speed: f32,
+    river_speed: f32,
+    reference_discharge: f32,
 }
 
 impl Default for WaterControl {
@@ -1245,12 +1358,13 @@ impl Default for WaterControl {
             rainfall: 0.0,
             rain_water: 0.0002,
             clear_generation: 0,
-            evaporation: 0.01,
+            infiltration: 5.0,
             sediment_capacity: 0.0005,
             solver: WaterSolver::default(),
-            manning_n: 0.01,
+            manning_n: 0.2,
             second_order_depth: false,
-            gravity: 2000.0,
+            gravity: GRAVITY,
+            time_scale: 50.0,
             dt: 0.0,
             bed: BedShaping::default(),
             shape_generation: 0,
@@ -1287,9 +1401,8 @@ pub struct Spring {
 pub const MAX_SPRINGS: usize = 16;
 /// Springs plus the brush (must match `MAX_SOURCES` in `water.wgsl`).
 const MAX_WATER_SOURCES: usize = MAX_SPRINGS + 1;
-/// Simulated seconds per water solver step (8 steps per frame at 60 fps).
-pub const WATER_STEP: f32 = 1.0 / 480.0;
-/// Most solver steps per frame; below 15 fps the water slows down instead of stalling the GPU.
+/// Most solver steps per frame; past this the water runs slower than its time scale instead of
+/// stalling the GPU.
 const MAX_WATER_STEPS: u32 = 32;
 
 /// Uniform for `water.wgsl`.
@@ -1301,17 +1414,22 @@ pub struct WaterParams {
     pub pad_offset: UVec2,
     pub grid_size: UVec2,
     pub clear: u32,
-    /// Fraction of the depth lost per step.
-    pub evaporation: f32,
     pub capacity: f32,
     /// Ocean level (0 = no ocean): terrain below it drains water away.
     pub sea_level: f32,
-    /// Depth added everywhere per step.
+    /// Depth added everywhere per step (negative: infiltration exceeds rain).
     pub rain: f32,
-    /// Seconds per step ([`WATER_STEP`]).
+    /// Seconds per step ([`WaterControl::step_seconds`]).
     pub step_seconds: f32,
     /// Bed load runs (`water_morpho.wgsl`), so the capacity model only erodes thin sheet flow.
     pub bed_load: u32,
+    /// [`WET_DEPTH`] and [`FULL_DEPTH`] in height units.
+    pub wet_depth: f32,
+    pub full_depth: f32,
+    /// Steps of the capacity model ([`CAPACITY_STEP`]) per solver step.
+    pub capacity_steps: f32,
+    /// Seconds per time unit of bevy_fft's solver ([`WaterControl::solver_seconds`]).
+    pub solver_seconds: f32,
     pub source_count: u32,
     /// Springs and the brush: center, radius, depth per step at the center.
     pub sources: [Vec4; MAX_WATER_SOURCES],
@@ -1330,6 +1448,10 @@ struct MorphoParams {
     ktt_vector: u32,
     sea_level: f32,
     manning_n: f32,
+    wet_depth: f32,
+    full_depth: f32,
+    /// [`MIN_SPEED`] in cells per second.
+    min_speed: f32,
     grain: f32,
     bed_load_k: f32,
     critical_shields: f32,
@@ -1343,12 +1465,13 @@ struct MorphoParams {
 }
 
 /// Seconds the shared discharge field averages over, so roll waves do not make it flicker.
-const DISCHARGE_TIME: f32 = 3.0;
+const DISCHARGE_TIME: f32 = 3.0 * LEGACY_SECONDS;
 /// KTT river momentum (trail water per texel) to unit discharge (height units × texels per
-/// second), fitted on a spring-fed valley (`tests/water_swe_gpu.rs`, `discharge_matches_ktt`).
-const KTT_DISCHARGE_SCALE: f32 = 0.0044;
-/// Helical flow adaptation length in texels (terracraft uses 42 m at 1 m per pixel).
-const HELICAL_LENGTH: f32 = 20.0;
+/// second), fitted on a spring-fed valley (`tests/water_swe_gpu.rs`, `discharge_matches_ktt`) in
+/// the old solver seconds.
+const KTT_DISCHARGE_SCALE: f32 = 0.0044 / LEGACY_SECONDS;
+/// Helical flow adaptation length in metres (terracraft uses 42 m at 1 m per pixel; 20 texels here).
+const HELICAL_LENGTH: f32 = 200.0;
 /// Most water steps one frame runs while refining beds.
 const MAX_REFINE_STEPS: u32 = 64;
 
@@ -2164,12 +2287,15 @@ impl WaterBuffers {
                 pad_offset: UVec2::ZERO,
                 grid_size: size,
                 clear: 0,
-                evaporation: 0.0,
                 capacity: 0.0,
                 sea_level: 0.0,
                 rain: 0.0,
-                step_seconds: WATER_STEP,
+                step_seconds: 1.0,
                 bed_load: 0,
+                wet_depth: 0.0,
+                full_depth: 1.0,
+                capacity_steps: 1.0,
+                solver_seconds: 1.0,
                 source_count: 0,
                 sources: [Vec4::ZERO; MAX_WATER_SOURCES],
             }),
@@ -2185,13 +2311,16 @@ impl WaterBuffers {
                 size,
                 pad_offset: UVec2::ZERO,
                 grid_size: size,
-                step_seconds: WATER_STEP,
+                step_seconds: 1.0,
                 frame_seconds: 0.0,
                 discharge_time: DISCHARGE_TIME,
                 ktt_scale: KTT_DISCHARGE_SCALE,
                 ktt_vector: 0,
                 sea_level: 0.0,
                 manning_n: 0.0,
+                wet_depth: 0.0,
+                full_depth: 1.0,
+                min_speed: 0.0,
                 grain: 1.0,
                 bed_load_k: 0.0,
                 critical_shields: 0.0,
@@ -2662,7 +2791,7 @@ struct ErosionState {
     last_water_clear: u32,
     /// bevy_fft's solver held the water last frame.
     last_swe: bool,
-    /// Frame time not yet simulated by the water solver (below one [`WATER_STEP`]).
+    /// Simulated time not yet run by the water solver (below one step).
     water_time: f32,
     last_shape: u32,
     last_refine: u32,
@@ -2694,8 +2823,10 @@ fn plan_erosion_frame(
     queue: Res<RenderQueue>,
     swe_pipelines: Option<Res<ShallowWaterPipelines>>,
     river_bed: Option<Res<river::RiverBed>>,
+    scale: Res<WorldScale>,
 ) {
     let state = &mut *state;
+    let step = water.step_seconds(&scale);
     state.frame.clear();
     state.steps.clear();
 
@@ -2782,6 +2913,8 @@ fn plan_erosion_frame(
                     granularity_strength: params.granularity_strength,
                     padded_size: finest_size,
                     pad_offset,
+                    wet_depth: WET_DEPTH / CELLS_PER_HEIGHT,
+                    full_depth: FULL_DEPTH / CELLS_PER_HEIGHT,
                 });
                 debug_assert!(first || src == 1 - dst);
                 info!(
@@ -2862,7 +2995,7 @@ fn plan_erosion_frame(
     let stroke = water.stroke_active && water.rate != 0.0;
     if (water.stroke_active && water.rate > 0.0)
         || !water.springs.is_empty()
-        || water.rainfall > 0.0
+        || water.rainfall > water.infiltration
     {
         state.water_active = true;
     }
@@ -2890,7 +3023,7 @@ fn plan_erosion_frame(
     let swe = water.solver == WaterSolver::Swe && grid.solver.is_some();
     if water.refine_generation != state.last_refine && finest_ready {
         state.last_refine = water.refine_generation;
-        state.refine_left = water.bed_load.refine_steps;
+        state.refine_left = water.bed_load.refine_steps(step);
         state.water_active = true;
     }
     let refining = state.refine_left > 0;
@@ -2909,10 +3042,7 @@ fn plan_erosion_frame(
         let mut sources = [Vec4::ZERO; MAX_WATER_SOURCES];
         let mut source_count = 0;
         for s in water.springs.iter().take(MAX_SPRINGS).chain(&brush) {
-            sources[source_count] = s
-                .center
-                .extend(s.radius.max(0.5))
-                .extend(s.rate * WATER_STEP);
+            sources[source_count] = s.center.extend(s.radius.max(0.5)).extend(s.rate * step);
             source_count += 1;
         }
         buffers.water.params.set(WaterParams {
@@ -2920,12 +3050,15 @@ fn plan_erosion_frame(
             pad_offset,
             grid_size: finest_size,
             clear: u32::from(clear),
-            evaporation: 1.0 - (1.0 - water.evaporation.clamp(0.0, 0.999)).powf(WATER_STEP),
             capacity: water.sediment_capacity,
             sea_level,
-            rain: water.rainfall * WATER_STEP,
-            step_seconds: WATER_STEP,
+            rain: water.net_rain(&scale) * step,
+            step_seconds: step,
             bed_load: u32::from(water.bed_load.live || refining),
+            wet_depth: WET_DEPTH / CELLS_PER_HEIGHT,
+            full_depth: FULL_DEPTH / CELLS_PER_HEIGHT,
+            capacity_steps: step / CAPACITY_STEP,
+            solver_seconds: water.solver_seconds(&scale),
             source_count: source_count as u32,
             sources,
         });
@@ -2941,9 +3074,9 @@ fn plan_erosion_frame(
             // One step so a brush stroke still shows.
             1
         } else {
-            state.water_time += water.dt;
-            let steps = ((state.water_time / WATER_STEP) as u32).min(MAX_WATER_STEPS);
-            state.water_time = (state.water_time - steps as f32 * WATER_STEP).min(WATER_STEP);
+            state.water_time += water.dt * water.time_scale.max(0.0);
+            let steps = ((state.water_time / step) as u32).min(MAX_WATER_STEPS);
+            state.water_time = (state.water_time - steps as f32 * step).min(step);
             steps
         };
         let bed_load = &water.bed_load;
@@ -2958,19 +3091,22 @@ fn plan_erosion_frame(
             size: params.map_size,
             pad_offset,
             grid_size: finest_size,
-            step_seconds: WATER_STEP,
-            frame_seconds: steps as f32 * WATER_STEP,
+            step_seconds: step,
+            frame_seconds: steps as f32 * step,
             discharge_time: DISCHARGE_TIME,
             ktt_scale: KTT_DISCHARGE_SCALE,
             ktt_vector: u32::from(params.do_rivers != 0 && params.momentum_coherence > 0.0),
             sea_level,
-            manning_n: water.manning_n,
-            grain: bed_load.grain,
-            bed_load_k: bed_load.k,
+            manning_n: water.manning_cells(&scale),
+            wet_depth: WET_DEPTH / CELLS_PER_HEIGHT,
+            full_depth: FULL_DEPTH / CELLS_PER_HEIGHT,
+            min_speed: scale.texels(MIN_SPEED),
+            grain: bed_load.grain_cells(&scale),
+            bed_load_k: bed_load.k_cells(water.gravity, &scale),
             critical_shields: bed_load.critical_shields,
             slope_effect: bed_load.slope_effect,
             helical_strength: bed_load.helical_strength,
-            helical_length: HELICAL_LENGTH,
+            helical_length: scale.texels(HELICAL_LENGTH),
             mor_fac,
             parity: state.helical_parity,
             use_bedrock: params.use_bedrock,
@@ -2981,16 +3117,18 @@ fn plan_erosion_frame(
             .morpho_params
             .write_buffer(&render_device, &queue);
         if swe && let Some(solver) = &buffers.water.swe.solver {
+            let unit = water.solver_seconds(&scale);
             // Sources, sinks and the map border come in through `swe_export`, so the borders
             // stay closed walls. The overshoot limiter is off: it does not conserve water.
             solver.write_settings(
                 &queue,
                 &ShallowWaterSettings {
-                    dt: WATER_STEP,
+                    // In the solver's time unit (see `LIMITER_DEPTH`).
+                    dt: step / unit,
                     cell_size: 1.0,
-                    gravity: water.gravity.max(1.0),
-                    manning_n: water.manning_n,
-                    evaporation: -(1.0 - water.evaporation.clamp(0.0, 0.999)).ln(),
+                    gravity: water.gravity_cells(&scale) * unit * unit,
+                    manning_n: water.manning_cells(&scale) / unit,
+                    evaporation: 0.0,
                     overshoot_limiter: false,
                     second_order_depth: water.second_order_depth,
                     ..default()
@@ -3033,6 +3171,11 @@ fn plan_erosion_frame(
         river_depth: bed.river_depth,
         river_width: bed.river_width,
         channel_discharge: bed.channel_discharge,
+        domain_depth: scale.heights(DOMAIN_DEPTH),
+        wet_depth: WET_DEPTH / CELLS_PER_HEIGHT,
+        still_speed: scale.texels(STILL_SPEED),
+        river_speed: scale.texels(RIVER_SPEED),
+        reference_discharge: REFERENCE_DISCHARGE,
     };
     let offsets = [0, 1].map(|parity| buffers.water.bed_params.push(&bed_params(parity)));
     if water.shape_generation != state.last_shape && finest_ready {
@@ -3109,6 +3252,8 @@ fn plan_erosion_frame(
             granularity_strength: 0.0,
             padded_size: UVec2::ONE,
             pad_offset: UVec2::ZERO,
+            wet_depth: 0.0,
+            full_depth: 1.0,
         });
     }
     buffers.params.write_buffer(&render_device, &queue);

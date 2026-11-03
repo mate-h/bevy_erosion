@@ -170,10 +170,10 @@ enum ErosionSliderFieldKind {
     BrushRadius,
     BrushStrength,
     WaterErosion,
-    WaterEvaporation,
+    WaterInfiltration,
     WaterRainfall,
     WaterManning,
-    WaterGravity,
+    WaterTimeScale,
     BedMaxDepth,
     BedShoreSlope,
     BedProfile,
@@ -183,13 +183,13 @@ enum ErosionSliderFieldKind {
     BedRiverWidth,
     BedChannelDischarge,
     WaterRainWater,
-    BedLoadGrain,
+    BedLoadDiameter,
     BedLoadK,
     BedLoadCriticalShields,
     BedLoadSlopeEffect,
     BedLoadHelical,
     BedLoadMorphFactor,
-    BedLoadRefineSteps,
+    BedLoadRefineHours,
     BedLoadRockHardness,
     RiverBrushDischarge,
     RiverBrushArmour,
@@ -329,12 +329,10 @@ impl ErosionSliderFieldKind {
             Self::RiverBrushBreach => brush.river.breach_depth = value,
             Self::BrushStrength => brush.strength = value,
             Self::WaterErosion => water.sediment_capacity = value,
-            // Shown in % per second.
-            Self::WaterEvaporation => water.evaporation = value / 100.0,
-            // Shown in ‰ of the map height per second.
-            Self::WaterRainfall => water.rainfall = value / 1000.0,
+            Self::WaterInfiltration => water.infiltration = value,
+            Self::WaterRainfall => water.rainfall = value,
             Self::WaterManning => water.manning_n = value,
-            Self::WaterGravity => water.gravity = value,
+            Self::WaterTimeScale => water.time_scale = value,
             Self::BedMaxDepth => water.bed.max_depth = value,
             Self::BedShoreSlope => water.bed.shore_slope = value,
             Self::BedProfile => water.bed.profile = value,
@@ -345,13 +343,14 @@ impl ErosionSliderFieldKind {
             Self::BedChannelDischarge => water.bed.channel_discharge = value,
             // Shown per thousand trail steps.
             Self::WaterRainWater => water.rain_water = value / 1000.0,
-            Self::BedLoadGrain => water.bed_load.grain = value,
+            // Shown in mm.
+            Self::BedLoadDiameter => water.bed_load.diameter = value / 1000.0,
             Self::BedLoadK => water.bed_load.k = value,
             Self::BedLoadCriticalShields => water.bed_load.critical_shields = value,
             Self::BedLoadSlopeEffect => water.bed_load.slope_effect = value,
             Self::BedLoadHelical => water.bed_load.helical_strength = value,
             Self::BedLoadMorphFactor => water.bed_load.morph_factor = value,
-            Self::BedLoadRefineSteps => water.bed_load.refine_steps = value as u32,
+            Self::BedLoadRefineHours => water.bed_load.refine_hours = value,
             Self::BedLoadRockHardness => water.bed_load.rock_hardness = value,
         }
     }
@@ -367,10 +366,10 @@ impl ErosionSliderFieldKind {
                 | Self::BrushRadius
                 | Self::BrushStrength
                 | Self::WaterErosion
-                | Self::WaterEvaporation
+                | Self::WaterInfiltration
                 | Self::WaterRainfall
                 | Self::WaterManning
-                | Self::WaterGravity
+                | Self::WaterTimeScale
                 | Self::BedMaxDepth
                 | Self::BedShoreSlope
                 | Self::BedProfile
@@ -380,13 +379,13 @@ impl ErosionSliderFieldKind {
                 | Self::BedRiverWidth
                 | Self::BedChannelDischarge
                 | Self::WaterRainWater
-                | Self::BedLoadGrain
+                | Self::BedLoadDiameter
                 | Self::BedLoadK
                 | Self::BedLoadCriticalShields
                 | Self::BedLoadSlopeEffect
                 | Self::BedLoadHelical
                 | Self::BedLoadMorphFactor
-                | Self::BedLoadRefineSteps
+                | Self::BedLoadRefineHours
                 | Self::BedLoadRockHardness
                 // New rivers take the discharge; armour re-sends the existing beds.
                 | Self::RiverBrushDischarge
@@ -400,8 +399,7 @@ impl ErosionSliderFieldKind {
             Self::RidgeErosionSteps
                 | Self::NoiseSeed
                 | Self::IterationsPerFrame
-                | Self::WaterGravity
-                | Self::BedLoadRefineSteps
+                | Self::WaterTimeScale
         )
     }
 }
@@ -874,9 +872,9 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl, world: WorldScale)
                     @section("Water", true, bsn_list! {
                         @slider_row(world, "Erosion", 0.0, 0.01, water.sediment_capacity, ErosionSliderFieldKind::WaterErosion)
                         --
-                        @slider_row(world, "Evaporation %/s", 0.0, 10.0, water.evaporation * 100.0, ErosionSliderFieldKind::WaterEvaporation)
+                        @slider_row(world, "Infiltration (mm/h)", 0.0, 50.0, water.infiltration, ErosionSliderFieldKind::WaterInfiltration)
                         --
-                        @slider_row(world, "Rainfall ‰/s", 0.0, 1.0, water.rainfall * 1000.0, ErosionSliderFieldKind::WaterRainfall)
+                        @slider_row(world, "Rainfall (mm/h)", 0.0, 200.0, water.rainfall, ErosionSliderFieldKind::WaterRainfall)
                         --
                         @slider_row(world, "Rain Water (per 1000 trail steps)", 0.0, 2.0, water.rain_water * 1000.0, ErosionSliderFieldKind::WaterRainWater)
                         --
@@ -884,9 +882,9 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl, world: WorldScale)
                         --
                         @toggle_row("Second-Order Depth Flux", ToggleKind::SecondOrderDepth)
                         --
-                        @slider_row(world, "Bed Friction (Manning n)", 0.002, 0.1, water.manning_n, ErosionSliderFieldKind::WaterManning)
+                        @slider_row(world, "Manning n (s/m^⅓)", 0.01, 0.3, water.manning_n, ErosionSliderFieldKind::WaterManning)
                         --
-                        @slider_row(world, "Gravity (cells/s²)", 250.0, 8000.0, water.gravity, ErosionSliderFieldKind::WaterGravity)
+                        @slider_row(world, "Time Scale (×)", 1.0, 500.0, water.time_scale, ErosionSliderFieldKind::WaterTimeScale)
                         --
                         @note_text("Springs: 0")
                         SpringCountText
@@ -948,9 +946,9 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl, world: WorldScale)
                             water.refine_generation = water.refine_generation.wrapping_add(1);
                         })
                         --
-                        @slider_row(world, "Grain", 0.02, 2.0, water.bed_load.grain, ErosionSliderFieldKind::BedLoadGrain)
+                        @slider_row(world, "Grain Size (mm)", 0.5, 2000.0, water.bed_load.diameter * 1000.0, ErosionSliderFieldKind::BedLoadDiameter)
                         --
-                        @slider_row(world, "Bed Load K", 0.0, 20.0, water.bed_load.k, ErosionSliderFieldKind::BedLoadK)
+                        @slider_row(world, "Bed Load K (Wong-Parker 3.97)", 0.0, 20.0, water.bed_load.k, ErosionSliderFieldKind::BedLoadK)
                         --
                         @slider_row(world, "Critical Shields", 0.0, 0.2, water.bed_load.critical_shields, ErosionSliderFieldKind::BedLoadCriticalShields)
                         --
@@ -962,7 +960,7 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl, world: WorldScale)
                         --
                         @slider_row(world, "Morph. Factor", 1.0, 100.0, water.bed_load.morph_factor, ErosionSliderFieldKind::BedLoadMorphFactor)
                         --
-                        @slider_row(world, "Refine Steps", 50.0, 4000.0, water.bed_load.refine_steps as f32, ErosionSliderFieldKind::BedLoadRefineSteps)
+                        @slider_row(world, "Refine (h of flow)", 0.01, 5.0, water.bed_load.refine_hours, ErosionSliderFieldKind::BedLoadRefineHours)
                     })
                     })
                     --

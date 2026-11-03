@@ -18,17 +18,12 @@
 
 const HEIGHT_SCALE: f32 = 1000000.0;
 const CELLS_PER_HEIGHT: f32 = 100.0;
-// Must match `water.wgsl`.
-const WET_DEPTH: f32 = 0.0005;
-const FULL_DEPTH: f32 = 0.004;
 // Most of the shallower side's depth one face may move per step (keeps a large morphological
 // factor from emptying a cell in one step; four faces can take at most 40%).
 const MAX_FACE_CUT: f32 = 0.1;
 // Largest helical flow deflection of the bed load (radians) and streamline curvature (1/texel).
 const MAX_DEFLECTION: f32 = 0.5;
 const MAX_CURVATURE: f32 = 0.3;
-// Speed (cells per second) below which water has no direction for the bed load or curvature.
-const MIN_SPEED: f32 = 0.05;
 
 struct MorphoParams {
     size: vec2<u32>,
@@ -44,7 +39,13 @@ struct MorphoParams {
     // KTT keeps a momentum vector (momentum coherence on) instead of a scalar in `mx`.
     ktt_vector: u32,
     sea_level: f32,
+    // Manning n in cells (n · dx^(1/3)).
     manning_n: f32,
+    // Dry and fully wet depths (height units), as in `water.wgsl`.
+    wet_depth: f32,
+    full_depth: f32,
+    // Speed (cells per second) below which water has no direction for the bed load or curvature.
+    min_speed: f32,
     // Submerged grain weight (R·D, cells) in θ = n²|u|² / (grain · h^(1/3)).
     grain: f32,
     bed_load_k: f32,
@@ -180,7 +181,7 @@ fn sample_helical(pos: vec2<f32>, slot: u32) -> f32 {
 // (counter-clockwise), toward the inner bank of the bend.
 fn curvature(p: vec2<i32>, u: vec2<f32>) -> f32 {
     let speed = length(u);
-    if (speed < MIN_SPEED) { return 0.0; }
+    if (speed < params.min_speed) { return 0.0; }
     let dudx = 0.5 * (flow(clamp_map(p + DIRS[1])) - flow(clamp_map(p + DIRS[0])));
     let dudy = 0.5 * (flow(clamp_map(p + DIRS[3])) - flow(clamp_map(p + DIRS[2])));
     let a = u.x * dudx + u.y * dudy;
@@ -198,7 +199,7 @@ fn morpho_helical(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dst = 1u - params.parity;
     let i = widx(p);
     let h = depth[i];
-    if (h < WET_DEPTH) {
+    if (h < params.wet_depth) {
         state[4u * i + dst] = 0.0;
         return;
     }
@@ -224,7 +225,7 @@ fn face_load(a: vec2<i32>, e: vec2<i32>) -> f32 {
     if (!inside(b)) { return 0.0; }
     let ha = depth[widx(a)];
     let hb = depth[widx(b)];
-    if (min(ha, hb) < WET_DEPTH) { return 0.0; }
+    if (min(ha, hb) < params.wet_depth) { return 0.0; }
     let ua = flow(a);
     let ub = flow(b);
     let downwind = dot(ua + ub, vec2<f32>(e)) >= 0.0;
@@ -232,10 +233,10 @@ fn face_load(a: vec2<i32>, e: vec2<i32>) -> f32 {
     let h = select(hb, ha, downwind);
     let u = select(ub, ua, downwind);
     // Thin sheet flow keeps the capacity model of `water_erode`.
-    let w = smoothstep(0.5 * FULL_DEPTH, FULL_DEPTH, h);
+    let w = smoothstep(0.5 * params.full_depth, params.full_depth, h);
     if (w <= 0.0) { return 0.0; }
     let speed = length(u);
-    if (speed < MIN_SPEED) { return 0.0; }
+    if (speed < params.min_speed) { return 0.0; }
     let h_cells = h * CELLS_PER_HEIGHT;
     let n = params.manning_n;
     let theta = n * n * speed * speed / (max(params.grain, 1e-6) * pow(h_cells, 1.0 / 3.0));

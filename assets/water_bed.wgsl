@@ -22,17 +22,6 @@
 //                  z_max = bank + slope·distance. The first ring is left alone: it sets η_ref.
 
 const HEIGHT_SCALE: f32 = 1000000.0;
-// Depth above which still water belongs to the domain (above `water.wgsl`'s WET_DEPTH, so thin
-// sheet flow on hillslopes only joins where it carries enough discharge).
-const DOMAIN_DEPTH: f32 = 0.002;
-const WET_DEPTH: f32 = 0.0005;
-// Averaged speed (texels per second) below which water counts as still (a lake) / above which it
-// is a river.
-const STILL_SPEED: f32 = 2.0;
-const RIVER_SPEED: f32 = 8.0;
-// Channel discharge (height units × texels² per second) at which rivers get `river_depth` and
-// `river_width`: about a default demo spring.
-const REFERENCE_DISCHARGE: f32 = 1.0;
 // Screened Poisson prior weight (terracraft's soft guide weight) for lakes, whose bowl prior
 // has kinks along τ's medial axis. River profiles come out of the hydraulic geometry smooth, so
 // rivers only round off their corners.
@@ -60,6 +49,18 @@ struct BedParams {
     river_depth: f32,
     river_width: f32,
     channel_discharge: f32,
+    // Depth above which still water belongs to the domain (above `water.wgsl`'s wet depth, so
+    // thin sheet flow on hillslopes only joins where it carries enough discharge), and the wet
+    // depth itself (height units).
+    domain_depth: f32,
+    wet_depth: f32,
+    // Averaged speed (texels per second) below which water counts as still (a lake) / above
+    // which it is a river.
+    still_speed: f32,
+    river_speed: f32,
+    // Channel discharge (height units × texels² per second) at which rivers get `river_depth`
+    // and `river_width`.
+    reference_discharge: f32,
 }
 
 @group(0) @binding(0) var<storage, read_write> height: array<atomic<u32>>;
@@ -100,7 +101,7 @@ fn unit_discharge(i: u32) -> f32 {
 // Lakes and channels. Shaping only deepens the water in it, so it stays the same domain.
 fn wet(p: vec2<i32>) -> bool {
     let i = widx(p);
-    return depth[i] > DOMAIN_DEPTH || unit_discharge(i) > params.channel_discharge;
+    return depth[i] > params.domain_depth || unit_discharge(i) > params.channel_discharge;
 }
 
 // Dry cell next to the domain.
@@ -116,8 +117,8 @@ fn is_bank(p: vec2<i32>) -> bool {
 // 1 for still water (lakes), 0 for rivers, from the averaged flow.
 fn stillness(i: u32) -> f32 {
     let d = discharge[i];
-    let speed = length(d.xy) / max(d.z, WET_DEPTH);
-    return 1.0 - smoothstep(STILL_SPEED, RIVER_SPEED, speed);
+    let speed = length(d.xy) / max(d.z, params.wet_depth);
+    return 1.0 - smoothstep(params.still_speed, params.river_speed, speed);
 }
 
 fn red_black(p: vec2<i32>) -> bool {
@@ -206,7 +207,7 @@ fn bed_prior(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = clamp(0.5 * sqrt(g2) / b, 0.0, 1.0);
     // Hydraulic geometry from the channel discharge. Where the flowing domain is wider than the
     // channel the discharge asks for (sheet flow), the channel takes its middle.
-    let flow = section_discharge(p) / REFERENCE_DISCHARGE;
+    let flow = section_discharge(p) / params.reference_discharge;
     let thalweg = params.river_depth * pow(flow, 0.4);
     let half_width = clamp(params.river_width * pow(flow, 0.5), 0.5, b);
     let x = min(n * b / half_width, 1.0);

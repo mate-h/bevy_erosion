@@ -18,12 +18,8 @@
 const HEIGHT_SCALE: f32 = 1000000.0;
 // dt * g * pipe area / pipe length per substep (stable below 0.25 on a 4-neighbour grid).
 const PIPE_GRAVITY: f32 = 0.2;
-// Depth below which a cell counts as dry.
-const WET_DEPTH: f32 = 0.0005;
 // How far below the terrain `water_surface` puts dry cells (height units).
 const DRY_SINK: f32 = 0.02;
-// Depth at which a cell is full outflow and flow reaches full sediment capacity.
-const FULL_DEPTH: f32 = 0.004;
 const DISSOLVE_RATE: f32 = 0.3;
 const DEPOSIT_RATE: f32 = 0.3;
 // Heights are ~1 unit over ~100 texels of rise; scale gradients to a tangent.
@@ -31,7 +27,7 @@ const SLOPE_SCALE: f32 = 100.0;
 const MIN_TILT: f32 = 0.05;
 // Height units to solver cells (the same vertical scale as `SLOPE_SCALE`).
 const CELLS_PER_HEIGHT: f32 = 100.0;
-// Most a substep may cut from one cell.
+// Most a capacity step (`WaterParams::capacity_steps`) may cut from one cell.
 const MAX_CUT: f32 = 0.0001;
 // Bank slumping in and next to water: height step per texel above which material slides down,
 // and the fraction of the excess moved per substep.
@@ -46,8 +42,6 @@ struct WaterParams {
     pad_offset: vec2<u32>,
     grid_size: vec2<u32>,
     clear: u32,
-    // Fraction of the depth lost per step.
-    evaporation: f32,
     capacity: f32,
     sea_level: f32,
     // Depth added everywhere per step.
@@ -56,6 +50,14 @@ struct WaterParams {
     step_seconds: f32,
     // Bed load runs (`water_morpho.wgsl`): the capacity model only erodes thin sheet flow.
     bed_load: u32,
+    // Depth below which a cell counts as dry, and at which it is full outflow and flow reaches
+    // full sediment capacity (height units).
+    wet_depth: f32,
+    full_depth: f32,
+    // Capacity-model steps (0.1 s each) per solver step: its rates are per capacity step.
+    capacity_steps: f32,
+    // Seconds per time unit of bevy_fft's solver: its sources and velocities are in this unit.
+    solver_seconds: f32,
     source_count: u32,
     // Springs and the brush: xy = disc center (texels), z = radius, w = depth per step at the
     // center (negative removes water).
@@ -184,14 +186,14 @@ fn water_depth(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (inside(p + DIRS[3])) { fin.w = flux[widx(p + DIRS[3])].z; }
     let d_old = depth[i];
     var d = d_old + (fin.x + fin.y + fin.z + fin.w) - (f.x + f.y + f.z + f.w);
-    d = max(d + source_depth(p), 0.0) * (1.0 - params.evaporation);
+    d = max(d + source_depth(p), 0.0);
     let ground = terrain(p);
     if (is_ocean(ground)) {
         d = 0.0;
     }
     depth[i] = d;
 
-    let mean_depth = max(0.5 * (d + d_old), WET_DEPTH);
+    let mean_depth = max(0.5 * (d + d_old), params.wet_depth);
     var v = vec2<f32>(fin.x - f.x + f.y - fin.y, fin.z - f.z + f.w - fin.w) * 0.5 / mean_depth;
     let speed = length(v);
     if (speed > 1.0) {
@@ -199,13 +201,18 @@ fn water_depth(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     velocity[i] = v;
 
-    let wet = smoothstep(WET_DEPTH, FULL_DEPTH, d);
+    let wet = smoothstep(params.wet_depth, params.full_depth, d);
     let gi = gidx(p);
     var m = masks[gi];
     m.y = max(source_masks[i].y, wet);
     masks[gi] = m;
 
     textureStore(water_out, p, vec4<f32>(d, v, sediment[i]));
+}
+
+// A fraction `r` per capacity step as a fraction per solver step.
+fn per_step(r: f32) -> f32 {
+    return 1.0 - pow(1.0 - r, params.capacity_steps);
 }
 
 // Fraction of a height difference that slumps per step where the slope (height per texel)
@@ -216,7 +223,7 @@ fn slump_rate(p: vec2<i32>) -> f32 {
     let gx = terrain(clamp(p + DIRS[1], lo, hi)) - terrain(clamp(p + DIRS[0], lo, hi));
     let gy = terrain(clamp(p + DIRS[3], lo, hi)) - terrain(clamp(p + DIRS[2], lo, hi));
     let g = 0.5 * length(vec2<f32>(gx, gy));
-    return SLUMP_RATE * max(g - WET_TALUS, 0.0) / max(g, 1e-9);
+    return per_step(SLUMP_RATE) * max(g - WET_TALUS, 0.0) / max(g, 1e-9);
 }
 
 // Sediment capacity C = K * tilt * speed (Mei et al.): dissolve below capacity, deposit above.
@@ -230,11 +237,11 @@ fn water_erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = widx(p);
     let d = depth[i];
     let s = sediment[i];
-    var near_water = d >= WET_DEPTH;
+    var near_water = d >= params.wet_depth;
     var nb: array<vec2<i32>, 4>;
     for (var k = 0; k < 4; k = k + 1) {
         nb[k] = clamp(p + DIRS[k], vec2<i32>(0), vec2<i32>(params.size) - 1);
-        near_water = near_water || depth[widx(nb[k])] >= WET_DEPTH;
+        near_water = near_water || depth[widx(nb[k])] >= params.wet_depth;
     }
     if (!near_water && s == 0.0) {
         sediment_tmp[i] = 0.0;
@@ -248,20 +255,22 @@ fn water_erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     let hb = terrain(nb[3]);
     let slope = length(vec2<f32>(hr - hl, hb - ht)) * 0.5 * SLOPE_SCALE;
     let tilt = max(slope / sqrt(1.0 + slope * slope), MIN_TILT);
-    var capacity = params.capacity * tilt * length(velocity[i]) * min(d / FULL_DEPTH, 1.0);
+    // Speed in texels per capacity step (`velocity` is texels per solver step).
+    let speed = length(velocity[i]) / max(params.capacity_steps, 1e-6);
+    var capacity = params.capacity * tilt * speed * min(d / params.full_depth, 1.0);
     if (params.bed_load != 0u) {
         // Deeper water moves its bed as bed load (`water_morpho.wgsl`); the capacity model fades
         // out over the same depths, so what it still carries settles there.
-        capacity *= 1.0 - smoothstep(0.5 * FULL_DEPTH, FULL_DEPTH, d);
+        capacity *= 1.0 - smoothstep(0.5 * params.full_depth, params.full_depth, d);
     }
 
     // Positive dh deposits onto the terrain, negative dissolves it.
-    var dh = DEPOSIT_RATE * (s - capacity);
+    var dh = per_step(DEPOSIT_RATE) * (s - capacity);
     if (capacity > s) {
-        dh = -min(DISSOLVE_RATE * (capacity - s), MAX_CUT);
+        dh = -min(per_step(DISSOLVE_RATE) * (capacity - s), MAX_CUT * params.capacity_steps);
     }
-    if (d < WET_DEPTH) {
-        dh = DEPOSIT_RATE * s; // drying out: settle what is left
+    if (d < params.wet_depth) {
+        dh = per_step(DEPOSIT_RATE) * s; // drying out: settle what is left
     }
     let from_sediment = dh;
 
@@ -269,13 +278,13 @@ fn water_erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     // from the full slope, so it acts across the slope as well as down it; thresholding each
     // neighbour pair instead smoothed only along the grid axis nearest the fall line and drew
     // the runoff out into axis-aligned stripes. Only banks of real water slump (either side at
-    // least `FULL_DEPTH` deep): thin sheet runoff on slopes steeper than the talus would
+    // least the full depth deep): thin sheet runoff on slopes steeper than the talus would
     // otherwise flatten whole hillsides. Both sides use the same mean rate, so the exchange is
     // conserved.
     let rate = slump_rate(p);
     for (var k = 0; k < 4; k = k + 1) {
         let q = nb[k];
-        if (all(q == p) || (d < FULL_DEPTH && depth[widx(q)] < FULL_DEPTH)) {
+        if (all(q == p) || (d < params.full_depth && depth[widx(q)] < params.full_depth)) {
             continue;
         }
         dh += 0.5 * (rate + slump_rate(q)) * (terrain(q) - ground) * 0.25;
@@ -331,7 +340,7 @@ fn swe_export(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(swe_bed, p, vec4<f32>(ground * CELLS_PER_HEIGHT, 0.0, 0.0, 0.0));
     let edge = any(p == vec2<i32>(0)) || any(p == vec2<i32>(params.size) - 1);
     let sink = select(0.0, 1.0, edge || is_ocean(ground));
-    let rate = source_depth(p) / params.step_seconds * CELLS_PER_HEIGHT;
+    let rate = source_depth(p) / params.step_seconds * CELLS_PER_HEIGHT * params.solver_seconds;
     textureStore(swe_source, p, vec4<f32>(rate, sink, 0.0, 0.0));
 }
 
@@ -344,14 +353,14 @@ fn swe_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = widx(p);
     let d = textureLoad(swe_water, p).y / CELLS_PER_HEIGHT;
     depth[i] = d;
-    var v = textureLoad(swe_velocity, p, 0).xy * params.step_seconds;
+    var v = textureLoad(swe_velocity, p, 0).xy * (params.step_seconds / params.solver_seconds);
     let speed = length(v);
     if (speed > 1.0) {
         v /= speed;
     }
     velocity[i] = v;
 
-    let wet = smoothstep(WET_DEPTH, FULL_DEPTH, d);
+    let wet = smoothstep(params.wet_depth, params.full_depth, d);
     let gi = gidx(p);
     var m = masks[gi];
     m.y = max(source_masks[i].y, wet);
@@ -386,7 +395,7 @@ fn water_surface(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     // Dry cells sit below the terrain, so the water surface dives under its banks and the
     // terrain hides it (and depth-tests it away) instead of covering dry ground.
-    let bed = select(ground, ground - DRY_SINK, d < WET_DEPTH);
+    let bed = select(ground, ground - DRY_SINK, d < params.wet_depth);
     textureStore(surface_out, p, vec4<f32>(bed, d, 0.0, 0.0));
     textureStore(surface_velocity_out, p, vec4<f32>(v, 0.0, 0.0));
 }

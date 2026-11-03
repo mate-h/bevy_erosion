@@ -12,7 +12,7 @@
 //! re-filtering the environment map every frame. `EROSION_BENCH_POUR=x,y` places a spring at
 //! texel (x, y) and moves the camera close to it or to the river's source (or to `EROSION_BENCH_TARGET=x,y`;
 //! `EROSION_BENCH_DISTANCE`, `_PITCH` and `_YAW`,
-//! in degrees, frame it), and `EROSION_BENCH_RAIN=<‰/s>` rains on the whole map, `EROSION_BENCH_RIVER=x,y` places a river from texel (x, y). `EROSION_VIEW=<view>` starts in a debug view (see the View tab). `EROSION_BENCH_SCREENSHOT=<path>` hides the settings panel (kept with `EROSION_BENCH_PANEL=1`) and saves
+//! in degrees, frame it), and `EROSION_BENCH_RAIN=<mm/h>` rains on the whole map, `EROSION_BENCH_RIVER=x,y` places a river from texel (x, y). `EROSION_VIEW=<view>` starts in a debug view (see the View tab). `EROSION_BENCH_SCREENSHOT=<path>` hides the settings panel (kept with `EROSION_BENCH_PANEL=1`) and saves
 //! the window just before the bench quits.
 
 use bevy::camera::visibility::NoFrustumCulling;
@@ -61,9 +61,6 @@ use std::sync::{
 const MAP_SIZE: UVec2 = UVec2::new(512, 512);
 // Controls how much to under-expose (in F-stops). Negative values = under-expose, positive = over-expose
 const UNDER_EXPOSURE_AMOUNT: f32 = -2.0;
-/// Water shallower than this (height units) is not drawn, so the terrain shows on dry ground and
-/// under thin films: `WET_DEPTH` in `water.wgsl`.
-const DRY_DEPTH: f32 = 0.0005;
 /// Width of the scene the camera, shadow and framing distances below were tuned for (world
 /// units); they scale with the map's width in metres.
 const TUNED_WIDTH: f32 = 256.0;
@@ -284,7 +281,7 @@ fn log_frame_times(
             water.springs.push(Spring {
                 center,
                 radius: 12.0,
-                rate: 0.007,
+                rate: 0.007 / LEGACY_SECONDS,
             });
         }
         // `x,y` in texels: pour there and look at it from close by.
@@ -292,7 +289,7 @@ fn log_frame_times(
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
         {
-            water.rainfall = rain / 1000.0;
+            water.rainfall = rain;
         }
         let texel = |name: &str| {
             let v = std::env::var(name).ok()?;
@@ -311,7 +308,7 @@ fn log_frame_times(
             water.springs.push(Spring {
                 center: at,
                 radius: 8.0,
-                rate: 0.05,
+                rate: 0.05 / LEGACY_SECONDS,
             });
         }
         // Look at the pour or the river's source from close by.
@@ -418,7 +415,8 @@ fn spawn_terrain(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
-    mut water_materials: ResMut<Assets<WaterSurfaceMaterial>>,
+    // Only there with bevy_fft's `WaterPlugin`, which the simple mode leaves out.
+    water_materials: Option<ResMut<Assets<WaterSurfaceMaterial>>>,
     mut compensation_curves: ResMut<Assets<AutoExposureCompensationCurve>>,
     mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
     erosion_images: Res<ErosionImages>,
@@ -452,7 +450,7 @@ fn spawn_terrain(
         extension: TerrainExtension::new(&erosion_images, height_scale),
     });
 
-    if !simple_mode() {
+    if let Some(mut water_materials) = water_materials {
         commands.spawn(water_heightfield(
             &erosion_images,
             config.map_size,
@@ -480,7 +478,9 @@ fn spawn_terrain(
                         ..WaterOpticsUniform::jerlov(JerlovWaterType::Coastal3)
                     },
                     settings: WaterSurfaceUniform {
-                        dry_depth: DRY_DEPTH * height_scale,
+                        // Water shallower than the solver's wet depth is not drawn, so the
+                        // terrain shows on dry ground and under thin films.
+                        dry_depth: WET_DEPTH * scale.metres_per_texel,
                         ..WaterSurfaceExtension::default().settings
                     },
                     ..default()

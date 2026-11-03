@@ -20,7 +20,7 @@
 
 use crate::{
     BrushStroke, ErodeParams, ErosionConfig, ErosionImages, MAX_SPRINGS, ResetSim, Spring,
-    WaterControl,
+    WaterControl, WorldScale,
     camera::OrbitController,
     camera::OrbitInputBlocked,
     river::{self, RiverBed, RiverSettings, Rivers},
@@ -61,8 +61,8 @@ const RAIN_STARTS_PER_SECOND: f32 = 2.0;
 /// Rain dispatches per frame (one ridge-biased, one flow-biased, like the cascade alternates).
 const RAIN_PASSES: u32 = 2;
 
-/// Water depth poured per second at the brush center at strength 1 (height units).
-const WATER_DEPTH_PER_SECOND: f32 = 0.02;
+/// Water depth poured per simulated second at the brush center at strength 1 (m).
+const WATER_DEPTH_PER_SECOND: f32 = 0.45;
 /// Terrain raise / lower per second at strength 1 (height units).
 const TERRAIN_HEIGHT_PER_SECOND: f32 = 0.1;
 /// Flatten / smooth weight gained per second at strength 1.
@@ -537,6 +537,7 @@ fn paint_water(
     erosion_images: Option<Res<ErosionImages>>,
     mut images: ResMut<Assets<Image>>,
     mut reset: ResMut<ResetSim>,
+    scale: Res<WorldScale>,
 ) {
     let Some(erosion_images) = erosion_images else {
         return;
@@ -560,7 +561,7 @@ fn paint_water(
         water.clear_generation = water.clear_generation.wrapping_add(1);
         water.springs.clear();
     }
-    let pour = brush.strength * WATER_DEPTH_PER_SECOND;
+    let pour = brush.strength * scale.heights(WATER_DEPTH_PER_SECOND);
     if can_paint
         && alt
         && brush.mode == BrushMode::WaterBody

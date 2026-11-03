@@ -28,10 +28,69 @@ use std::{
 
 const N: u32 = 256;
 const FPS: f32 = 60.0;
-/// Solver step in seconds (`WATER_STEP`): velocities in the water texture are texels per step.
-const STEP: f32 = 1.0 / 480.0;
-/// Height units to solver cells (`CELLS_PER_HEIGHT` in `water.wgsl`).
-const CELLS_PER_HEIGHT: f32 = 100.0;
+/// Simulated seconds per test second: the harness runs the water at the time stretch of the old
+/// solver seconds (`LEGACY_SECONDS`), so the tests' durations and rates (written per old
+/// second) keep their meaning. Rates are divided by it on the way in.
+const TIME: f32 = LEGACY_SECONDS;
+
+/// The default map scale (10 m texels).
+fn scale() -> WorldScale {
+    WorldScale::default()
+}
+
+/// Solver step in seconds: velocities in the water texture are texels per step.
+fn step() -> f32 {
+    WaterControl::default().step_seconds(&scale())
+}
+
+/// Gravity in cells per test second² (velocities are read in texels per test second).
+fn g_cells() -> f32 {
+    WaterControl::default().gravity_cells(&scale()) * TIME * TIME
+}
+
+/// Manning n the harness runs at, in cells and test seconds (u = h^(2/3) S^(1/2) / n in texels
+/// per test second): the old solver's default, so these checks hold the SI solver to the old
+/// one. It is n ≈ 0.21 in SI, rougher than the app's default.
+const OLD_N: f32 = 0.01;
+
+fn n_cells() -> f32 {
+    OLD_N
+}
+
+/// The old solver's bed load: grain R·D = 0.25 cells, K = 4 cells² per test second, θ_c 0.047.
+fn old_bed_load() -> BedLoad {
+    let unit = BedLoad {
+        diameter: 0.25 * scale().metres_per_texel / SUBMERGED_DENSITY,
+        k: 1.0,
+        critical_shields: 0.047,
+        ..default()
+    };
+    BedLoad {
+        k: 4.0 / TIME / unit.k_cells(GRAVITY, &scale()),
+        ..unit
+    }
+}
+
+/// Grain R·D in cells.
+fn grain_cells() -> f32 {
+    old_bed_load().grain_cells(&scale())
+}
+
+/// Refine time that runs `steps` water steps.
+fn refine_hours(steps: u32) -> f32 {
+    steps as f32 * step() * BedLoad::default().morph_factor / 3600.0
+}
+
+/// Manning n (SI) whose flow matches cell-unit roughness `n` of the old solver (g = 2000
+/// cells/s²): Froude-similar at the [`TIME`] stretch.
+fn manning_from_old(n: f32) -> f32 {
+    n * TIME / scale().metres_per_texel.cbrt()
+}
+
+/// Rain of `rate` height units per simulated second, in mm per hour.
+fn mm_per_hour(rate: f32) -> f32 {
+    rate * scale().metres_per_height() * 3.6e6
+}
 
 fn f16_to_f32(h: u16) -> f32 {
     let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
@@ -45,7 +104,7 @@ fn f16_to_f32(h: u16) -> f32 {
     }
 }
 
-/// One texel of the water texture: depth (height units), velocity (texels per second).
+/// One texel of the water texture: depth (height units), velocity (texels per test second).
 #[derive(Clone, Copy, Default)]
 struct Water {
     depth: f32,
@@ -108,7 +167,13 @@ impl Harness {
         {
             let mut water = h.app.world_mut().resource_mut::<WaterControl>();
             water.solver = solver;
-            water.evaporation = 0.0;
+            water.infiltration = 0.0;
+            water.time_scale = TIME;
+            water.manning_n = manning_from_old(OLD_N);
+            water.bed_load = BedLoad {
+                live: false,
+                ..old_bed_load()
+            };
             water.sediment_capacity = 0.0;
             water.bed_load.live = false;
             if let Some(g) = std::env::var("TEST_GRAVITY")
@@ -121,7 +186,7 @@ impl Harness {
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
-                water.manning_n = n;
+                water.manning_n = manning_from_old(n);
             }
         }
         h.settle_cascade();
@@ -266,9 +331,13 @@ impl Harness {
     }
 
     /// The shared discharge field ([`WaterFields::discharge`]).
+    /// Unit discharges (`xy`, and KTT's in `w`) are per test second.
     fn read_discharge(&mut self) -> Vec<Vec4> {
         let handle = self.app.world().resource::<WaterFields>().discharge.clone();
         self.read_vec4(handle)
+            .into_iter()
+            .map(|v| v * Vec4::new(TIME, TIME, 1.0, TIME))
+            .collect()
     }
 
     /// Simulated frames per second from now on.
@@ -295,7 +364,7 @@ impl Harness {
             .iter()
             .map(|t| Water {
                 depth: t[0],
-                velocity: Vec2::new(t[1], t[2]) / STEP,
+                velocity: Vec2::new(t[1], t[2]) / step() * TIME,
             })
             .collect()
     }
@@ -312,7 +381,7 @@ impl Harness {
             water.stroke_active = true;
             water.center = center;
             water.radius = radius;
-            water.rate = rate;
+            water.rate = rate / TIME;
         }
         self.run(seconds);
         self.water().stroke_active = false;
@@ -383,8 +452,10 @@ fn dam_break_spreads_symmetrically() {
     assert!(reach as f32 > radius + 4.0, "the mound did not spread");
     assert!(mirror < 0.02 * peak, "mirror asymmetry {mirror}");
     assert!(diagonal < 0.02 * peak, "diagonal asymmetry {diagonal}");
+    // Up to one solver step of the pour is still waiting in the time accumulator.
+    let pending = step() / (time * TIME);
     assert!(
-        (volume - added).abs() < 0.01 * added,
+        (volume - added).abs() < (0.01 + pending) * added,
         "volume {volume} of {added}"
     );
 }
@@ -399,12 +470,12 @@ fn flume_follows_manning() {
     let mut h = Harness::new(WaterSolver::Swe, bed);
     assert_bed(&h.read_heights(), bed);
 
-    let n = h.water().manning_n;
+    let n = n_cells();
     let s = slope * CELLS_PER_HEIGHT;
     // Rain for a sheet about 0.3 cells deep in the middle of the plane.
     let q_mid = 0.3f32.powf(5.0 / 3.0) * s.sqrt() / n;
     let rain = q_mid / (CELLS_PER_HEIGHT * (N / 2) as f32);
-    h.water().rainfall = rain;
+    h.water().rainfall = mm_per_hour(rain / TIME);
     // Long enough for water from the top edge to reach the middle and settle.
     let u_mid = 0.3f32.powf(2.0 / 3.0) * s.sqrt() / n;
     let settle = (3.0 * (N / 2) as f32 / u_mid).min(90.0);
@@ -468,7 +539,7 @@ fn lake_jet(solver: WaterSolver) -> [f32; 5] {
     h.water().springs.push(Spring {
         center: Vec2::new(24.0, 128.0),
         radius: 6.0,
-        rate: 0.05,
+        rate: 0.05 / TIME,
     });
     h.run(12.0);
     let water = h.read_water();
@@ -654,7 +725,7 @@ fn ridge_runoff_leaves_the_flanks_alone() {
             .iter()
             .map(|w| {
                 let hc = (w.depth * CELLS_PER_HEIGHT).max(1e-4);
-                w.velocity.length() / (h.app.world().resource::<WaterControl>().gravity * hc).sqrt()
+                w.velocity.length() / (g_cells() * hc).sqrt()
             })
             .filter(|f| f.is_finite())
             .fold(0.0f32, f32::max);
@@ -782,7 +853,7 @@ fn natural_ridge_pour_images() {
         water.stroke_active = true;
         water.center = Vec2::new(cx as f32, cy as f32);
         water.radius = 8.0;
-        water.rate = 0.05;
+        water.rate = 0.05 / TIME;
     }
     let pour_seconds = std::env::var("TEST_POUR_SECONDS")
         .ok()
@@ -949,7 +1020,7 @@ fn shape_beds_converges() {
     h.water().springs.push(Spring {
         center: Vec2::new(24.0, N as f32 / 2.0),
         radius: 6.0,
-        rate: 0.05,
+        rate: 0.05 / TIME,
     });
     h.run(40.0);
     let q = h.read_discharge();
@@ -1091,7 +1162,7 @@ fn discharge_matches_ktt() {
     h.water().springs.push(Spring {
         center: Vec2::new(at.0 as f32, at.1 as f32),
         radius: 6.0,
-        rate: 0.05,
+        rate: 0.05 / TIME,
     });
     h.run(20.0);
     let d = h.read_discharge();
@@ -1171,7 +1242,7 @@ fn run_flume(bed: impl Fn(u32, u32) -> f32, radius: f32, rate: f32, seconds: f32
         water.springs.push(Spring {
             center: Vec2::new(12.0, N as f32 / 2.0),
             radius,
-            rate,
+            rate: rate / TIME,
         });
     }
     // Let the flow reach the far end before the bed starts to count.
@@ -1184,7 +1255,7 @@ fn run_flume(bed: impl Fn(u32, u32) -> f32, radius: f32, rate: f32, seconds: f32
         .ok()
         .and_then(|v| v.parse().ok())
     {
-        h.water().bed_load.refine_steps = steps;
+        h.water().bed_load.refine_hours = refine_hours(steps);
         {
             let mut water = h.water();
             water.refine_generation = water.refine_generation.wrapping_add(1);
@@ -1251,7 +1322,7 @@ fn dominant_period(v: &[f32]) -> (f32, f32, f32, f32) {
 #[ignore = "needs a graphics adapter"]
 fn bed_load_on_flumes() {
     let mid = N / 2;
-    let g = WaterControl::default().gravity;
+    let g = g_cells();
     for (name, slope, width) in [
         ("gentle", 0.0003, 20.0f32),
         ("steep", 0.004, 20.0),
@@ -1314,8 +1385,8 @@ fn bed_load_on_flumes() {
         let hc = w.depth * CELLS_PER_HEIGHT;
         let froude = w.velocity.length() / (g * hc.max(1e-4)).sqrt();
         let theta = {
-            let n = WaterControl::default().manning_n;
-            let grain = BedLoad::default().grain;
+            let n = n_cells();
+            let grain = grain_cells();
             n * n * w.velocity.length().powi(2) / (grain * hc.max(1e-4).cbrt())
         };
         println!(
@@ -1451,7 +1522,7 @@ fn apex_scour(helical: f32) -> Vec<f32> {
                 N as f32 / 2.0 + 24.0 * (2.0 * PI * 10.0 / 128.0).sin(),
             ),
             radius: 6.0,
-            rate: 0.05,
+            rate: 0.05 / TIME,
         });
     }
     h.run(6.0);
@@ -1525,11 +1596,11 @@ fn refine_fast_forwards_the_bed() {
             N as f32 / 2.0 + 24.0 * (2.0 * PI * 10.0 / 128.0).sin(),
         ),
         radius: 6.0,
-        rate: 0.05,
+        rate: 0.05 / TIME,
     });
     h.run(6.0);
     let start = h.read_heights();
-    let steps = BedLoad::default().refine_steps;
+    let steps = BedLoad::default().refine_steps(step());
     // Live: the same number of steps (8 per frame at 60 fps).
     h.water().bed_load.live = true;
     for _ in 0..steps / 8 {
@@ -1698,7 +1769,7 @@ fn trail_cut_along_stream(steer: bool) -> (f32, f32) {
     h.water().springs.push(Spring {
         center: Vec2::new(24.0, N as f32 / 2.0),
         radius: 4.0,
-        rate: 0.05,
+        rate: 0.05 / TIME,
     });
     h.run(6.0);
     {
@@ -1766,7 +1837,7 @@ fn flume_cut(slope: f32, setup: impl Fn(&mut ErodeParams), hardness: f32) -> (f3
         water.springs.push(Spring {
             center: Vec2::new(12.0, N as f32 / 2.0),
             radius: 6.0,
-            rate: 0.05,
+            rate: 0.05 / TIME,
         });
     }
     h.run(6.0);
@@ -1869,19 +1940,19 @@ fn validate_roll_wave_onset() {
         "roll_waves",
         "manning_n,depth_cells,speed,froude,depth_cv,cv_upstream,cv_downstream",
     );
-    let g = WaterControl::default().gravity;
+    let g = g_cells();
     let mid = N / 2;
     for n in [
         0.016, 0.012, 0.0095, 0.008, 0.007, 0.006, 0.005, 0.0042, 0.0035, 0.0028, 0.0022, 0.0017,
         0.0013,
     ] {
         let mut h = Harness::new(WaterSolver::Swe, flume(0.002, 24.0));
-        h.water().manning_n = n;
+        h.water().manning_n = manning_from_old(n);
         h.water().second_order_depth = std::env::var("TEST_SECOND_ORDER").is_ok();
         h.water().springs.push(Spring {
             center: Vec2::new(12.0, N as f32 / 2.0),
             radius: 6.0,
-            rate: 0.05,
+            rate: 0.05 / TIME,
         });
         // Long enough for the front to leave the flume at the slowest flow.
         h.run(25.0);
@@ -1969,7 +2040,7 @@ fn validate_step_migration() {
         h.water().springs.push(Spring {
             center: Vec2::new(12.0, N as f32 / 2.0),
             radius: 2.0,
-            rate: 0.45,
+            rate: 0.45 / TIME,
         });
         h.run(6.0);
         let start = h.read_heights();
@@ -2028,11 +2099,11 @@ fn validate_hydraulic_geometry() {
         h.water().springs.push(Spring {
             center: Vec2::new(16.0, N as f32 / 2.0),
             radius: 6.0,
-            rate: 0.05 * factor,
+            rate: 0.05 * factor / TIME,
         });
         h.run(8.0);
         let before = h.read_heights();
-        h.water().bed_load.refine_steps = 3000;
+        h.water().bed_load.refine_hours = refine_hours(3000);
         {
             let mut water = h.water();
             water.refine_generation = water.refine_generation.wrapping_add(1);
@@ -2195,7 +2266,7 @@ fn validate_alternate_bars() {
             .sum::<f32>()
             / wet.len().max(1) as f32;
         let shields =
-            g.manning_n.powi(2) * speed * speed / (g.bed_load.grain * depth.max(1e-4).cbrt());
+            g.manning_n.powi(2) * speed * speed / (grain_cells() * depth.max(1e-4).cbrt());
         row(
             &mut f,
             &[
@@ -2222,7 +2293,7 @@ fn validate_cyclic_steps() {
         "slope_cells,depth_cells,froude,wavelength,wavelength_over_depth,relief_cells,band_share",
     );
     let mid = N / 2;
-    let g = WaterControl::default().gravity;
+    let g = g_cells();
     for slope in [0.001f32, 0.002, 0.004, 0.006, 0.009, 0.013] {
         let r = run_flume(flume(slope, 6.0), 2.0, 0.45, 25.0);
         let profile: Vec<f32> = (48..N - 24).map(|x| r.after[idx(x, mid)]).collect();
@@ -2592,7 +2663,7 @@ fn inspect_river_brush() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20.0);
-    let g = WaterControl::default().gravity;
+    let g = g_cells();
     // `TEST_RIVER_TERRAIN=valley`: a winding valley at 1 % instead of the default terrain.
     let valley = std::env::var("TEST_RIVER_TERRAIN").as_deref() == Ok("valley");
     let mut h = if valley {

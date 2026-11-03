@@ -19,6 +19,9 @@ struct PyramidResampleParams {
     granularity_strength: f32,
     padded_size: vec2<u32>,  // finest level (padded base)
     pad_offset: vec2<u32>,   // base map offset inside the padded grid (Compute_Padding)
+    // Water bodies count as outflow from `wet_depth` to fully at `full_depth` (height units).
+    wet_depth: f32,
+    full_depth: f32,
 }
 
 // River momentum, x and y per cell (2i, 2i + 1; see `erosion.wgsl`).
