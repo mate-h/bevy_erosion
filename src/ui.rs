@@ -201,6 +201,13 @@ enum ErosionSliderFieldKind {
     BedLoadRockHardness,
     RiverBrushCatchment,
     BoulderDiameter,
+    SlideDepth,
+    SlideFriction,
+    SlideBasal,
+    SlideDuration,
+    SlideSpeed,
+    SlopeFriction,
+    SlopeCohesion,
     BoulderDrag,
     BoulderFriction,
     RiverBrushArmour,
@@ -341,6 +348,13 @@ impl ErosionSliderFieldKind {
             Self::BrushRadius => brush.radius = value,
             Self::RiverBrushCatchment => brush.river.catchment = value,
             Self::BoulderDiameter => water.boulders.diameter = value,
+            Self::SlideDepth => water.landslide.depth = value,
+            Self::SlideFriction => water.landslide.friction_angle = value,
+            Self::SlideBasal => water.landslide.basal_angle = value,
+            Self::SlideDuration => water.landslide.duration = value,
+            Self::SlideSpeed => water.landslide.speed = value,
+            Self::SlopeFriction => water.landslide.soil_friction_angle = value,
+            Self::SlopeCohesion => water.landslide.cohesion = value,
             Self::BoulderDrag => water.boulders.drag = value,
             Self::BoulderFriction => water.boulders.friction_static = value,
             Self::RiverBrushArmour => brush.river.armour = value,
@@ -427,6 +441,13 @@ impl ErosionSliderFieldKind {
                 // New rivers take the discharge; armour re-sends the existing beds.
                 | Self::RiverBrushCatchment
                 | Self::BoulderDiameter
+                | Self::SlideDepth
+                | Self::SlideFriction
+                | Self::SlideBasal
+                | Self::SlideDuration
+                | Self::SlideSpeed
+                | Self::SlopeFriction
+                | Self::SlopeCohesion
                 | Self::BoulderDrag
                 | Self::BoulderFriction
                 | Self::RiverBrushArmour
@@ -473,6 +494,7 @@ enum ToggleKind {
     MomentumFlow,
     SecondOrderDepth,
     LiveBedLoad,
+    AutoLandslides,
 }
 
 impl ToggleKind {
@@ -504,6 +526,7 @@ impl ToggleKind {
             Self::MomentumFlow => water.solver == WaterSolver::Swe,
             Self::SecondOrderDepth => water.second_order_depth,
             Self::LiveBedLoad => water.bed_load.live,
+            Self::AutoLandslides => water.landslide.auto,
         }
     }
 
@@ -543,6 +566,7 @@ impl ToggleKind {
             }
             Self::SecondOrderDepth => water.second_order_depth = on,
             Self::LiveBedLoad => water.bed_load.live = on,
+            Self::AutoLandslides => water.landslide.auto = on,
         }
     }
 
@@ -930,6 +954,28 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl, world: WorldScale)
                                 edits.clear_all();
                             })
                         })
+                    })
+                    --
+                    @section("Landslides", true, bsn_list! {
+                        @note_text("Click with the Landslide brush to release a slab; its debris flows (MPM) and settles as a deposit.")
+                        --
+                        @slider_row(world, "Slip Depth (m)", 2.0, 80.0, water.landslide.depth, ErosionSliderFieldKind::SlideDepth)
+                        --
+                        @slider_row(world, "Debris Friction (°)", 10.0, 45.0, water.landslide.friction_angle, ErosionSliderFieldKind::SlideFriction)
+                        --
+                        @slider_row(world, "Basal Friction (°)", 5.0, 45.0, water.landslide.basal_angle, ErosionSliderFieldKind::SlideBasal)
+                        --
+                        @slider_row(world, "Duration (s)", 5.0, 300.0, water.landslide.duration, ErosionSliderFieldKind::SlideDuration)
+                        --
+                        @slider_row(world, "Speed (×)", 0.25, 10.0, water.landslide.speed, ErosionSliderFieldKind::SlideSpeed)
+                        --
+                        @toggle_row("Slopes Fail on Their Own", ToggleKind::AutoLandslides)
+                        --
+                        @note_text("Where the infinite-slope factor of safety drops below 1: dry slopes past about 45°, or wet ones past about 30°.")
+                        --
+                        @slider_row(world, "Slope Friction (°)", 20.0, 60.0, water.landslide.soil_friction_angle, ErosionSliderFieldKind::SlopeFriction)
+                        --
+                        @slider_row(world, "Cohesion (kPa)", 0.0, 300.0, water.landslide.cohesion, ErosionSliderFieldKind::SlopeCohesion)
                     })
                     })
                     --

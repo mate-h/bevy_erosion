@@ -17,6 +17,8 @@
 //   * grid_clear, slide_p2g, grid_update, slide_g2p: one MPM substep.
 //   * slide_stamp (per particle): write the debris into the heights, recording it per texel.
 //   * slide_settle (per box texel): forget the record, so the last write stays.
+//   * scan_clear, slide_scan, scan_pick (per map texel): the infinite-slope factor of safety of
+//     every texel, and the least stable one where it is below 1 (slopes that fail on their own).
 
 const HEIGHT_SCALE: f32 = 1000000.0;
 // Fixed point of the grid's atomic sums (mass in m³, momentum in m⁴/s).
@@ -62,6 +64,14 @@ struct SlideParams {
     centre: vec2<f32>,
     radius: f32,
     depth: f32,
+    // Stability scan: slip depth (m), cohesion of soil and of the hardest rock (Pa), tan of the
+    // intact friction angle, unit weight of the soil (N/m³), sea level (height units).
+    slip_depth: f32,
+    cohesion: f32,
+    rock_cohesion: f32,
+    soil_friction: f32,
+    soil_weight: f32,
+    sea_level: f32,
 }
 
 @group(0) @binding(0) var<storage, read_write> height: array<atomic<u32>>;
@@ -71,6 +81,11 @@ struct SlideParams {
 // Per box texel: height quanta the debris added this frame. Last slot: the particle count.
 @group(0) @binding(3) var<storage, read_write> stamp: array<atomic<u32>>;
 @group(0) @binding(4) var<uniform> params: SlideParams;
+// The stability scan's inputs: water depth (height units) and KTT's masks (x = softness), and
+// its result: the lowest factor of safety's bits, the texel that has it, and how many fail.
+@group(0) @binding(5) var<storage, read> depth: array<f32>;
+@group(0) @binding(6) var<storage, read> masks: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> failure: array<atomic<u32>>;
 
 fn gidx(p: vec2<i32>) -> u32 {
     let q = vec2<u32>(p) + params.pad_offset;
@@ -377,4 +392,60 @@ fn slide_stamp(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn slide_settle(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (!box_texel(gid)) { return; }
     atomicStore(&stamp[gid.y * params.box_texels.x + gid.x], 0u);
+}
+
+const WATER_WEIGHT: f32 = 9810.0;
+
+// Infinite-slope factor of safety of a slab `slip_depth` deep at map texel `p` (Skempton &
+// DeLory 1957): FS = c / (γ z sinβ cosβ) + (1 − m γw / γ) tanφ / tanβ, with the slope β over
+// two texels, cohesion c from soil to rock by KTT's softness, and the slab saturated (m = 1)
+// where 10 cm of water or more stands on it. Flat texels, the sea and the map border never fail.
+fn safety(p: vec2<i32>) -> f32 {
+    let size = vec2<i32>(params.size);
+    // The map border's outflow band can stand in cliffs; it never fails.
+    if (any(p < vec2<i32>(6)) || any(p >= size - 6)) { return 1e9; }
+    let h = f32(atomicLoad(&height[gidx(p)])) / HEIGHT_SCALE;
+    if (params.sea_level > 0.0 && h < params.sea_level) { return 1e9; }
+    let e = vec2<i32>(2, 0);
+    let n = vec2<i32>(0, 2);
+    let g = vec2<f32>(ground_texel(p + e) - ground_texel(p - e), ground_texel(p + n) - ground_texel(p - n))
+        / (4.0 * params.metres_per_texel);
+    let tan_b = length(g);
+    if (tan_b < 0.05) { return 1e9; }
+    let cos_b = inverseSqrt(1.0 + tan_b * tan_b);
+    let sin_b = tan_b * cos_b;
+    let water = depth[u32(p.y) * params.size.x + u32(p.x)] * params.metres_per_height;
+    let wet = clamp(water / 0.1, 0.0, 1.0);
+    let soft = clamp(masks[gidx(p)].x, 0.0, 1.0);
+    let c = params.cohesion + params.rock_cohesion * (1.0 - soft);
+    let z = max(params.slip_depth, 0.1);
+    return c / (params.soil_weight * z * sin_b * cos_b)
+        + (1.0 - wet * WATER_WEIGHT / params.soil_weight) * params.soil_friction / tan_b;
+}
+
+@compute @workgroup_size(1, 1, 1)
+fn scan_clear() {
+    atomicStore(&failure[0], bitcast<u32>(1.0));
+    atomicStore(&failure[1], 0u);
+    atomicStore(&failure[2], 0u);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn slide_scan(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (any(gid.xy >= params.size)) { return; }
+    let fs = safety(vec2<i32>(gid.xy));
+    if (fs < 1.0) {
+        // Positive floats order like their bits.
+        atomicMin(&failure[0], bitcast<u32>(max(fs, 0.0)));
+        atomicAdd(&failure[2], 1u);
+    }
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn scan_pick(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (any(gid.xy >= params.size)) { return; }
+    let fs = safety(vec2<i32>(gid.xy));
+    if (fs < 1.0 && bitcast<u32>(max(fs, 0.0)) == atomicLoad(&failure[0])) {
+        atomicMax(&failure[1], gid.y * params.size.x + gid.x + 1u);
+    }
 }

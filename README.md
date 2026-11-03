@@ -121,6 +121,19 @@ centre (thinning to the rim) leaves the terrain and runs as a granular flow (MPM
 minute of slide time the moving debris is part of the terrain, so the water flows over and
 around it. What is left at the end is the deposit.
 
+Slopes also fail on their own (Slopes Fail on Their Own, on by default): wherever a slab of the
+slip depth has an infinite-slope factor of safety below 1, a slide releases there, one at a time.
+Dry slopes hold to about 45°; slopes with water running over them fail from about 30°. Cohesion
+is higher on hard rock (KTT's softness mask).
+
+| Setting | Effect |
+|---|---|
+| Slip Depth | Depth (m) of the slab at the centre of a release |
+| Debris Friction | Angle the debris comes to rest at |
+| Basal Friction | Friction of the debris sliding on the terrain |
+| Duration, Speed | Slide seconds per event, and per real second |
+| Slope Friction, Cohesion | Strength of intact slopes in the stability check |
+
 ## KTT rivers
 
 **Do Rivers** turns on KTT's river momentum: every trail leaves momentum behind it, and where it

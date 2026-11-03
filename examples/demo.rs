@@ -330,7 +330,8 @@ fn log_frame_times(
         // Release a landslide there, 20 texels across.
         let slide = texel("EROSION_BENCH_LANDSLIDE");
         if let Some(at) = slide {
-            slides.release(at, 10.0, &drainage.heights, drainage.size, &scale);
+            let depth = water.landslide.depth;
+            slides.release(at, 10.0, depth, &drainage.heights, drainage.size, &scale);
         }
         // Look at the pour or the river's source from close by.
         if let Some(focus) = texel("EROSION_BENCH_TARGET")

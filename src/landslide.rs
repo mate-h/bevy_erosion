@@ -8,7 +8,7 @@
 //! drawing see it; at the end it stays as the deposit.
 
 use crate::{
-    WorldScale,
+    ErosionConfig, WaterControl, WaterFields, WorldScale,
     brush::{BrushHit, BrushMode, WaterBrush},
     drainage::DrainageArea,
 };
@@ -18,6 +18,7 @@ use bevy::{
     render::{
         RenderApp,
         extract_resource::{ExtractResource, ExtractResourcePlugin},
+        gpu_readback::{Readback, ReadbackComplete},
     },
 };
 
@@ -30,6 +31,10 @@ pub const MAX_PARTICLES: u32 = 262_144;
 pub const SLIDE_STEP: f32 = 0.02;
 /// Most substeps per frame.
 pub const MAX_SLIDE_SUBSTEPS: u32 = 16;
+/// Unit weight of the soil (N/m³).
+pub const SOIL_WEIGHT: f32 = 20_000.0;
+/// Real seconds after a slide settles before the next one may release on its own.
+const AUTO_PAUSE: f32 = 2.0;
 
 /// How landslides release and run. In SI.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -48,6 +53,16 @@ pub struct LandslideSettings {
     /// Speed of sound in the debris (m/s): how stiffly it resists compaction. The substep is
     /// sized for it.
     pub sound_speed: f32,
+    /// Release slides where slopes fail on their own: where the infinite-slope factor of safety
+    /// of a slab [`Self::depth`] deep falls below 1 (see `safety` in `landslide.wgsl`).
+    pub auto: bool,
+    /// Friction angle of the intact slope (degrees).
+    pub soil_friction_angle: f32,
+    /// Cohesion of the soil (kPa), and what the hardest rock of KTT's softness mask adds.
+    pub cohesion: f32,
+    pub rock_cohesion: f32,
+    /// Radius (texels) of the slides that release on their own.
+    pub auto_radius: f32,
 }
 
 impl Default for LandslideSettings {
@@ -59,6 +74,12 @@ impl Default for LandslideSettings {
             duration: 60.0,
             speed: 2.0,
             sound_speed: 40.0,
+            // Dry slopes up to about 45° hold; saturated ones fail from about 30°.
+            auto: true,
+            soil_friction_angle: 40.0,
+            cohesion: 50.0,
+            rock_cohesion: 500.0,
+            auto_radius: 8.0,
         }
     }
 }
@@ -77,31 +98,40 @@ pub struct SlideEvent {
     pub floor: f32,
 }
 
-/// The landslide settings and the latest release; the render world starts an event each time
+/// The latest release (the settings are [`WaterControl::landslide`]); the render world starts an event each time
 /// [`Self::generation`] changes.
 #[derive(Resource, Clone, Default, ExtractResource)]
 #[extract_app(RenderApp)]
 pub struct Landslides {
-    pub settings: LandslideSettings,
     pub event: Option<SlideEvent>,
     pub generation: u32,
-    /// A release (centre, radius) waiting for the terrain's heights to be read back.
-    pub pending: Option<(Vec2, f32)>,
+    /// A release (centre, radius, depth) waiting for the terrain's heights to be read back.
+    pub pending: Option<(Vec2, f32, f32)>,
+}
+
+/// The stability scan's latest result, read back from the GPU.
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct SlopeFailure {
+    /// The least stable texel and its factor of safety, where one is below 1.
+    pub weakest: Option<(UVec2, f32)>,
+    /// Texels below 1.
+    pub failing: u32,
 }
 
 impl Landslides {
-    /// Release a slide of `radius` texels at `centre`, its box placed over the terrain `heights`
-    /// (height units, `size` texels; the drainage readback).
+    /// Release a slide of `radius` texels at `centre`, `depth` m deep at the centre, its box
+    /// placed over the terrain `heights` (height units, `size` texels; the drainage readback).
     pub fn release(
         &mut self,
         centre: Vec2,
         radius: f32,
+        depth: f32,
         heights: &[f32],
         size: UVec2,
         scale: &WorldScale,
     ) {
         if heights.is_empty() || heights.len() != (size.x * size.y) as usize {
-            self.pending = Some((centre, radius));
+            self.pending = Some((centre, radius, depth));
             return;
         }
         let texels = (NODES.xz() / 2).as_ivec2();
@@ -124,7 +154,7 @@ impl Landslides {
         self.event = Some(SlideEvent {
             centre,
             radius,
-            depth: self.settings.depth,
+            depth,
             box_origin,
             floor,
         });
@@ -133,7 +163,7 @@ impl Landslides {
         info!(
             "Landslide at {centre} ({:.0} m across, {:.0} m deep)",
             2.0 * radius * scale.metres_per_texel,
-            self.settings.depth
+            depth
         );
     }
 }
@@ -143,8 +173,12 @@ pub struct LandslidePlugin;
 impl Plugin for LandslidePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Landslides>()
+            .init_resource::<SlopeFailure>()
             .add_plugins(ExtractResourcePlugin::<Landslides>::default())
-            .add_systems(Update, (release_pending, click_landslide));
+            .add_systems(
+                Update,
+                (sync_failure_readback, release_pending, click_landslide, release_failures),
+            );
     }
 }
 
@@ -154,10 +188,10 @@ fn release_pending(
     scale: Res<WorldScale>,
     mut slides: ResMut<Landslides>,
 ) {
-    if let Some((centre, radius)) = slides.pending
+    if let Some((centre, radius, depth)) = slides.pending
         && !drainage.heights.is_empty()
     {
-        slides.release(centre, radius, &drainage.heights, drainage.size, &scale);
+        slides.release(centre, radius, depth, &drainage.heights, drainage.size, &scale);
     }
 }
 
@@ -168,6 +202,7 @@ fn click_landslide(
     buttons: Option<Res<ButtonInput<MouseButton>>>,
     drainage: Res<DrainageArea>,
     scale: Res<WorldScale>,
+    water: Res<WaterControl>,
     mut slides: ResMut<Landslides>,
 ) {
     let (Some(brush), Some(hit), Some(buttons)) = (brush, hit, buttons) else {
@@ -178,6 +213,74 @@ fn click_landslide(
         && hit.world.is_some()
         && buttons.just_pressed(MouseButton::Left)
     {
-        slides.release(hit.texel, brush.radius, &drainage.heights, drainage.size, &scale);
+        let depth = water.landslide.depth;
+        slides.release(hit.texel, brush.radius, depth, &drainage.heights, drainage.size, &scale);
+    }
+}
+
+#[derive(Component)]
+struct FailureReadback;
+
+/// Read the stability scan back every frame while slopes may fail on their own.
+fn sync_failure_readback(
+    mut commands: Commands,
+    water: Res<WaterControl>,
+    fields: Option<Res<WaterFields>>,
+    config: Res<ErosionConfig>,
+    mut failure: ResMut<SlopeFailure>,
+    existing: Query<Entity, With<FailureReadback>>,
+) {
+    let Some(fields) = fields else { return };
+    if water.landslide.auto && existing.is_empty() {
+        let width = config.map_size.x;
+        commands
+            .spawn((Readback::buffer(fields.slope_failure.clone()), FailureReadback))
+            .observe(move |ev: On<ReadbackComplete>, mut failure: ResMut<SlopeFailure>| {
+                let words: Vec<u32> = bytemuck::pod_collect_to_vec(&ev.data);
+                let [fs, index, failing, ..] = words[..] else {
+                    return;
+                };
+                failure.failing = failing;
+                failure.weakest = (index > 0).then(|| {
+                    let i = index - 1;
+                    (UVec2::new(i % width, i / width), f32::from_bits(fs))
+                });
+            });
+    } else if !water.landslide.auto && !existing.is_empty() {
+        for entity in &existing {
+            commands.entity(entity).despawn();
+        }
+        *failure = SlopeFailure::default();
+    }
+}
+
+/// Release a slide at the least stable texel once the last one has settled.
+fn release_failures(
+    time: Res<Time>,
+    water: Res<WaterControl>,
+    failure: Res<SlopeFailure>,
+    drainage: Res<DrainageArea>,
+    scale: Res<WorldScale>,
+    mut slides: ResMut<Landslides>,
+    mut busy_until: Local<f32>,
+    mut seen: Local<u32>,
+) {
+    let s = &water.landslide;
+    let now = time.elapsed_secs();
+    // Any release (the brush's too) keeps the slope still until its slide has settled.
+    if slides.generation != *seen {
+        *seen = slides.generation;
+        *busy_until = now + s.duration / s.speed.max(1e-3) + AUTO_PAUSE;
+    }
+    if !s.auto || now < *busy_until || slides.pending.is_some() || drainage.heights.is_empty() {
+        return;
+    }
+    if let Some((texel, fs)) = failure.weakest {
+        info!(
+            "Slope failure at {texel}: factor of safety {fs:.2} ({} texels below 1)",
+            failure.failing
+        );
+        let centre = texel.as_vec2() + 0.5;
+        slides.release(centre, s.auto_radius, s.depth, &drainage.heights, drainage.size, &scale);
     }
 }

@@ -21,7 +21,7 @@ use bevy::{
 };
 use bevy_erosion::{
     boulders::{Boulder, BoulderEdits, BoulderList},
-    landslide::Landslides,
+    landslide::{Landslides, SlopeFailure},
     drainage::DrainageArea,
     *,
 };
@@ -203,6 +203,8 @@ impl Harness {
                 ..old_bed_load()
             };
             water.channel = old_channel();
+            // Slopes fail on their own only in the tests about it.
+            water.landslide.auto = false;
             water.sediment_capacity = 0.0;
             water.bed_load.live = false;
             if let Some(g) = std::env::var("TEST_GRAVITY")
@@ -3170,10 +3172,10 @@ fn landslide_runs_downhill() {
     let before = h.read_heights();
     {
         let scale = *h.app.world().resource::<WorldScale>();
+        h.water().landslide.duration = 40.0;
+        h.water().landslide.speed = 4.0;
         let mut slides = h.app.world_mut().resource_mut::<Landslides>();
-        slides.settings.duration = 40.0;
-        slides.settings.speed = 4.0;
-        slides.release(Vec2::new(14.0, N as f32 / 2.0), 8.0, &before, UVec2::splat(N), &scale);
+        slides.release(Vec2::new(14.0, N as f32 / 2.0), 8.0, 25.0, &before, UVec2::splat(N), &scale);
     }
     h.run(1.0);
     let during = h.read_heights();
@@ -3211,4 +3213,36 @@ fn landslide_runs_downhill() {
     assert!(lost.0 > 0.05, "nothing moved ({})", lost.0);
     assert!(((v1 - v0) / lost.0).abs() < 0.05, "volume not kept ({v0} -> {v1}, {} moved)", lost.0);
     assert!(to > from + 4.0, "the slide did not run downhill (from {from} to {to})");
+}
+
+/// Slopes fail on their own: a dry 42° slope holds (its factor of safety stays above 1), and once
+/// water runs down it the saturated slab fails and a slide releases there.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn wet_slopes_fail() {
+    let bed = |x: u32, _y: u32| {
+        0.02 + 0.001 * (N - 1 - x) as f32 + 0.009 * (40.0 - x as f32).max(0.0)
+    };
+    let mut h = Harness::new(WaterSolver::Swe, &bed);
+    h.water().landslide.auto = true;
+    h.water().landslide.duration = 10.0;
+    h.water().landslide.speed = 5.0;
+    let generation = |h: &Harness| h.app.world().resource::<Landslides>().generation;
+    let start = generation(&h);
+    h.run(3.0);
+    let dry = *h.app.world().resource::<SlopeFailure>();
+    println!("dry: {dry:?}");
+    assert_eq!(generation(&h), start, "a dry slope failed ({dry:?})");
+    h.water().springs.push(Spring {
+        center: Vec2::new(6.0, N as f32 / 2.0),
+        radius: 6.0,
+        rate: 0.05 / TIME,
+    });
+    h.run(6.0);
+    let wet = *h.app.world().resource::<SlopeFailure>();
+    let event = h.app.world().resource::<Landslides>().event;
+    println!("wet: {wet:?}, released {:?}", event.map(|e| e.centre));
+    assert!(generation(&h) != start, "the wet slope did not fail");
+    let centre = event.unwrap().centre;
+    assert!(centre.x < 40.0, "the slide released off the steep slope ({centre})");
 }

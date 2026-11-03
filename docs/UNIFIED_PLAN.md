@@ -482,11 +482,21 @@ Status (Phase 9): a first version, built on our own MPM rather than nexus
 - **Test**: `landslide_runs_downhill`: a slab released on a 35° slope above a break runs down and
   spreads onto the gentle slope below it (mass centre from x 13 to x 28), with the volume kept to
   rounding.
-- Not yet: slopes failing on their own (a factor-of-safety check from the slope, KTT's rock
-  hardness and the water), μ(I) rheology and dilatancy, water in the debris (debris flows),
-  boulders and grain sizes carried by the slide, drawing the particles themselves, and panel
-  settings beyond the brush radius (Depth, friction angles, duration and speed live in
-  `LandslideSettings`).
+- **Slopes that fail on their own** (on by default): between events a scan computes every
+  texel's infinite-slope factor of safety for a slab of the slip depth (Skempton & DeLory 1957),
+  FS = c / (γ z sinβ cosβ) + (1 − m γw/γ) tanφ / tanβ, with β over two texels, c = 50 kPa plus
+  500 kPa on the hardest rock of KTT's softness mask, φ = 40°, γ = 20 kN/m³, and the slab
+  saturated (m = 1) under 10 cm of water or more. The least stable texel below 1 is read back and
+  a slide (radius 8 texels) releases there, one at a time, two seconds after the last settles.
+  Dry slopes hold to about 45°; wet ones fail from about 30°. The map border's six-texel band is
+  left out (its outflow cliffs). `wet_slopes_fail`: a dry 42° slope holds, and fails at FS 0.63
+  once a spring's water runs down it. The default demo map, dry, has one marginal texel
+  (FS 0.98) that fails once.
+- **Panel**: a Landslides section (slip depth, debris and basal friction, duration, speed, the
+  automatic failures and their slope friction and cohesion).
+- Not yet: rain soaking slopes without standing water (the saturation is the water depth only),
+  μ(I) rheology and dilatancy, water in the debris (debris flows),
+  boulders and grain sizes carried by the slide, and drawing the particles themselves.
 
 ## How it was built
 
