@@ -442,9 +442,10 @@ Status (Phase 8): built (`src/boulders.rs`, `assets/boulders.wgsl`).
   `boulders_jam_against_a_big_one`: a 2 m boulder the flow carries off the map alone moves 0.04
   texels resting against a 15 m one. Pairs are found by looping over all slots (fine at a few
   thousand); no stacking in height.
-- Not yet: boulders settling into the bed or jamming into step lines, boulders from the bed's own boulder
-  fraction (Phase 7) entraining as bodies, and rocks drawn white in the simple view (its lighting
-  is set for the terrain's own shading).
+- In the Simple view the rocks are drawn unlit in a mid grey (that view's lighting is the
+  terrain's own, and lit rocks blew out to white).
+- Not yet: boulders settling into the bed or jamming into step lines, and boulders from the
+  bed's own boulder fraction (Phase 7) entraining as bodies.
 
 ### Phase 9: mass movement with MPM
 
@@ -494,8 +495,12 @@ Status (Phase 9): a first version, built on our own MPM rather than nexus
   (FS 0.98) that fails once.
 - **Panel**: a Landslides section (slip depth, debris and basal friction, duration, speed, the
   automatic failures and their slope friction and cohesion).
-- Not yet: rain soaking slopes without standing water (the saturation is the water depth only),
-  μ(I) rheology and dilatancy, water in the debris (debris flows),
+- **Rain soaks slopes** (SHALSTAB, Montgomery & Dietrich 1994): the slab's saturation is also
+  m = R·a / (T·sinβ), R the rainfall, a the drainage area per texel width, T the soil's
+  transmissivity (65 m²/day), so under rain the hollows that gather water fail first.
+  `rain_soaks_slopes_until_they_fail`: with all the rain soaking in and no water standing, the
+  42° slope fails at FS 0.51.
+- Not yet: μ(I) rheology and dilatancy, water in the debris (debris flows),
   boulders and grain sizes carried by the slide, and drawing the particles themselves.
 
 ## How it was built
@@ -544,11 +549,29 @@ Not done:
   scene, the panel's metre values and the camera are built from it once.
 - **Realistic defaults.** The defaults keep the old look (n = 0.2, 1.5 m grains, grid-relative
   wet depths). Sweeping n = 0.035–0.07, gravel grains and absolute wet depths against the
-  acceptance checks below is the next step; the `validate_` sweeps have not been rerun.
+  acceptance checks below is the next step. The `validate_` sweeps have been rerun on the metric
+  solver at the old-equivalent settings and agree with it (`docs/VALIDATION.md`, "Rerun in
+  metres").
 - **A channel-head threshold** (A_c) and separate edge inlets.
 - **Refitting `KTT_DISCHARGE_SCALE`** at two texel sizes; it is the old fit converted.
-- **Full PBR at 10 m texels** was seen once with the water drawn only inside a rectangle and
-  84 ms frames during Phase 2; not investigated (benches since ran in simple mode).
+- **Full PBR frame time.** Measured with Metal System Trace on the demo (a pour, the camera
+  250 m away): about 105 ms a frame, of which bevy_fft's water surface fragment
+  (`main_transmissive_pass_3d`) took 46 ms and the erosion compute 41 ms. The compute part was
+  a feedback loop: the water caught up on each frame's real time, so a slow frame ran more
+  solver steps (up to 32), which made the next one slower. The water now advances by at most
+  1/30 s of real time per frame (`MAX_WATER_FRAME`), and a slower frame runs it slower: 80 ms
+  in PBR, 22 ms in the plain views. The water surface itself costs about 48 ms (32 ms with it
+  hidden); its refraction and reflection traces make no difference, so the cost is per pixel
+  over the whole screen (the surface mesh covers the map, every pixel samples the LOD data
+  before the dry-pixel `discard`, and the `discard` turns off hidden-surface removal). That is
+  bevy_fft's shader, to fix there. The water is drawn: an earlier "no water in PBR" was a
+  misreading of the dark lake surface.
+- **Heights read back at full precision.** The drainage area and the brush read the heights
+  from `ErosionImages::height_exact` (R32Float, written by `blit_fields`) instead of the f16
+  display texture, which steps up to 0.49 m at these heights. On the test terrain the f16
+  heights had 17,766 texels with an equal neighbour (148 exact), 2.5 % of the channel texels'
+  drainage areas were off by more than 2×, and the Drainage view's checkerboard came from it
+  (46 isolated spikes, 13 exact, all real single-texel peaks). `inspect_drainage_precision`.
 
 ## Acceptance
 

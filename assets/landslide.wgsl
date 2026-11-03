@@ -72,6 +72,9 @@ struct SlideParams {
     soil_friction: f32,
     soil_weight: f32,
     sea_level: f32,
+    // Rain soaking into the slopes (m/s) over the soil's transmissivity (m²/s).
+    recharge: f32,
+    transmissivity: f32,
 }
 
 @group(0) @binding(0) var<storage, read_write> height: array<atomic<u32>>;
@@ -86,6 +89,8 @@ struct SlideParams {
 @group(0) @binding(5) var<storage, read> depth: array<f32>;
 @group(0) @binding(6) var<storage, read> masks: array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read_write> failure: array<atomic<u32>>;
+// Drainage area (m²) of each map texel (`drainage.rs`).
+@group(0) @binding(8) var drainage: texture_2d<f32>;
 
 fn gidx(p: vec2<i32>) -> u32 {
     let q = vec2<u32>(p) + params.pad_offset;
@@ -398,8 +403,10 @@ const WATER_WEIGHT: f32 = 9810.0;
 
 // Infinite-slope factor of safety of a slab `slip_depth` deep at map texel `p` (Skempton &
 // DeLory 1957): FS = c / (γ z sinβ cosβ) + (1 − m γw / γ) tanφ / tanβ, with the slope β over
-// two texels, cohesion c from soil to rock by KTT's softness, and the slab saturated (m = 1)
-// where 10 cm of water or more stands on it. Flat texels, the sea and the map border never fail.
+// two texels, cohesion c from soil to rock by KTT's softness. The slab is saturated (m = 1) where
+// 10 cm of water or more stands on it; under rain, by the steady-state hillslope hydrology of
+// SHALSTAB (Montgomery & Dietrich 1994): m = R·a / (T·sinβ), with a the upslope area per unit
+// contour width, so hollows that gather water saturate first and ridges stay dry. Flat texels, the sea and the map border never fail.
 fn safety(p: vec2<i32>) -> f32 {
     let size = vec2<i32>(params.size);
     // The map border's outflow band can stand in cliffs; it never fails.
@@ -415,7 +422,9 @@ fn safety(p: vec2<i32>) -> f32 {
     let cos_b = inverseSqrt(1.0 + tan_b * tan_b);
     let sin_b = tan_b * cos_b;
     let water = depth[u32(p.y) * params.size.x + u32(p.x)] * params.metres_per_height;
-    let wet = clamp(water / 0.1, 0.0, 1.0);
+    let a = textureLoad(drainage, p, 0).x / params.metres_per_texel;
+    let soaked = params.recharge * a / max(params.transmissivity * sin_b, 1e-12);
+    let wet = clamp(max(water / 0.1, soaked), 0.0, 1.0);
     let soft = clamp(masks[gidx(p)].x, 0.0, 1.0);
     let c = params.cohesion + params.rock_cohesion * (1.0 - soft);
     let z = max(params.slip_depth, 0.1);

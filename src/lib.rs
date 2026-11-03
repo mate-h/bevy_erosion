@@ -380,6 +380,9 @@ pub struct ErosionImages {
     /// Height the boulders add to the shallow-water solver's bed (height units;
     /// `boulders.wgsl`).
     pub obstacle: Handle<Image>,
+    /// The finest heights at full precision (height units), for CPU readbacks: [`Self::height`]
+    /// is f16, which steps about 0.24 m on 10 m texels and turns gentle ground into flats.
+    pub height_exact: Handle<Image>,
 }
 
 /// Creates all erosion render-target images for the given map size and adds them to `images`.
@@ -411,6 +414,7 @@ pub fn create_erosion_images(images: &mut Assets<Image>, size: UVec2) -> Erosion
         debug_bed: add(images, TextureFormat::Rgba16Float),
         drainage: images.add(cpu_image(size, TextureFormat::R32Float, 4)),
         obstacle: add(images, TextureFormat::R32Float),
+        height_exact: add(images, TextureFormat::R32Float),
     }
 }
 
@@ -1163,8 +1167,8 @@ pub struct WaterControl {
     pub gravity: f32,
     /// Simulated seconds per second of frame time.
     pub time_scale: f32,
-    /// Seconds since the last frame (set from [`Time`]); the solver catches up by this much
-    /// times [`Self::time_scale`].
+    /// Seconds since the last frame, at most 1/30 (set from [`Time`]); the solver catches up by
+    /// this much times [`Self::time_scale`].
     pub dt: f32,
     /// Bed reconstruction settings (see [`BedShaping`]).
     pub bed: BedShaping,
@@ -1797,9 +1801,14 @@ fn setup_erosion_resources(
     commands.insert_resource(river::RiverBed::default());
 }
 
+/// Longest frame the water catches up on (s). A slower frame runs the water slower instead:
+/// catching up would add solver steps to the next frame, which slows it further, until every
+/// frame runs [`MAX_WATER_STEPS`] (the full PBR view settled at about 100 ms a frame that way).
+const MAX_WATER_FRAME: f32 = 1.0 / 30.0;
+
 fn update_water_time(time: Res<Time>, water: Option<ResMut<WaterControl>>) {
     if let Some(mut water) = water {
-        water.dt = time.delta_secs();
+        water.dt = time.delta_secs().min(MAX_WATER_FRAME);
     }
 }
 
@@ -1865,6 +1874,8 @@ struct ErosionPipeline {
     layout_blit_blur: BindGroupLayoutDescriptor,
     /// Two debug view outputs (group 1 of `blit_fields` and `morpho_debug`).
     layout_debug_out: BindGroupLayoutDescriptor,
+    /// `blit_fields`: the debug outputs and [`ErosionImages::height_exact`].
+    layout_fields_out: BindGroupLayoutDescriptor,
     layout_upscale_height: BindGroupLayoutDescriptor,
     layout_upscale_rivers: BindGroupLayoutDescriptor,
     layout_upscale_masks: BindGroupLayoutDescriptor,
@@ -1982,6 +1993,19 @@ fn init_erosion_pipeline(
             (
                 texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
                 texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
+            ),
+        ),
+    );
+
+    // `blit_fields`: the two debug outputs and the heights at full precision.
+    let layout_fields_out = BindGroupLayoutDescriptor::new(
+        "ErosionFieldsGroup1",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
+                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
+                texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::WriteOnly),
             ),
         ),
     );
@@ -2235,7 +2259,7 @@ fn init_erosion_pipeline(
     );
 
     let pipeline_blit_fields = compute(
-        vec![layout_erosion.clone(), layout_debug_out.clone()],
+        vec![layout_erosion.clone(), layout_fields_out.clone()],
         &shader,
         "blit_fields",
     );
@@ -2346,6 +2370,7 @@ fn init_erosion_pipeline(
                 storage_buffer_read_only::<f32>(false), // water depth
                 storage_buffer_read_only::<Vec4>(false), // KTT masks
                 storage_buffer::<u32>(false), // stability scan result
+                texture_2d(TextureSampleType::Float { filterable: false }), // drainage area
             ),
         ),
     );
@@ -2397,6 +2422,7 @@ fn init_erosion_pipeline(
         layout_blit,
         layout_blit_blur,
         layout_debug_out,
+        layout_fields_out,
         layout_upscale_height,
         layout_upscale_rivers,
         layout_upscale_masks,
@@ -2536,6 +2562,8 @@ struct SlideParams {
     soil_friction: f32,
     soil_weight: f32,
     sea_level: f32,
+    recharge: f32,
+    transmissivity: f32,
 }
 
 /// Water solver state at base map size (`water.wgsl`).
@@ -2803,6 +2831,8 @@ fn prepare_erosion_bind_groups(
         Some(view_debug_discharge),
         Some(view_debug_bed),
         Some(view_obstacle),
+        Some(view_drainage),
+        Some(view_height_exact),
     ) = (
         gpu_images.get(&images.height),
         gpu_images.get(&images.color),
@@ -2819,6 +2849,8 @@ fn prepare_erosion_bind_groups(
         gpu_images.get(&images.debug_discharge),
         gpu_images.get(&images.debug_bed),
         gpu_images.get(&images.obstacle),
+        gpu_images.get(&images.drainage),
+        gpu_images.get(&images.height_exact),
     )
     else {
         return;
@@ -3017,6 +3049,7 @@ fn prepare_erosion_bind_groups(
                     buffers.water.depth.binding().unwrap(),
                     buffers.sets[set].masks.binding().unwrap(),
                     slope_failure.buffer.as_entire_binding(),
+                    &view_drainage.texture_view,
                 )),
             )
         }),
@@ -3087,10 +3120,11 @@ fn prepare_erosion_bind_groups(
         ),
         debug_fields: render_device.create_bind_group(
             None,
-            &layout(&pipeline.layout_debug_out),
+            &layout(&pipeline.layout_fields_out),
             &BindGroupEntries::sequential((
                 &view_debug_masks.texture_view,
                 &view_debug_layers.texture_view,
+                &view_height_exact.texture_view,
             )),
         ),
         debug_water: render_device.create_bind_group(
@@ -3552,6 +3586,9 @@ fn plan_erosion_frame(
             soil_friction: s.soil_friction_angle.to_radians().tan(),
             soil_weight: landslide::SOIL_WEIGHT,
             sea_level,
+            // Rain that soaks in (mm/h to m/s), against the transmissivity (m²/day to m²/s).
+            recharge: water.rainfall.max(0.0) / 3.6e6,
+            transmissivity: s.transmissivity / 86_400.0,
             ..default()
         };
         if let Some((event, elapsed)) = state.slide {

@@ -271,6 +271,19 @@ impl HeightCache {
 struct HeightReadback;
 
 /// Red channel of an Rgba16Float readback, rows possibly padded.
+/// The texels of an R32Float readback (rows may be padded).
+pub fn read_r32(data: &[u8], size: UVec2, out: &mut Vec<f32>) {
+    let stride = data.len() / size.y as usize;
+    out.resize((size.x * size.y) as usize, 0.0);
+    for y in 0..size.y as usize {
+        let row = &data[y * stride..];
+        for x in 0..size.x as usize {
+            let bytes = [row[x * 4], row[x * 4 + 1], row[x * 4 + 2], row[x * 4 + 3]];
+            out[y * size.x as usize + x] = f32::from_le_bytes(bytes);
+        }
+    }
+}
+
 pub(crate) fn read_red_channel(data: &[u8], size: UVec2, out: &mut Vec<f32>) {
     let stride = data.len() / size.y as usize;
     out.resize((size.x * size.y) as usize, 0.0);
@@ -414,10 +427,10 @@ fn sync_height_readback(
         let size = config.map_size;
         cache.size = size;
         commands
-            .spawn((Readback::texture(images.height.clone()), HeightReadback))
+            .spawn((Readback::texture(images.height_exact.clone()), HeightReadback))
             .observe(
                 move |ev: On<ReadbackComplete>, mut cache: ResMut<HeightCache>| {
-                    read_red_channel(&ev.data, size, &mut cache.heights);
+                    read_r32(&ev.data, size, &mut cache.heights);
                     cache.readbacks = cache.readbacks.saturating_add(1);
                 },
             );

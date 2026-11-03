@@ -87,7 +87,7 @@ fn refresh_drainage(
     }
     let size = config.map_size;
     commands
-        .spawn((Readback::texture(images.height.clone()), DrainageReadback))
+        .spawn((Readback::texture(images.height_exact.clone()), DrainageReadback))
         .observe(
             move |ev: On<ReadbackComplete>,
                   mut commands: Commands,
@@ -98,7 +98,7 @@ fn refresh_drainage(
                   mut drainage: ResMut<DrainageArea>| {
                 commands.entity(ev.entity).despawn();
                 let mut heights = Vec::new();
-                crate::brush::read_red_channel(&ev.data, size, &mut heights);
+                crate::brush::read_r32(&ev.data, size, &mut heights);
                 let sea_level = if params.use_outflow != 0 {
                     params.outflow_sea_level
                 } else {

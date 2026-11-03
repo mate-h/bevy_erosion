@@ -12,7 +12,8 @@ The water and bed model (Phases 4 and 6 of `WATER_PLAN.md`) checked against prim
   g = 2000 cells/s², Manning n = 0.01 unless stated. Since the water runs in metres and seconds
   (`docs/UNIFIED_PLAN.md`), the GPU tests run at the Froude-similar settings: 10 m texels, time
   in old seconds (`LEGACY_SECONDS` = 45 SI seconds each), n ≈ 0.21 and 1.5 m grains, so these
-  numbers carry over. The sweeps below were run before that change.
+  numbers carry over. The sections below were measured before that change; "Rerun in metres"
+  at the end has every sweep run again after it.
 
 ## Summary
 
@@ -26,8 +27,8 @@ The water and bed model (Phases 4 and 6 of `WATER_PLAN.md`) checked against prim
 | Roll waves, onset | Jeffreys 1925 / Vedernikov: Fr > 1.5 for Manning (2 for Chézy); convective, so hard to excite in short flumes | first-order flux: grows only from Fr ≈ 2.7; second-order flux: from Fr ≈ 2.2 | onset 1.5–2× too high (numerical damping) |
 | Alternate bars, onset | β = W/2h above β_cr ≈ 3–8 (Redolfi et al. 2020, Table 1) | no bars at β 6; bars from β ≈ 10 | agrees |
 | Alternate bars, wavelength | L = 5–12 W; shorter (< 5 W) diagonal bars at high flow (Redolfi et al. 2020) | 1–3 W, a criss-cross of oblique bars | too short (diagonal or braid bars) |
-| Hydraulic geometry, depth | Leopold & Maddock 1953: depth ∝ Q^0.4 | deepest point ∝ Q^0.41–0.52 | agrees |
-| Hydraulic geometry, width | width ∝ Q^0.5 downstream (0.26 at a station) | channel width ∝ Q^0.9–1.1 | too fast: no bank strength, short runs |
+| Hydraulic geometry, depth | Leopold & Maddock 1953: depth ∝ Q^0.4 | deepest point ∝ Q^0.35 (rerun in metres; 0.41–0.52 before) | agrees |
+| Hydraulic geometry, width | width ∝ Q^0.5 downstream (0.26 at a station) | cut width ∝ Q^0.57, wetted channel ∝ Q^0.78 (rerun; 0.9–1.1 before) | close for the cut; the wetted sheet still too wide |
 | Transverse slope effect | tan γ = −(r/√θ) ∂η/∂n, r = 0.3–0.6 (Redolfi: 0.40) | r = 1/A_s = 1 by default | stronger than measured; kept (see below) |
 | Bends | outer-bank pools, inner point bars | scour 3.8–4.5 texels toward the outer bank, switching sides | agrees qualitatively |
 | Deltas | bar where the jet slows (Edmonds & Slingerland 2007) | mouth +0.03, far basin unchanged | agrees qualitatively |
@@ -196,6 +197,39 @@ detrended carved bed.
   slopes 5–25 % everywhere, so every river there is a step-pool torrent.
 - With armour 1 the bed is unchanged after the flow; with armour 0, live bed load and water
   erosion take its step relief from 0.46 to 0.19 cells in 15 s (`river_brush_keeps_its_steps`).
+
+## Rerun in metres (`validate_*`, after Phases 1–9)
+
+All six sweeps run again on the metric solver (10 m texels, Froude-similar settings), with the
+CSVs in `TEST_DATA_DIR`. The boulders, landslides and the frame-time cap play no part in them
+(the fractions are zero, slides are off, the tests run at 60 frames a second).
+
+- **Roll waves:** the same as the first-order table above to within 0.01–0.04 in CV (Fr 1.55:
+  0.032 upstream, 0.009 downstream; Fr 2.64: 0.094 and 0.067; Fr 5.26: 0.084 and 0.099). Growth
+  still starts only at Fr ≈ 2.6.
+- **Alternate bars:** the same: no bars at β 6 (thalweg wander 0.77), wander growing to 12.9 at
+  β 107, wavelengths 1.9–3.8 W.
+- **Hydraulic geometry:** exponents against Q: deepest point 0.35, mean depth 0.13, cut width
+  0.57, channel width 0.78, wetted width 1.14. The cut channel now widens close to Leopold &
+  Maddock's 0.5; the water around it still spreads as a sheet.
+- **KTT rivers:** hillslope detail RMS 0.14 without rivers and 0.26–0.33 with them, channels
+  3.5–7.5 lower than the rivers-off terrain at River Scale 0.25.
+- **Cyclic steps and migration:** relief and direction hold, the wavelength does not:
+
+| Slope (cells) | 0.1 | 0.2 | 0.4 | 0.6 | 0.9 | 1.3 |
+|---|---|---|---|---|---|---|
+| Relief, metres solver (cells) | 0.02 | 0.04 | 0.23 | 0.43 | 1.18 | 1.39 |
+| Relief, commit before it (cells) | 0.02 | 0.04 | 0.22 | 0.52 | 1.05 | 1.27 |
+| Wavelength, metres solver (texels) | – | – | 13 | 92 | 17 | 23 |
+| Wavelength, commit before it (texels) | – | – | 92 | 15 | 18 | 20 |
+
+  The commit before the metric solver (`e8bb604`) was run again for comparison: the wavelength
+  flips between a short (13–20 texel) and a long (92 texel) peak from run to run at the same
+  settings, because the step pattern is chaotic and the detector takes the stronger peak. Its
+  depth and Froude number at slope 0.9 (0.08 cells, Fr 0.91) also differ from the table further
+  up (0.19, 1.36), which is older still. Steps migrate upstream in both runs (−0.01 to −0.44
+  texels/s). So the metric solver changed nothing measurable here; the wavelength is not a
+  stable measure of these short runs.
 
 ## Not yet validated
 

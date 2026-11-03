@@ -63,6 +63,9 @@ pub struct LandslideSettings {
     pub rock_cohesion: f32,
     /// Radius (texels) of the slides that release on their own.
     pub auto_radius: f32,
+    /// How fast water drains through the soil along the slope (m²/day): rain saturates slopes
+    /// where it arrives faster than this carries it away (SHALSTAB). Soils measure 1–100.
+    pub transmissivity: f32,
 }
 
 impl Default for LandslideSettings {
@@ -80,6 +83,7 @@ impl Default for LandslideSettings {
             cohesion: 50.0,
             rock_cohesion: 500.0,
             auto_radius: 8.0,
+            transmissivity: 65.0,
         }
     }
 }

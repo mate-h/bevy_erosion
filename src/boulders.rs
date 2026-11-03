@@ -10,7 +10,7 @@
 //! buffer) and reads them back every frame ([`BoulderList`]) to draw a rock mesh per boulder.
 
 use crate::{
-    ErosionConfig, WaterControl, WaterFields,
+    ErosionConfig, PreviewMode, TerrainView, WaterControl, WaterFields,
     brush::{BrushHit, BrushMode, TerrainSurface, WaterBrush},
 };
 use bevy::{
@@ -182,7 +182,7 @@ impl Plugin for BoulderPlugin {
             .add_systems(Startup, setup_rocks)
             .add_systems(
                 Update,
-                (paint_boulders, sync_readback, draw_boulders).chain(),
+                (paint_boulders, sync_readback, draw_boulders, style_rocks).chain(),
             );
     }
 }
@@ -340,6 +340,28 @@ fn rock_mesh(seed: u32) -> Mesh {
     mesh.compute_flat_normals();
     mesh.asset_usage = RenderAssetUsages::RENDER_WORLD;
     mesh
+}
+
+/// The Simple view shades the terrain itself and leaves the sun unexposed, which blows lit rocks
+/// out to white: there the rocks are drawn unlit in a mid grey.
+fn style_rocks(
+    view: Res<TerrainView>,
+    rocks: Option<Res<RockAssets>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let Some(rocks) = rocks else { return };
+    if !view.is_changed() && !rocks.is_added() {
+        return;
+    }
+    if let Some(mut material) = materials.get_mut(&rocks.material) {
+        let simple = view.mode == PreviewMode::Simple;
+        material.unlit = simple;
+        material.base_color = if simple {
+            Color::srgb(0.36, 0.35, 0.33)
+        } else {
+            Color::srgb(0.52, 0.5, 0.47)
+        };
+    }
 }
 
 #[derive(Component)]

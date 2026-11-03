@@ -301,6 +301,20 @@ impl Harness {
 
     /// Read an `Rgba16Float` image; the water is paused meanwhile.
     fn read(&mut self, handle: Handle<Image>) -> Vec<[f32; 4]> {
+        self.read_raw(handle, |bytes| {
+            bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| {
+                    std::array::from_fn(|k| f16_to_f32(u16::from_le_bytes([c[2 * k], c[2 * k + 1]])))
+                })
+                .collect()
+        })
+    }
+
+    /// Read a texture back and parse its bytes; the water is paused meanwhile.
+    fn read_raw<T>(&mut self, handle: Handle<Image>, parse: impl Fn(&[u8]) -> Vec<T>) -> Vec<T> {
         self.app.world_mut().resource_mut::<SimControl>().paused = true;
         let captured = Arc::new(Mutex::new(None));
         let sink = captured.clone();
@@ -319,14 +333,7 @@ impl Harness {
         }
         self.app.world_mut().resource_mut::<SimControl>().paused = false;
         let bytes = captured.lock().unwrap().take().expect("readback timed out");
-        bytes
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|c| {
-                std::array::from_fn(|k| f16_to_f32(u16::from_le_bytes([c[2 * k], c[2 * k + 1]])))
-            })
-            .collect()
+        parse(&bytes)
     }
 
     /// Read a storage buffer of `vec4<f32>`; the water is paused meanwhile.
@@ -400,7 +407,14 @@ impl Harness {
             .collect()
     }
 
+    /// The heights at full precision ([`ErosionImages::height_exact`]).
     fn read_heights(&mut self) -> Vec<f32> {
+        let handle = self.app.world().resource::<ErosionImages>().height_exact.clone();
+        self.read_raw(handle, |b| b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect())
+    }
+
+    /// The f16 display heights ([`ErosionImages::height`]), as the GPU draws them.
+    fn read_display_heights(&mut self) -> Vec<f32> {
         let handle = self.app.world().resource::<ErosionImages>().height.clone();
         self.read(handle).iter().map(|t| t[0]).collect()
     }
@@ -1767,19 +1781,25 @@ fn trail_sediment_reaches_the_lake() {
         shown > 0.0,
         "the water's deposits are not in KTT's deposition buffer"
     );
-    let before_clear: f32 = h.read_heights().iter().sum();
+    let before_clear = h.read_heights();
     {
         let mut water = h.water();
         water.clear_generation = water.clear_generation.wrapping_add(1);
     }
     h.run(0.1);
-    let after_clear: f32 = h.read_heights().iter().sum();
+    // Per-texel changes, summed in f64: an f32 running sum of the whole map steps by about 0.002
+    // here and swallows the thin settled layer.
+    let settled_on_clear: f64 = h
+        .read_heights()
+        .iter()
+        .zip(&before_clear)
+        .map(|(a, b)| (a - b) as f64)
+        .sum();
     let suspended2: f32 = sediment2.iter().sum();
     println!(
         "trail sediment: trails cut {cut:.3}; right after the rain {suspended:.3} suspended and {in_lake:.3} \
          settled in the lake; 4 s later {settled:.3} settled and {suspended2:.3} suspended; \
-         Clear Water settled {:.3}",
-        after_clear - before_clear
+         Clear Water settled {settled_on_clear:.4}"
     );
     assert!(cut > 0.01, "the rain carved nothing");
     assert!(
@@ -1790,10 +1810,9 @@ fn trail_sediment_reaches_the_lake() {
         suspended2 > 0.001,
         "nothing stayed suspended to check Clear Water with"
     );
-    // Heights read back as f16 (about 0.00024 apart here), so the sum of many small deposits is
-    // only good to tens of percent; before this, Clear Water deleted the load (0 settled).
+    // Before this, Clear Water deleted the load (0 settled).
     assert!(
-        after_clear - before_clear > 0.5 * suspended2,
+        settled_on_clear > 0.5 * suspended2 as f64,
         "Clear Water lost the suspended load"
     );
 }
@@ -3245,4 +3264,124 @@ fn wet_slopes_fail() {
     assert!(generation(&h) != start, "the wet slope did not fail");
     let centre = event.unwrap().centre;
     assert!(centre.x < 40.0, "the slide released off the steep slope ({centre})");
+}
+
+/// Rain soaks slopes until they fail: with the rain all soaking in (no water standing on the
+/// slope), the steady-state hillslope hydrology saturates the slab where enough area drains to
+/// it, and the 42° slope that holds dry fails.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn rain_soaks_slopes_until_they_fail() {
+    let bed = |x: u32, _y: u32| {
+        0.02 + 0.001 * (N - 1 - x) as f32 + 0.009 * (40.0 - x as f32).max(0.0)
+    };
+    let mut h = Harness::new(WaterSolver::Swe, &bed);
+    {
+        let mut water = h.water();
+        water.landslide.auto = true;
+        water.landslide.duration = 10.0;
+        water.landslide.speed = 5.0;
+        // Every drop soaks in: no water stands on the slope.
+        water.infiltration = 100.0;
+    }
+    let generation = |h: &Harness| h.app.world().resource::<Landslides>().generation;
+    let start = generation(&h);
+    h.run(3.0);
+    assert_eq!(generation(&h), start, "the dry slope failed");
+    h.water().rainfall = 30.0;
+    h.run(3.0);
+    let wet = *h.app.world().resource::<SlopeFailure>();
+    let standing = h.read_water().iter().map(|w| w.depth).fold(0.0f32, f32::max);
+    println!("rain: {wet:?}, deepest standing water {standing:.6}");
+    assert!(standing < 1e-4, "water stands on the slope ({standing})");
+    assert!(generation(&h) != start, "the soaked slope did not fail");
+}
+
+/// Data check of the drainage area: on the natural terrain, compare the area from the f16 display
+/// heights (what the drainage used to read back) with the area from the exact heights, and count flat texels and
+/// two-texel checkerboard (a texel far above or below all four neighbours) in each. Writes
+/// `heights.f32`, `drainage_f16.f32` and `drainage_exact.f32` (raw, N × N) to `TEST_DUMP` if set.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn inspect_drainage_precision() {
+    let mut h = Harness::natural(WaterSolver::Swe);
+    // The drainage readback finishes a few frames after the cascade.
+    for _ in 0..30 {
+        h.frame();
+    }
+    let heights = h.read_heights();
+    let display = h.read_display_heights();
+    let dx = h.app.world().resource::<WorldScale>().metres_per_texel;
+    let exact = bevy_erosion::drainage::drainage_area(&heights, UVec2::splat(N), dx, 0.0, &[]);
+    // What the drainage was computed from before the full-precision readback.
+    let app = DrainageArea {
+        size: UVec2::splat(N),
+        area: std::sync::Arc::new(bevy_erosion::drainage::drainage_area(
+            &display,
+            UVec2::splat(N),
+            dx,
+            0.0,
+            &[],
+        )),
+        heights: std::sync::Arc::new(display.clone()),
+        generation: 0,
+    };
+    let n = N as usize;
+    let flats = |f: &[f32]| {
+        let mut count = 0;
+        for y in 1..n - 1 {
+            for x in 1..n - 1 {
+                let c = f[y * n + x];
+                if [f[y * n + x - 1], f[y * n + x + 1], f[(y - 1) * n + x], f[(y + 1) * n + x]]
+                    .iter()
+                    .any(|&v| v == c)
+                {
+                    count += 1;
+                }
+            }
+        }
+        count
+    };
+    // Checkerboard: a texel whose log area differs from every 4-neighbour by more than ln 4 in
+    // the same direction (a spike or a pit in the area field).
+    let checker = |a: &[f32]| {
+        let mut count = 0;
+        for y in 1..n - 1 {
+            for x in 1..n - 1 {
+                let c = a[y * n + x].max(1.0).ln();
+                let nb = [a[y * n + x - 1], a[y * n + x + 1], a[(y - 1) * n + x], a[(y + 1) * n + x]]
+                    .map(|v| v.max(1.0).ln() - c);
+                if nb.iter().all(|&d| d > 1.386) || nb.iter().all(|&d| d < -1.386) {
+                    count += 1;
+                }
+            }
+        }
+        count
+    };
+    let app_heights: &[f32] = &app.heights;
+    let quant = heights
+        .iter()
+        .zip(app_heights)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    println!(
+        "drainage: f16 height error up to {quant:.6} hu ({:.2} m); flat texels {} (f16) vs {} \
+         (exact); checkerboard texels {} (f16) vs {} (exact); largest area {:.1} vs {:.1} km²",
+        quant * h.app.world().resource::<WorldScale>().metres_per_height(),
+        flats(app_heights),
+        flats(&heights),
+        checker(&app.area),
+        checker(&exact),
+        app.area.iter().copied().fold(0.0, f32::max) / 1e6,
+        exact.iter().copied().fold(0.0, f32::max) / 1e6,
+    );
+    if let Ok(dir) = std::env::var("TEST_DUMP") {
+        let write = |name: &str, f: &[f32]| {
+            let bytes: Vec<u8> = f.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(format!("{dir}/{name}"), bytes).unwrap();
+        };
+        write("heights.f32", &heights);
+        write("drainage_f16.f32", &app.area);
+        write("drainage_exact.f32", &exact);
+    }
 }

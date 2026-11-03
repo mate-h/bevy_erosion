@@ -1198,6 +1198,8 @@ fn blur_ao_vertical(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(1) @binding(0) var masks_out: texture_storage_2d<rgba16float, write>;
 // R = sediment above the bedrock (height units, 0 without bedrock), G = raw age.
 @group(1) @binding(1) var layers_out: texture_storage_2d<rgba16float, write>;
+// The heights at full precision, for CPU readbacks (the display texture is f16).
+@group(1) @binding(2) var height_exact_out: texture_storage_2d<r32float, write>;
 
 @compute @workgroup_size(8,8,1)
 fn blit_fields(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -1208,6 +1210,7 @@ fn blit_fields(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = py * params.map_size.x + px;
     let h = f32(atomicLoad(&height[idx])) / HEIGHT_SCALE;
     textureStore(masks_out, out_px, masks[idx]);
+    textureStore(height_exact_out, out_px, vec4<f32>(h, 0.0, 0.0, 0.0));
     var above_bedrock = 0.0;
     if (params.use_bedrock != 0u) {
         above_bedrock = max(h - layers[idx].x, 0.0);
