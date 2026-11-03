@@ -19,7 +19,7 @@ use bevy::{
     window::ExitCondition,
     winit::WinitPlugin,
 };
-use bevy_erosion::*;
+use bevy_erosion::{drainage::DrainageArea, *};
 use std::{
     f32::consts::PI,
     sync::{Arc, Mutex},
@@ -69,6 +69,25 @@ fn old_bed_load() -> BedLoad {
         k: 4.0 / TIME / unit.k_cells(GRAVITY, &scale()),
         ..unit
     }
+}
+
+/// The old Shape Beds geometry: a 10 texel wide, 0.008 deep channel for its reference
+/// discharge of 1 height unit × texel² per old second (2222 m³/s at 10 m texels), with the same
+/// exponents (Q^0.5, Q^0.4).
+fn old_channel() -> ChannelModel {
+    let q = scale().metres_per_height() * scale().metres_per_texel.powi(2) / TIME;
+    ChannelModel {
+        width_coef: 10.0 * scale().metres_per_texel / q.sqrt(),
+        depth_coef: 0.008 * scale().metres_per_height() / q.powf(0.4),
+        ..default()
+    }
+}
+
+/// Upstream catchment (km²) whose bankfull discharge is the old river brush's default (1 height
+/// unit × texel² per old second).
+fn old_river_catchment() -> f32 {
+    let q = scale().metres_per_height() * scale().metres_per_texel.powi(2) / TIME;
+    (q / ChannelModel::default().bankfull_k).powf(1.25)
 }
 
 /// Grain R·D in cells.
@@ -174,6 +193,7 @@ impl Harness {
                 live: false,
                 ..old_bed_load()
             };
+            water.channel = old_channel();
             water.sediment_capacity = 0.0;
             water.bed_load.live = false;
             if let Some(g) = std::env::var("TEST_GRAVITY")
@@ -2549,9 +2569,11 @@ fn river_brush_keeps_its_steps() {
         }
         let settings = RiverSettings {
             armour,
+            catchment: old_river_catchment(),
             ..default()
         };
-        let bed = h.water().bed;
+        let shape = river::ChannelShape::new(&h.water(), &scale());
+        let drainage = h.app.world().resource::<DrainageArea>().clone();
         let size = UVec2::splat(N);
         let placed = river::place(
             &heights,
@@ -2561,17 +2583,13 @@ fn river_brush_keeps_its_steps() {
             source,
             0.0,
             &settings,
-            &(&bed).into(),
+            &shape,
+            &drainage,
             1,
         )
         .expect("no route from the summit");
-        let spring = river::spring_for(&placed, &bed);
-        let cells = river::rasterize(
-            std::slice::from_ref(&placed),
-            &(&bed).into(),
-            &settings,
-            size,
-        );
+        let spring = river::spring_for(&placed, &shape);
+        let cells = river::rasterize(std::slice::from_ref(&placed), &shape, &settings, size);
         h.water().springs.push(spring);
         {
             let mut out = h.app.world_mut().resource_mut::<RiverBed>();
@@ -2680,9 +2698,12 @@ fn inspect_river_brush() {
         water.sediment_capacity = WaterControl::default().sediment_capacity;
     }
     let heights = h.read_heights();
-    let bed = h.water().bed;
-    let shape: river::ChannelShape = (&bed).into();
-    let settings = RiverSettings::default();
+    let shape = river::ChannelShape::new(&h.water(), &scale());
+    let drainage = h.app.world().resource::<DrainageArea>().clone();
+    let settings = RiverSettings {
+        catchment: old_river_catchment(),
+        ..default()
+    };
     let size = UVec2::splat(N);
     let sinuosity = |r: &river::River| {
         let ends = r.path[0].distance(*r.path.last().unwrap()).max(1.0);
@@ -2692,8 +2713,18 @@ fn inspect_river_brush() {
     for gy in (40..N - 40).step_by(24) {
         for gx in (40..N - 40).step_by(24) {
             let at = Vec2::new(gx as f32 + 0.5, gy as f32 + 0.5);
-            let Some(r) = river::place(&heights, &[], &[], size, at, 0.0, &settings, &shape, 1)
-            else {
+            let Some(r) = river::place(
+                &heights,
+                &[],
+                &[],
+                size,
+                at,
+                0.0,
+                &settings,
+                &shape,
+                &drainage,
+                1,
+            ) else {
                 continue;
             };
             let drop = (r.profile[0] - r.profile.last().unwrap()) * CELLS_PER_HEIGHT;
@@ -2713,7 +2744,19 @@ fn inspect_river_brush() {
         let (x, y) = v.split_once(',')?;
         Some(Vec2::new(x.parse().ok()?, y.parse().ok()?))
     }) {
-        Some(at) => river::place(&heights, &[], &[], size, at, 0.0, &settings, &shape, 1).unwrap(),
+        Some(at) => river::place(
+            &heights,
+            &[],
+            &[],
+            size,
+            at,
+            0.0,
+            &settings,
+            &shape,
+            &drainage,
+            1,
+        )
+        .unwrap(),
         None => best.expect("no river").1,
     };
     println!(
@@ -2722,7 +2765,7 @@ fn inspect_river_brush() {
         placed.path.len(),
         sinuosity(&placed)
     );
-    h.water().springs.push(river::spring_for(&placed, &bed));
+    h.water().springs.push(river::spring_for(&placed, &shape));
     {
         let mut out = h.app.world_mut().resource_mut::<RiverBed>();
         out.cells = std::sync::Arc::new(river::rasterize(

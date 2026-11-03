@@ -23,7 +23,8 @@ use crate::{
     WaterControl, WorldScale,
     camera::OrbitController,
     camera::OrbitInputBlocked,
-    river::{self, RiverBed, RiverSettings, Rivers},
+    drainage::DrainageArea,
+    river::{self, ChannelShape, RiverBed, RiverSettings, Rivers},
 };
 use bevy::{
     prelude::*,
@@ -297,8 +298,11 @@ fn paint_rivers(
     buttons: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     blocked: Res<OrbitInputBlocked>,
+    scale: Res<WorldScale>,
+    drainage: Res<DrainageArea>,
 ) {
     let size = cache.size;
+    let shape = ChannelShape::new(&water, &scale);
     let mut removed = std::mem::take(&mut brush.clear_rivers) && !rivers.list.is_empty();
     if removed {
         for r in &rivers.list {
@@ -337,7 +341,8 @@ fn paint_rivers(
             at,
             cache.sea_level,
             &brush.river,
-            &(&water.bed).into(),
+            &shape,
+            &drainage,
             seed,
         );
         match placed {
@@ -351,10 +356,15 @@ fn paint_rivers(
                 if water.springs.len() >= MAX_SPRINGS {
                     water.springs.remove(0);
                 }
-                let spring = river::spring_for(&r, &water.bed);
+                info!(
+                    "River: {:.1} m³/s at the source, {:.1} m³/s at the mouth",
+                    r.flow[0],
+                    r.flow.last().unwrap()
+                );
+                let spring = river::spring_for(&r, &shape);
                 water.springs.push(spring);
                 rivers.list.push(r);
-                river::rebuild(&rivers, &water.bed, &brush.river, size, &mut bed);
+                river::rebuild(&rivers, &shape, &brush.river, size, &mut bed);
             }
             None => info!(
                 "River: nowhere to flow from {at} (height {}, sea level {})",
@@ -661,6 +671,8 @@ fn draw_brush(
     keys: Res<ButtonInput<KeyCode>>,
     terrain: Query<(&TerrainSurface, &GlobalTransform)>,
     rivers: Res<Rivers>,
+    scale: Res<WorldScale>,
+    drainage: Res<DrainageArea>,
     mut preview: Local<(Option<UVec2>, Vec<Vec2>)>,
     mut gizmos: Gizmos,
 ) {
@@ -717,7 +729,8 @@ fn draw_brush(
                 hit.texel,
                 cache.sea_level,
                 &brush.river,
-                &(&water.bed).into(),
+                &ChannelShape::new(&water, &scale),
+                &drainage,
                 0,
             );
             preview.1 = place.map(|r| r.path).unwrap_or_default();

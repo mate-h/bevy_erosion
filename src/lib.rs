@@ -1129,6 +1129,8 @@ pub struct WaterControl {
     pub dt: f32,
     /// Bed reconstruction settings (see [`BedShaping`]).
     pub bed: BedShaping,
+    /// River channel sizes, for Shape Beds and the river brush.
+    pub channel: ChannelModel,
     /// Bump to reshape the beds of the current lakes and rivers once.
     pub shape_generation: u32,
     /// Bed load moved by the flow (see [`BedLoad`]).
@@ -1299,12 +1301,6 @@ pub struct BedShaping {
     pub bank_width: f32,
     /// Bank rise per texel away from the first bank cell.
     pub bank_slope: f32,
-    /// River thalweg depth below the banks at a channel discharge of about a default demo
-    /// spring; it grows with the discharge to the power 0.4.
-    pub river_depth: f32,
-    /// River half-width at the same discharge; it grows with the square root of the discharge,
-    /// up to the width of the flowing water.
-    pub river_width: f32,
     /// Averaged unit discharge (height units × texels per second) above which flowing water
     /// belongs to a channel.
     pub channel_discharge: f32,
@@ -1319,10 +1315,61 @@ impl Default for BedShaping {
             strength: 1.0,
             bank_width: 8.0,
             bank_slope: 0.0015,
-            river_depth: 0.008,
-            river_width: 5.0,
             channel_discharge: 0.02 / LEGACY_SECONDS,
         }
+    }
+}
+
+/// River channels from their discharge, shared by Shape Beds and the river brush (see
+/// `docs/UNIFIED_PLAN.md`): a catchment of A km² carries a bankfull discharge
+/// Q = k · A^0.8 m³/s, and a channel for Q is a_W · Q^0.5 m wide and a_H · Q^0.4 m deep
+/// (Leopold & Maddock 1953; Parker et al. 2007).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChannelModel {
+    /// k in Q = k · A^0.8: about 1–3 in humid regions, much less in arid ones.
+    pub bankfull_k: f32,
+    /// a_W in width = a_W · Q^0.5 (m).
+    pub width_coef: f32,
+    /// a_H in depth = a_H · Q^0.4 (m).
+    pub depth_coef: f32,
+    /// Narrowest channel (texels) the water can run in. Narrower ones are widened to it and made
+    /// shallower so they carry the same flow (Manning conveyance W · H^(5/3)).
+    pub min_width: f32,
+}
+
+impl Default for ChannelModel {
+    fn default() -> Self {
+        Self {
+            bankfull_k: 1.5,
+            width_coef: 4.4,
+            depth_coef: 0.3,
+            min_width: 3.0,
+        }
+    }
+}
+
+impl ChannelModel {
+    /// Bankfull discharge (m³/s) of a catchment of `area` m².
+    pub fn discharge(&self, area: f32) -> f32 {
+        self.bankfull_k * (area.max(0.0) / 1.0e6).powf(0.8)
+    }
+
+    /// Width and depth (m) of the channel for `q` m³/s, widened to [`Self::min_width`] texels.
+    pub fn section(&self, q: f32, scale: &WorldScale) -> (f32, f32) {
+        let q = q.max(1e-6);
+        let (w, h) = (self.width_coef * q.sqrt(), self.depth_coef * q.powf(0.4));
+        let min = self.min_width * scale.metres_per_texel;
+        if w < min {
+            (min, h * (w / min).powf(0.6))
+        } else {
+            (w, h)
+        }
+    }
+
+    /// Half-width (texels) and depth (height units) of the channel for `q` m³/s.
+    pub fn half_width_and_depth(&self, q: f32, scale: &WorldScale) -> (f32, f32) {
+        let (w, h) = self.section(q, scale);
+        (scale.texels(0.5 * w), scale.heights(h))
     }
 }
 
@@ -1339,9 +1386,7 @@ const DOMAIN_DEPTH: f32 = 2.0;
 /// Averaged speeds (m/s) below which water is still (a lake) and above which it is a river.
 const STILL_SPEED: f32 = 0.44;
 const RIVER_SPEED: f32 = 1.8;
-/// Channel discharge (height units × texels² per second) at which rivers get Shape Beds'
-/// `river_depth` and `river_width`: about a default demo spring, in the old solver seconds.
-pub const REFERENCE_DISCHARGE: f32 = 1.0 / LEGACY_SECONDS;
+
 const BED_OMEGA: f32 = 1.9;
 
 /// Uniform for `water_bed.wgsl` (one entry per red-black parity).
@@ -1358,14 +1403,15 @@ struct BedParams {
     strength: f32,
     bank_width: f32,
     bank_slope: f32,
-    river_depth: f32,
-    river_width: f32,
     channel_discharge: f32,
     domain_depth: f32,
     wet_depth: f32,
     still_speed: f32,
     river_speed: f32,
-    reference_discharge: f32,
+    q_to_si: f32,
+    width_coef: f32,
+    depth_coef: f32,
+    min_half_width: f32,
 }
 
 impl Default for WaterControl {
@@ -1388,6 +1434,7 @@ impl Default for WaterControl {
             time_scale: 50.0,
             dt: 0.0,
             bed: BedShaping::default(),
+            channel: ChannelModel::default(),
             shape_generation: 0,
             bed_load: BedLoad::default(),
             refine_generation: 0,
@@ -3190,14 +3237,15 @@ fn plan_erosion_frame(
         strength: bed.strength,
         bank_width: bed.bank_width.clamp(1.0, MAX_BANK_WIDTH),
         bank_slope: bed.bank_slope,
-        river_depth: bed.river_depth,
-        river_width: bed.river_width,
         channel_discharge: bed.channel_discharge,
         domain_depth: scale.heights(DOMAIN_DEPTH),
         wet_depth: WET_DEPTH / CELLS_PER_HEIGHT,
         still_speed: scale.texels(STILL_SPEED),
         river_speed: scale.texels(RIVER_SPEED),
-        reference_discharge: REFERENCE_DISCHARGE,
+        q_to_si: scale.metres_per_height() * scale.metres_per_texel * scale.metres_per_texel,
+        width_coef: water.channel.width_coef / (2.0 * scale.metres_per_texel),
+        depth_coef: water.channel.depth_coef / scale.metres_per_height(),
+        min_half_width: 0.5 * water.channel.min_width,
     };
     let offsets = [0, 1].map(|parity| buffers.water.bed_params.push(&bed_params(parity)));
     if water.shape_generation != state.last_shape && finest_ready {

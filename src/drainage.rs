@@ -39,6 +39,8 @@ const NEIGHBOURS: [(i32, i32); 8] = [
 #[derive(Resource, Clone, Default)]
 pub struct DrainageArea {
     pub size: UVec2,
+    /// The heights it was computed on (height units per map texel).
+    pub heights: Arc<Vec<f32>>,
     /// m² per map texel; empty before the first cascade has finished.
     pub area: Arc<Vec<f32>>,
     /// Bumped on every update.
@@ -108,6 +110,7 @@ fn refresh_drainage(
                 }
                 drainage.size = size;
                 drainage.area = Arc::new(area);
+                drainage.heights = Arc::new(heights);
                 drainage.generation = drainage.generation.wrapping_add(1);
             },
         );

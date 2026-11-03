@@ -7,8 +7,10 @@
 //! 2. [`smooth_path`]: the 8-connected cell path, smoothed and resampled every texel.
 //! 3. [`long_profile`]: the bank level along the path, made to run downhill. A rise up to
 //!    `breach_depth` is cut through; a higher one is left for the water to fill as a lake.
-//! 4. [`rasterize`]: the channel and its banks, per texel. Depth ∝ Q^0.4 and half-width
-//!    ∝ Q^0.5 with Shape Beds' cross-section and bank grading ([`crate::BedShaping`]). The bed
+//! 4. [`rasterize`]: the channel and its banks, per texel, sized by [`crate::ChannelModel`] for
+//!    the bankfull discharge along the path: that of its drainage area
+//!    ([`crate::drainage::DrainageArea`]) plus the catchment upstream of the click. Shape Beds'
+//!    cross-section and bank grading ([`crate::BedShaping`]) shape the banks. The bed
 //!    detail follows the reach: step-pools above about 3 % slope, riffle-pools above about 1 %,
 //!    and point bars on the inside of bends everywhere.
 //!
@@ -17,29 +19,20 @@
 //! water erosion, settling, slumping and bed load keep to.
 
 use crate::{
-    BedShaping, ErosionConfig, ErosionImages, PyramidProgress, WaterControl, brush::WaterBrush,
+    BedShaping, CELLS_PER_HEIGHT, ChannelModel, ErosionConfig, WaterControl, WorldScale,
+    brush::WaterBrush, drainage::DrainageArea,
 };
 use bevy::{
     prelude::*,
-    render::{
-        RenderApp,
-        extract_resource::ExtractResource,
-        gpu_readback::{Readback, ReadbackComplete},
-    },
+    render::{RenderApp, extract_resource::ExtractResource},
 };
 use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc};
 
-/// Map texels per height unit, as drawn (and as `water.wgsl` counts cells).
-const CELLS_PER_HEIGHT: f32 = 100.0;
-/// Water deeper than this (height units) ends a route: a lake or another river.
-const STOP_DEPTH: f32 = 0.002;
+/// Water deeper than this (texels of depth, as [`crate::WET_DEPTH`]) ends a route: a lake or
+/// another river.
+const STOP_DEPTH: f32 = 0.2 / CELLS_PER_HEIGHT;
 /// Water this close to the source (texels) does not end the route: it is the source's own.
 const SOURCE_REACH: f32 = 6.0;
-/// Discharge doubles over this many texels downstream.
-const DOUBLING_LENGTH: f32 = 256.0;
-/// Channel discharge at which rivers get Shape Beds' `river_depth` and `river_width`
-/// (`REFERENCE_DISCHARGE` in `water_bed.wgsl`).
-const REFERENCE_DISCHARGE: f32 = 1.0;
 /// Local slope (cells per texel) where step-pools take over from riffle-pools, and where
 /// riffle-pools take over from a plain bed.
 const STEP_POOL_SLOPE: (f32, f32) = (0.02, 0.04);
@@ -66,9 +59,9 @@ pub struct RiverBed {
 /// River brush settings.
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
 pub struct RiverSettings {
-    /// Discharge at the source (height units × texels² per second); 1 gives Shape Beds' River
-    /// Depth and River Width.
-    pub discharge: f32,
+    /// Catchment upstream of the click beyond what the map drains to it (km²): a river that
+    /// comes from off the map, or from a larger range than the map shows.
+    pub catchment: f32,
     /// How much of the carved bed the water may not rework: 1 keeps every step up and every pool
     /// open, 0 leaves the bed to the water, which wears the steps down and fills the pools.
     pub armour: f32,
@@ -82,7 +75,7 @@ pub struct RiverSettings {
 impl Default for RiverSettings {
     fn default() -> Self {
         Self {
-            discharge: 1.0,
+            catchment: 100.0,
             armour: 1.0,
             bed_detail: 1.0,
             breach_depth: 0.03,
@@ -94,7 +87,10 @@ impl Default for RiverSettings {
 #[derive(Clone, Debug, PartialEq)]
 pub struct River {
     pub source: Vec2,
-    pub discharge: f32,
+    /// Catchment upstream of the source (m²), beyond the map's own drainage.
+    pub catchment: f32,
+    /// Bankfull discharge (m³/s) at each path sample.
+    pub flow: Vec<f32>,
     /// Seeds the step and pool spacing.
     pub seed: u32,
     /// Centreline, one sample per texel, in map texels.
@@ -103,32 +99,39 @@ pub struct River {
     pub profile: Vec<f32>,
 }
 
-/// Hydraulic geometry and bank grading, from [`crate::BedShaping`].
+/// Hydraulic geometry ([`ChannelModel`]) and bank grading ([`BedShaping`]).
 #[derive(Clone, Copy, Debug)]
 pub struct ChannelShape {
-    pub river_depth: f32,
-    pub river_width: f32,
+    pub model: ChannelModel,
+    pub scale: WorldScale,
     pub profile: f32,
     pub max_depth: f32,
     pub bank_width: f32,
     pub bank_slope: f32,
 }
 
-impl From<&BedShaping> for ChannelShape {
-    fn from(bed: &BedShaping) -> Self {
+impl ChannelShape {
+    pub fn new(water: &WaterControl, scale: &WorldScale) -> Self {
+        let bed: &BedShaping = &water.bed;
         Self {
-            river_depth: bed.river_depth,
-            river_width: bed.river_width,
+            model: water.channel,
+            scale: *scale,
             profile: bed.profile,
             max_depth: bed.max_depth,
             bank_width: bed.bank_width.clamp(1.0, crate::MAX_BANK_WIDTH),
             bank_slope: bed.bank_slope,
         }
     }
+
+    /// Half-width (texels) and depth (height units) of the channel for `q` m³/s.
+    pub fn section(&self, q: f32) -> (f32, f32) {
+        self.model.half_width_and_depth(q, &self.scale)
+    }
 }
 
 /// The rivers placed with the brush. They survive reruns of the cascade: once it finishes,
-/// [`refresh_after_cascade`] gives them the new terrain's bank levels and carves them again.
+/// [`refresh_after_cascade`] gives them the new terrain's bank levels and flows and carves them
+/// again.
 #[derive(Resource, Default)]
 pub struct Rivers {
     pub list: Vec<River>,
@@ -145,12 +148,12 @@ impl Rivers {
 /// Rasterize `rivers` for the render world, which carves them on its next finished frame.
 pub fn rebuild(
     rivers: &Rivers,
-    bed: &BedShaping,
+    shape: &ChannelShape,
     settings: &RiverSettings,
     size: UVec2,
     out: &mut RiverBed,
 ) {
-    out.cells = Arc::new(rasterize(&rivers.list, &bed.into(), settings, size));
+    out.cells = Arc::new(rasterize(&rivers.list, shape, settings, size));
     out.generation = out.generation.wrapping_add(1);
 }
 
@@ -159,13 +162,17 @@ pub fn rebuild(
 const SPRING_SHARE: f32 = 0.5;
 
 /// The spring that feeds a river, over a disc about the channel's width.
-pub fn spring_for(river: &River, bed: &BedShaping) -> crate::Spring {
-    let radius = (bed.river_width * river.discharge.max(1e-6).sqrt()).max(2.0);
+pub fn spring_for(river: &River, shape: &ChannelShape) -> crate::Spring {
+    let q = river.flow.first().copied().unwrap_or(0.0);
+    let radius = shape.section(q).0.max(2.0);
+    // In height units × texels² per second.
+    let scale = &shape.scale;
+    let q = q / (scale.metres_per_height() * scale.metres_per_texel * scale.metres_per_texel);
     // A spring adds `rate` at its centre, falling off as (1 − r²)², which integrates to πR²/3.
     crate::Spring {
         center: river.source,
         radius,
-        rate: SPRING_SHARE * river.discharge * 3.0 / (std::f32::consts::PI * radius * radius),
+        rate: SPRING_SHARE * q * 3.0 / (std::f32::consts::PI * radius * radius),
     }
 }
 
@@ -178,48 +185,36 @@ impl Plugin for RiverPlugin {
     }
 }
 
-#[derive(Component)]
-struct RiverReadback;
-
-/// When a rerun of the cascade finishes, read its heights back and give every river the new
-/// terrain's bank levels (its path stays). The raster then goes to the render world.
+/// When a rerun of the cascade finishes and its drainage area is in, give every river the new
+/// terrain's bank levels and flows (its path stays). The raster then goes to the render world.
 fn refresh_after_cascade(
-    mut commands: Commands,
-    progress: Option<Res<PyramidProgress>>,
-    rivers: Res<Rivers>,
-    images: Option<Res<ErosionImages>>,
-    config: Res<ErosionConfig>,
-    pending: Query<(), With<RiverReadback>>,
-    mut was_finished: Local<bool>,
+    drainage: Res<DrainageArea>,
+    mut rivers: ResMut<Rivers>,
+    brush: Res<WaterBrush>,
+    water: Res<WaterControl>,
+    scale: Res<WorldScale>,
+    mut bed: ResMut<RiverBed>,
 ) {
-    let (Some(progress), Some(images)) = (progress, images) else {
-        return;
-    };
-    let finished = progress.get().finished;
-    let rising = finished && !*was_finished;
-    *was_finished = finished;
-    if !rising || rivers.list.is_empty() || !pending.is_empty() {
+    if !drainage.is_changed() || drainage.area.is_empty() || rivers.list.is_empty() {
         return;
     }
-    let size = config.map_size;
-    commands
-        .spawn((Readback::texture(images.height.clone()), RiverReadback))
-        .observe(
-            move |ev: On<ReadbackComplete>,
-                  mut commands: Commands,
-                  mut rivers: ResMut<Rivers>,
-                  brush: Res<WaterBrush>,
-                  water: Res<WaterControl>,
-                  mut bed: ResMut<RiverBed>| {
-                commands.entity(ev.entity).despawn();
-                let mut heights = Vec::new();
-                crate::brush::read_red_channel(&ev.data, size, &mut heights);
-                for river in &mut rivers.list {
-                    reprofile(river, &heights, size, brush.river.breach_depth);
-                }
-                rebuild(&rivers, &water.bed, &brush.river, size, &mut bed);
-            },
+    let shape = ChannelShape::new(&water, &scale);
+    for river in &mut rivers.list {
+        reprofile(
+            river,
+            &drainage.heights,
+            drainage.size,
+            brush.river.breach_depth,
         );
+        set_flow(river, &drainage, &shape.model);
+        info!(
+            "River from {}: {:.1} m³/s at the source, {:.1} m³/s at the mouth",
+            river.source,
+            river.flow[0],
+            river.flow.last().unwrap()
+        );
+    }
+    rebuild(&rivers, &shape, &brush.river, drainage.size, &mut bed);
 }
 
 /// Armour only sets the band `river_carve` writes, so a change re-sends the raster. (Bed Detail
@@ -228,13 +223,15 @@ fn follow_armour(
     brush: Res<WaterBrush>,
     rivers: Res<Rivers>,
     water: Res<WaterControl>,
+    scale: Res<WorldScale>,
     config: Res<ErosionConfig>,
     mut bed: ResMut<RiverBed>,
     mut last: Local<Option<f32>>,
 ) {
     let armour = brush.river.armour;
     if last.replace(armour).is_some_and(|a| a != armour) && !rivers.list.is_empty() {
-        rebuild(&rivers, &water.bed, &brush.river, config.map_size, &mut bed);
+        let shape = ChannelShape::new(&water, &scale);
+        rebuild(&rivers, &shape, &brush.river, config.map_size, &mut bed);
     }
 }
 
@@ -437,10 +434,9 @@ fn sections(river: &River, shape: &ChannelShape, detail: f32) -> Vec<Section> {
         let m = shape.max_depth.max(1e-6);
         m * (1.0 - (-d / m).exp())
     };
-    let flow =
-        |i: usize| river.discharge * (1.0 + i as f32 / DOUBLING_LENGTH) / REFERENCE_DISCHARGE;
-    let width = |i: usize| (shape.river_width * flow(i).max(1e-6).sqrt()).max(1.0);
-    let base = |i: usize| soft_cap(shape.river_depth * flow(i).max(1e-6).powf(0.4));
+    let flow = |i: usize| river.flow.get(i).copied().unwrap_or(0.0);
+    let width = |i: usize| shape.section(flow(i)).0.max(1.0);
+    let base = |i: usize| soft_cap(shape.section(flow(i)).1);
     let tangent = |i: usize| {
         let a = river.path[i.saturating_sub(1)];
         let b = river.path[(i + 1).min(n - 1)];
@@ -668,7 +664,8 @@ pub fn rasterize(
     cells
 }
 
-/// Route a river from `source` and give it its bank level, or `None` if it goes nowhere.
+/// Route a river from `source` and give it its bank level and flow, or `None` if it goes
+/// nowhere. `drainage` sizes it; before the first one is in, only the upstream catchment does.
 #[allow(clippy::too_many_arguments)]
 pub fn place(
     heights: &[f32],
@@ -679,6 +676,7 @@ pub fn place(
     sea_level: f32,
     settings: &RiverSettings,
     shape: &ChannelShape,
+    drainage: &DrainageArea,
     seed: u32,
 ) -> Option<River> {
     let mut taken = vec![false; (size.x * size.y) as usize];
@@ -687,22 +685,39 @@ pub fn place(
         taken[(c.y * size.x + c.x) as usize] = true;
     }
     let cells = route(heights, water, &taken, size, source, sea_level);
-    let radius = (shape.river_width * settings.discharge.max(1e-6).sqrt())
-        .round()
-        .max(2.0) as usize;
+    let catchment = settings.catchment.max(0.0) * 1.0e6;
+    let q = shape.model.discharge(catchment + drainage.at(source));
+    let radius = shape.section(q).0.round().max(2.0) as usize;
     let path = smooth_path(&cells, radius);
     if path.len() < 4 {
         return None;
     }
     let mut river = River {
         source,
-        discharge: settings.discharge,
+        catchment,
+        flow: Vec::new(),
         seed,
         path,
         profile: Vec::new(),
     };
     reprofile(&mut river, heights, size, settings.breach_depth);
+    set_flow(&mut river, drainage, &shape.model);
     Some(river)
+}
+
+/// Bankfull discharge along `river` from its drainage area, which only grows downstream (the
+/// multiple-flow-direction area dips where flow spreads across the path), plus its upstream
+/// catchment.
+pub fn set_flow(river: &mut River, drainage: &DrainageArea, model: &ChannelModel) {
+    let mut area = 0.0f32;
+    river.flow = river
+        .path
+        .iter()
+        .map(|p| {
+            area = area.max(drainage.at(*p));
+            model.discharge(river.catchment + area)
+        })
+        .collect();
 }
 
 /// Bank level of `river` on the terrain `heights` (after the terrain changed under it).

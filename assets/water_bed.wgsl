@@ -46,8 +46,6 @@ struct BedParams {
     strength: f32,
     bank_width: f32,
     bank_slope: f32,
-    river_depth: f32,
-    river_width: f32,
     channel_discharge: f32,
     // Depth above which still water belongs to the domain (above `water.wgsl`'s wet depth, so
     // thin sheet flow on hillslopes only joins where it carries enough discharge), and the wet
@@ -58,9 +56,13 @@ struct BedParams {
     // which it is a river.
     still_speed: f32,
     river_speed: f32,
-    // Channel discharge (height units × texels² per second) at which rivers get `river_depth`
-    // and `river_width`.
-    reference_discharge: f32,
+    // Hydraulic geometry (`ChannelModel` in `lib.rs`): section discharge to m³/s, half-width
+    // (texels) per √(m³/s), depth (height units) per (m³/s)^0.4, and the narrowest half-width
+    // (texels), to which narrower channels widen at the same conveyance.
+    q_to_si: f32,
+    width_coef: f32,
+    depth_coef: f32,
+    min_half_width: f32,
 }
 
 @group(0) @binding(0) var<storage, read_write> height: array<atomic<u32>>;
@@ -207,9 +209,14 @@ fn bed_prior(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = clamp(0.5 * sqrt(g2) / b, 0.0, 1.0);
     // Hydraulic geometry from the channel discharge. Where the flowing domain is wider than the
     // channel the discharge asks for (sheet flow), the channel takes its middle.
-    let flow = section_discharge(p) / params.reference_discharge;
-    let thalweg = params.river_depth * pow(flow, 0.4);
-    let half_width = clamp(params.river_width * pow(flow, 0.5), 0.5, b);
+    let flow = section_discharge(p) * params.q_to_si;
+    var thalweg = params.depth_coef * pow(flow, 0.4);
+    var hw = params.width_coef * sqrt(flow);
+    if (hw < params.min_half_width) {
+        thalweg *= pow(hw / params.min_half_width, 0.6);
+        hw = params.min_half_width;
+    }
+    let half_width = clamp(hw, 0.5, b);
     let x = min(n * b / half_width, 1.0);
     let river = soft_cap(thalweg) * pow(max(1.0 - x * x, 0.0), params.profile);
     // sqrt(2τ) grows like the distance to the shore near the banks and is the radius at the

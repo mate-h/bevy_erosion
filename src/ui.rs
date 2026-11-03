@@ -179,8 +179,10 @@ enum ErosionSliderFieldKind {
     BedProfile,
     BedStrength,
     BedBankWidth,
-    BedRiverDepth,
-    BedRiverWidth,
+    ChannelBankfullK,
+    ChannelWidthCoef,
+    ChannelDepthCoef,
+    ChannelMinWidth,
     BedChannelDischarge,
     WaterRainWater,
     BedLoadDiameter,
@@ -191,7 +193,7 @@ enum ErosionSliderFieldKind {
     BedLoadMorphFactor,
     BedLoadRefineHours,
     BedLoadRockHardness,
-    RiverBrushDischarge,
+    RiverBrushCatchment,
     RiverBrushArmour,
     RiverBrushDetail,
     RiverBrushBreach,
@@ -212,6 +214,8 @@ enum Shown {
     Slope,
     /// A frequency per texel, shown as its wavelength in metres.
     Wavelength,
+    /// Height units × texels per second, shown in m²/s.
+    UnitDischarge,
 }
 
 impl Shown {
@@ -223,6 +227,7 @@ impl Shown {
             Self::Height => v * world.metres_per_height(),
             Self::Slope => v * CELLS_PER_HEIGHT * 100.0,
             Self::Wavelength => world.metres_per_texel / v.max(1e-9),
+            Self::UnitDischarge => v * world.metres_per_height() * world.metres_per_texel,
         }
     }
 
@@ -234,6 +239,7 @@ impl Shown {
             Self::Height => v / world.metres_per_height(),
             Self::Slope => v / (CELLS_PER_HEIGHT * 100.0),
             Self::Wavelength => world.metres_per_texel / v.max(1e-9),
+            Self::UnitDischarge => v / (world.metres_per_height() * world.metres_per_texel),
         }
     }
 }
@@ -246,14 +252,13 @@ impl ErosionSliderFieldKind {
             | Self::HydroSearchDistance
             | Self::OutflowBorder
             | Self::BrushRadius
-            | Self::BedBankWidth
-            | Self::BedRiverWidth => Shown::Length,
+            | Self::BedBankWidth => Shown::Length,
             Self::NoiseScale
             | Self::OutflowSeaLevel
             | Self::BedrockDepth
             | Self::BedMaxDepth
-            | Self::BedRiverDepth
             | Self::RiverBrushBreach => Shown::Height,
+            Self::BedChannelDischarge => Shown::UnitDischarge,
             Self::BedShoreSlope => Shown::Slope,
             Self::NoiseFrequency | Self::MaskFrequency => Shown::Wavelength,
             _ => Shown::Plain,
@@ -323,7 +328,7 @@ impl ErosionSliderFieldKind {
             Self::GranularityStrength => params.granularity_strength = value,
             Self::AgeStrength => params.age_strength = value,
             Self::BrushRadius => brush.radius = value,
-            Self::RiverBrushDischarge => brush.river.discharge = value,
+            Self::RiverBrushCatchment => brush.river.catchment = value,
             Self::RiverBrushArmour => brush.river.armour = value,
             Self::RiverBrushDetail => brush.river.bed_detail = value,
             Self::RiverBrushBreach => brush.river.breach_depth = value,
@@ -338,8 +343,10 @@ impl ErosionSliderFieldKind {
             Self::BedProfile => water.bed.profile = value,
             Self::BedStrength => water.bed.strength = value,
             Self::BedBankWidth => water.bed.bank_width = value,
-            Self::BedRiverDepth => water.bed.river_depth = value,
-            Self::BedRiverWidth => water.bed.river_width = value,
+            Self::ChannelBankfullK => water.channel.bankfull_k = value,
+            Self::ChannelWidthCoef => water.channel.width_coef = value,
+            Self::ChannelDepthCoef => water.channel.depth_coef = value,
+            Self::ChannelMinWidth => water.channel.min_width = value,
             Self::BedChannelDischarge => water.bed.channel_discharge = value,
             // Shown per thousand trail steps.
             Self::WaterRainWater => water.rain_water = value / 1000.0,
@@ -375,8 +382,10 @@ impl ErosionSliderFieldKind {
                 | Self::BedProfile
                 | Self::BedStrength
                 | Self::BedBankWidth
-                | Self::BedRiverDepth
-                | Self::BedRiverWidth
+                | Self::ChannelBankfullK
+                | Self::ChannelWidthCoef
+                | Self::ChannelDepthCoef
+                | Self::ChannelMinWidth
                 | Self::BedChannelDischarge
                 | Self::WaterRainWater
                 | Self::BedLoadDiameter
@@ -388,7 +397,7 @@ impl ErosionSliderFieldKind {
                 | Self::BedLoadRefineHours
                 | Self::BedLoadRockHardness
                 // New rivers take the discharge; armour re-sends the existing beds.
-                | Self::RiverBrushDischarge
+                | Self::RiverBrushCatchment
                 | Self::RiverBrushArmour
         )
     }
@@ -849,7 +858,7 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl, world: WorldScale)
                     @section("River Brush", true, bsn_list! {
                         @note_text("Click the terrain: a river routes itself downhill from there, with a carved bed and a spring.")
                         --
-                        @slider_row(world, "Discharge", 0.1, 8.0, brush.river.discharge, ErosionSliderFieldKind::RiverBrushDischarge)
+                        @slider_row(world, "Upstream Catchment (km²)", 0.0, 5000.0, brush.river.catchment, ErosionSliderFieldKind::RiverBrushCatchment)
                         --
                         @slider_row(world, "Armour", 0.0, 1.0, brush.river.armour, ErosionSliderFieldKind::RiverBrushArmour)
                         --
@@ -917,11 +926,17 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl, world: WorldScale)
                             water.shape_generation = water.shape_generation.wrapping_add(1);
                         })
                         --
-                        @slider_row(world, "River Depth (m)", 0.0, 0.03, water.bed.river_depth, ErosionSliderFieldKind::BedRiverDepth)
+                        @slider_row(world, "Channel Discharge (m²/s)", 0.0, 0.01, water.bed.channel_discharge, ErosionSliderFieldKind::BedChannelDischarge)
                         --
-                        @slider_row(world, "River Half-Width (m)", 1.0, 16.0, water.bed.river_width, ErosionSliderFieldKind::BedRiverWidth)
+                        @note_text("Channel size: bankfull Q = k·A^0.8 m³/s for a catchment of A km², width a_W·Q^0.5 m, depth a_H·Q^0.4 m. Used by Shape Beds and the river brush.")
                         --
-                        @slider_row(world, "Channel Discharge", 0.0, 0.2, water.bed.channel_discharge, ErosionSliderFieldKind::BedChannelDischarge)
+                        @slider_row(world, "Bankfull k", 0.05, 5.0, water.channel.bankfull_k, ErosionSliderFieldKind::ChannelBankfullK)
+                        --
+                        @slider_row(world, "Width a_W", 1.0, 10.0, water.channel.width_coef, ErosionSliderFieldKind::ChannelWidthCoef)
+                        --
+                        @slider_row(world, "Depth a_H", 0.05, 1.0, water.channel.depth_coef, ErosionSliderFieldKind::ChannelDepthCoef)
+                        --
+                        @slider_row(world, "Min Width (texels)", 1.0, 8.0, water.channel.min_width, ErosionSliderFieldKind::ChannelMinWidth)
                         --
                         @slider_row(world, "Max Depth (m)", 0.0, 0.1, water.bed.max_depth, ErosionSliderFieldKind::BedMaxDepth)
                         --
