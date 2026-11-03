@@ -457,6 +457,37 @@ Status (Phase 8): built (`src/boulders.rs`, `assets/boulders.wgsl`).
   wgpu matches Bevy's and that it can share the device with the erosion passes; otherwise
   prototype it standalone.
 
+Status (Phase 9): a first version, built on our own MPM rather than nexus
+(`src/landslide.rs`, `assets/landslide.wgsl`).
+
+- **Why not nexus**: its GPU layer (khal 0.4) is on wgpu 30, like Bevy 0.20, so the device could
+  be shared; but its shaders are Rust compiled to SPIR-V by rust-gpu at build time (the
+  `nexus_mpm_shaders3d` build script), which needs the rust-gpu nightly toolchain on every build,
+  and it runs one fixed 3D domain. A compact MLS-MPM in WGSL fits the local-event design and the
+  existing passes.
+- **Release**: the Landslide brush (or `Landslides::release`) takes a slab under a disc with a
+  paraboloid slip surface (Depth at the centre, default 25 m) off the terrain and spawns it as
+  particles, 4 × 4 per texel and layered half a cell apart, each carrying its share of the slab's
+  volume.
+- **Run**: MLS-MPM (Hu et al. 2018) in a local box of 128 × 64 × 128 nodes, half a texel per cell
+  (640 m across at 10 m texels), 0.02 s substeps on real time × speed. The debris is a frictional
+  granular continuum: pressure c²·max(1/J − 1, 0) resists compaction only, and a shear viscosity
+  μ·p / γ̇ holds the shear stress at μ·p (Drucker–Prager in its simplest form, friction angle 30°),
+  capped at the explicit step's limit. The terrain is the boundary: grid nodes in the ground lose
+  their velocity into it and slide along it with Coulomb friction (20°).
+- **Coupling**: every frame the particles write their volume into the heights and the next frame
+  takes exactly that back out first (a per-texel record), so the water, the bed load and the
+  drawing see the debris move. At the end of the event (default 60 s of slide) the last write
+  stays: the deposit.
+- **Test**: `landslide_runs_downhill`: a slab released on a 35° slope above a break runs down and
+  spreads onto the gentle slope below it (mass centre from x 13 to x 28), with the volume kept to
+  rounding.
+- Not yet: slopes failing on their own (a factor-of-safety check from the slope, KTT's rock
+  hardness and the water), μ(I) rheology and dilatancy, water in the debris (debris flows),
+  boulders and grain sizes carried by the slide, drawing the particles themselves, and panel
+  settings beyond the brush radius (Depth, friction angles, duration and speed live in
+  `LandslideSettings`).
+
 ## How it was built
 
 Decisions taken while implementing, where they differ from or sharpen the plan above.
@@ -495,7 +526,7 @@ Decisions taken while implementing, where they differ from or sharpen the plan a
 
 ### Status
 
-Done: Phases 1–8 as above (7 and 8 under Rocks and boulders), with every GPU test (`water_swe_gpu`, all but the `validate_` and
+Done: Phases 1–8 as above (7 and 8 under Rocks and boulders) and a first Phase 9, with every GPU test (`water_swe_gpu`, all but the `validate_` and
 `inspect_` sweeps) passing at the old-equivalent settings.
 
 Not done:

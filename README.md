@@ -113,6 +113,14 @@ all. Up to 4096 at a time.
 | Drag Coefficient | C_d on the frontal area in the flow |
 | Friction | Tangent of the pivot angle: how hard a resting boulder is to set moving |
 
+## Landslides
+
+With the Landslide brush, a click releases a landslide under the brush: a slab 25 m deep at the
+centre (thinning to the rim) leaves the terrain and runs as a granular flow (MPM, on the GPU, in a
+640 m box around it at 10 m texels). It comes to rest at about its friction angle, and for a
+minute of slide time the moving debris is part of the terrain, so the water flows over and
+around it. What is left at the end is the deposit.
+
 ## KTT rivers
 
 **Do Rivers** turns on KTT's river momentum: every trail leaves momentum behind it, and where it

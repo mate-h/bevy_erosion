@@ -21,6 +21,7 @@ use bevy::{
 };
 use bevy_erosion::{
     boulders::{Boulder, BoulderEdits, BoulderList},
+    landslide::Landslides,
     drainage::DrainageArea,
     *,
 };
@@ -3154,4 +3155,60 @@ fn boulders_jam_against_a_big_one() {
     assert!(alone[0] > 2.0, "the lone boulder stayed ({})", alone[0]);
     assert!(jammed[0] < 0.5, "the small boulder went through the large one ({})", jammed[0]);
     assert!(jammed[1].abs() < 0.5, "the large boulder was pushed away ({})", jammed[1]);
+}
+
+/// Landslides with MPM: a slab released high on a slope that is steep (35°) above x = 24 and
+/// gentle below runs down and spreads onto the gentle part. Its volume is kept, and the material
+/// ends up downhill of where it left.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn landslide_runs_downhill() {
+    let bed = |x: u32, _y: u32| {
+        0.02 + 0.001 * (N - 1 - x) as f32 + 0.007 * (24.0 - x as f32).max(0.0)
+    };
+    let mut h = Harness::new(WaterSolver::Swe, &bed);
+    let before = h.read_heights();
+    {
+        let scale = *h.app.world().resource::<WorldScale>();
+        let mut slides = h.app.world_mut().resource_mut::<Landslides>();
+        slides.settings.duration = 40.0;
+        slides.settings.speed = 4.0;
+        slides.release(Vec2::new(14.0, N as f32 / 2.0), 8.0, &before, UVec2::splat(N), &scale);
+    }
+    h.run(1.0);
+    let during = h.read_heights();
+    h.run(10.0);
+    let after = h.read_heights();
+    let total = |f: &[f32]| f.iter().map(|&v| v as f64).sum::<f64>();
+    let (v0, v1) = (total(&before), total(&after));
+    // Where the material left and where it went: x weighted by the height lost and gained.
+    let mut lost = (0.0f64, 0.0f64);
+    let mut gained = (0.0f64, 0.0f64);
+    for (i, (a, b)) in before.iter().zip(&after).enumerate() {
+        let d = (b - a) as f64;
+        let x = (i as u32 % N) as f64;
+        if d < 0.0 {
+            lost = (lost.0 - d, lost.1 - d * x);
+        } else {
+            gained = (gained.0 + d, gained.1 + d * x);
+        }
+    }
+    let (from, to) = (lost.1 / lost.0.max(1e-12), gained.1 / gained.0.max(1e-12));
+    let moving = during.iter().zip(&before).filter(|(a, b)| (*a - *b).abs() > 1e-4).count();
+    println!(
+        "landslide: volume {v0:.4} -> {v1:.4} height units·texels, {:.4} moved, from x {from:.1} \
+         to x {to:.1}; {moving} texels changed after a second",
+        lost.0
+    );
+    if std::env::var("TEST_PROFILE").is_ok() {
+        let row: Vec<String> = (0..N)
+            .step_by(2)
+            .map(|x| format!("{:+.4}", after[idx(x, N / 2)] - before[idx(x, N / 2)]))
+            .collect();
+        println!("centre line: {}", row.join(" "));
+    }
+    assert!(after.iter().all(|v| v.is_finite()), "non-finite heights");
+    assert!(lost.0 > 0.05, "nothing moved ({})", lost.0);
+    assert!(((v1 - v0) / lost.0).abs() < 0.05, "volume not kept ({v0} -> {v1}, {} moved)", lost.0);
+    assert!(to > from + 4.0, "the slide did not run downhill (from {from} to {to})");
 }

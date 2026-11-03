@@ -688,6 +688,7 @@ fn update_brush_ui(
             BrushMode::WaterBody => "Drag: pour · Shift: remove · Alt+click: spring",
             BrushMode::River => "Click: river from here · Shift+click: remove",
             BrushMode::Boulders => "Drag: drop boulders · Shift+drag: remove",
+            BrushMode::Landslide => "Click: release a landslide under the brush",
         }
     };
     for mut text in &mut hints {
@@ -862,6 +863,8 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl, world: WorldScale)
                             @brush_mode_button("River", BrushMode::River)
                             --
                             @brush_mode_button("Boulders", BrushMode::Boulders)
+                            --
+                            @brush_mode_button("Landslide", BrushMode::Landslide)
                         })
                         --
                         Node {

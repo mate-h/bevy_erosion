@@ -10,7 +10,8 @@ use bevy::{
         render_resource::{
             TextureFormat, TextureUsages,
             binding_types::{
-                storage_buffer, storage_buffer_read_only, texture_2d, texture_storage_2d,
+                storage_buffer, storage_buffer_read_only, storage_buffer_sized, texture_2d,
+                texture_storage_2d,
                 uniform_buffer,
             },
             *,
@@ -34,6 +35,7 @@ pub mod boulders;
 pub mod brush;
 pub mod camera;
 pub mod drainage;
+pub mod landslide;
 pub mod river;
 pub mod sun;
 
@@ -50,6 +52,7 @@ const WATER_MORPHO_SHADER: &str = "water_morpho.wgsl";
 const WATER_SPLAT_SHADER: &str = "water_splat.wgsl";
 const RIVER_SHADER: &str = "river.wgsl";
 const BOULDER_SHADER: &str = "boulders.wgsl";
+const LANDSLIDE_SHADER: &str = "landslide.wgsl";
 /// Erode dispatches per `writeBack` at geological age 0 (`Compute_Erosion.iterations`).
 const ERODE_ITERS_PER_WRITEBACK: u32 = 200;
 /// Erode dispatches between our `writeBack`s. KTT runs one per level, after every batch of
@@ -1807,7 +1810,11 @@ impl Plugin for ErosionComputePlugin {
                 ExtractResourcePlugin::<WaterControl>::default(),
                 ExtractResourcePlugin::<river::RiverBed>::default(),
             ))
-            .add_plugins((drainage::DrainagePlugin, boulders::BoulderPlugin))
+            .add_plugins((
+                drainage::DrainagePlugin,
+                boulders::BoulderPlugin,
+                landslide::LandslidePlugin,
+            ))
             .init_resource::<TerrainView>()
             .add_systems(Startup, setup_erosion_resources)
             .add_systems(PostUpdate, (update_water_time, sync_terrain_view));
@@ -1882,6 +1889,10 @@ struct ErosionPipeline {
     layout_boulders: BindGroupLayoutDescriptor,
     /// `boulders.wgsl`: forces, contacts, integrate, obstacle clear, obstacle stamp.
     pipelines_boulders: [CachedComputePipelineId; 5],
+    layout_slide: BindGroupLayoutDescriptor,
+    /// `landslide.wgsl`: reset, release, unstamp, grid clear, p2g, grid update, g2p, stamp,
+    /// settle.
+    pipelines_slide: [CachedComputePipelineId; 9],
 }
 
 impl ErosionPipeline {
@@ -2311,6 +2322,32 @@ fn init_erosion_pipeline(
             ),
         ),
     );
+    let layout_slide = BindGroupLayoutDescriptor::new(
+        "SlideGroup0",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                storage_buffer::<u32>(false), // work set height (atomic, fixed-point)
+                storage_buffer_sized(false, None), // particles (five vec4s each)
+                storage_buffer::<i32>(false),  // grid (atomic, fixed-point)
+                storage_buffer::<u32>(false),  // debris record and particle count
+                uniform_buffer::<SlideParams>(false),
+            ),
+        ),
+    );
+    let slide_shader = asset_server.load(LANDSLIDE_SHADER);
+    let pipelines_slide = [
+        "slide_reset",
+        "slide_release",
+        "slide_unstamp",
+        "grid_clear",
+        "slide_p2g",
+        "grid_update",
+        "slide_g2p",
+        "slide_stamp",
+        "slide_settle",
+    ]
+    .map(|entry| compute(vec![layout_slide.clone()], &slide_shader, entry));
     let boulder_shader = asset_server.load(BOULDER_SHADER);
     let pipelines_boulders = [
         "boulder_forces",
@@ -2326,6 +2363,8 @@ fn init_erosion_pipeline(
         pipelines_river,
         layout_boulders,
         pipelines_boulders,
+        layout_slide,
+        pipelines_slide,
         layout_erosion,
         layout_water_splat,
         pipelines_water_splat,
@@ -2415,6 +2454,65 @@ struct ErosionBuffers {
     water: WaterBuffers,
     /// Water and sediment trails hand to the water on the finest level (`erosion.wgsl` `splat`).
     splat: StorageBuffer<Vec<u32>>,
+    slide: SlideBuffers,
+}
+
+/// A landslide event's particles, grid and debris record (`landslide.wgsl`).
+struct SlideBuffers {
+    particles: Buffer,
+    grid: Buffer,
+    /// Per box texel: the debris added to the heights this frame; then the particle count.
+    stamp: Buffer,
+    params: UniformBuffer<SlideParams>,
+}
+
+impl SlideBuffers {
+    fn new(device: &RenderDevice, queue: &RenderQueue) -> Self {
+        let buffer = |label: &'static str, size: u64| {
+            device.create_buffer(&BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let nodes = landslide::NODES;
+        let box_texels = (nodes.x / 2 * nodes.z / 2) as u64;
+        let mut params = UniformBuffer::from(SlideParams::default());
+        params.write_buffer(device, queue);
+        Self {
+            // Five vec4s per particle.
+            particles: buffer("slide_particles", landslide::MAX_PARTICLES as u64 * 80),
+            grid: buffer("slide_grid", (nodes.x * nodes.y * nodes.z) as u64 * 16),
+            stamp: buffer("slide_stamp", (box_texels + 1) * 4),
+            params,
+        }
+    }
+}
+
+/// `SlideParams` in `landslide.wgsl`.
+#[derive(Clone, Copy, Debug, Default, ShaderType)]
+struct SlideParams {
+    size: UVec2,
+    pad_offset: UVec2,
+    grid_size: UVec2,
+    box_origin: IVec2,
+    box_texels: UVec2,
+    nodes: UVec3,
+    max_particles: u32,
+    floor: f32,
+    metres_per_texel: f32,
+    metres_per_height: f32,
+    cell: f32,
+    dt: f32,
+    gravity: f32,
+    stiffness: f32,
+    friction: f32,
+    basal_friction: f32,
+    max_viscosity: f32,
+    centre: Vec2,
+    radius: f32,
+    depth: f32,
 }
 
 /// Water solver state at base map size (`water.wgsl`).
@@ -2603,6 +2701,8 @@ struct ErosionBindGroups {
     river: [BindGroup; 2],
     /// Boulders, indexed by work set.
     boulders: [BindGroup; 2],
+    /// Landslides, indexed by work set.
+    slide: [BindGroup; 2],
     blit: BindGroup,
     blit_blur: BindGroup,
     /// Debug view outputs of `blit_fields` and `morpho_debug`.
@@ -2628,6 +2728,7 @@ fn prepare_erosion_buffers(
         params: DynamicUniformBuffer::default(),
         resample_params: DynamicUniformBuffer::default(),
         water: WaterBuffers::new(params.map_size, &render_device, &queue),
+        slide: SlideBuffers::new(&render_device, &queue),
         splat: {
             let mut splat = StorageBuffer::from(vec![0u32; 2 * texels]);
             splat.write_buffer(&render_device, &queue);
@@ -2878,6 +2979,20 @@ fn prepare_erosion_bind_groups(
                 )),
             )
         }),
+        slide: [0, 1].map(|set| {
+            let slide = &buffers.slide;
+            render_device.create_bind_group(
+                None,
+                &layout(&pipeline.layout_slide),
+                &BindGroupEntries::sequential((
+                    buffers.sets[set].height.binding().unwrap(),
+                    slide.particles.as_entire_binding(),
+                    slide.grid.as_entire_binding(),
+                    slide.stamp.as_entire_binding(),
+                    slide.params.binding().unwrap(),
+                )),
+            )
+        }),
         boulders: [0, 1].map(|set| {
             let w = &buffers.water;
             render_device.create_bind_group(
@@ -2965,6 +3080,15 @@ fn prepare_erosion_bind_groups(
 /// A GPU command for this frame, with its dynamic offset into [`ErosionBuffers::params`].
 #[derive(Clone, Copy, Debug)]
 enum FrameCmd {
+    /// A landslide event on the finest level: release it first when `release`, take last
+    /// frame's debris out of the heights, run `substeps` of MPM, and write the debris back;
+    /// `settle` leaves it there for good.
+    Landslide {
+        set: usize,
+        release: bool,
+        substeps: u32,
+        settle: bool,
+    },
     Init {
         offset: u32,
         size: UVec2,
@@ -3054,6 +3178,10 @@ struct ErosionState {
     boulder_settings: [f32; 3],
     /// [`boulders::BoulderEdits::generation`] last written to the GPU.
     boulder_generation: u64,
+    /// [`landslide::Landslides::generation`] last released, and the running event with its
+    /// elapsed slide time.
+    slide_generation: u32,
+    slide: Option<(landslide::SlideEvent, f32)>,
     /// Cascade was finished last frame (AO refresh on the frame it finishes).
     was_finished: bool,
     /// Finest-level displays since AO was last computed (`None` before the first one).
@@ -3079,10 +3207,11 @@ fn plan_erosion_frame(
     swe_pipelines: Option<Res<ShallowWaterPipelines>>,
     river_bed: Option<Res<river::RiverBed>>,
     scale: Res<WorldScale>,
-    (boulder_edits, fields, gpu_buffers): (
+    (boulder_edits, fields, gpu_buffers, slides): (
         Option<Res<boulders::BoulderEdits>>,
         Option<Res<WaterFields>>,
         Res<RenderAssets<GpuShaderBuffer>>,
+        Option<Res<landslide::Landslides>>,
     ),
 ) {
     let state = &mut *state;
@@ -3351,6 +3480,60 @@ fn plan_erosion_frame(
             sources,
         });
         buffers.water.params.write_buffer(&render_device, &queue);
+    }
+    // Landslides: a new release starts an event; it runs on real time until its duration is up.
+    if finest_ready && let Some(slides) = &slides {
+        let release = slides.generation != state.slide_generation && slides.event.is_some();
+        if slides.generation != state.slide_generation {
+            state.slide_generation = slides.generation;
+            if let Some(event) = slides.event {
+                // A running event settles where it is: the new one takes the buffers.
+                state.slide = Some((event, 0.0));
+            }
+        }
+        if let Some((event, elapsed)) = state.slide {
+            let s = &slides.settings;
+            let seconds = if sim.paused { 0.0 } else { water.dt * s.speed.max(0.0) };
+            let substeps = ((seconds / landslide::SLIDE_STEP).ceil() as u32)
+                .min(landslide::MAX_SLIDE_SUBSTEPS);
+            let elapsed = elapsed + substeps as f32 * landslide::SLIDE_STEP;
+            let settle = elapsed >= s.duration;
+            let cell = 0.5 * scale.metres_per_texel;
+            let nodes = landslide::NODES;
+            buffers.slide.params.set(SlideParams {
+                size: params.map_size,
+                pad_offset,
+                grid_size: finest_size,
+                box_origin: event.box_origin,
+                box_texels: nodes.xz() / 2,
+                nodes,
+                max_particles: landslide::MAX_PARTICLES,
+                floor: event.floor,
+                metres_per_texel: scale.metres_per_texel,
+                metres_per_height: scale.metres_per_height(),
+                cell,
+                dt: landslide::SLIDE_STEP,
+                gravity: water.gravity,
+                stiffness: s.sound_speed * s.sound_speed,
+                friction: s.friction_angle.to_radians().tan(),
+                basal_friction: s.basal_angle.to_radians().tan(),
+                // Explicit viscous diffusion is stable below h²/(6 dt); keep a margin.
+                max_viscosity: 0.5 * cell * cell / (6.0 * landslide::SLIDE_STEP),
+                centre: event.centre,
+                radius: event.radius,
+                depth: event.depth,
+            });
+            buffers.slide.params.write_buffer(&render_device, &queue);
+            state.frame.push(FrameCmd::Landslide {
+                set: state.cascade.current,
+                release,
+                substeps,
+                settle,
+            });
+            state.slide = (!settle).then_some((event, elapsed));
+            // The water runs meanwhile, so it sees the debris move.
+            state.water_active = true;
+        }
     }
     if finest_ready && (clear || stroke || refining || (state.water_active && !sim.paused)) {
         let steps = if refining {
@@ -3683,6 +3866,55 @@ fn erosion_compute(
                     pass.set_pipeline(p);
                     pass.set_bind_group(0, &groups.erosion[set], &[offset]);
                     pass.dispatch_workgroups(gx, gy, 1);
+                }
+            }
+            FrameCmd::Landslide {
+                set,
+                release,
+                substeps,
+                settle,
+            } => {
+                let [reset, spawn, unstamp, clear_grid, p2g, update, g2p, stamp, forget] =
+                    pipes.pipelines_slide.map(get);
+                let (
+                    Some(reset),
+                    Some(spawn),
+                    Some(unstamp),
+                    Some(clear_grid),
+                    Some(p2g),
+                    Some(update),
+                    Some(g2p),
+                    Some(stamp),
+                    Some(forget),
+                ) = (reset, spawn, unstamp, clear_grid, p2g, update, g2p, stamp, forget)
+                else {
+                    continue;
+                };
+                let nodes = landslide::NODES;
+                let texels = nodes.xz() / 2;
+                let (tx, ty) = (texels.x.div_ceil(8), texels.y.div_ceil(8));
+                let node_groups = (nodes.x * nodes.y * nodes.z).div_ceil(64);
+                let particle_groups = landslide::MAX_PARTICLES.div_ceil(64);
+                pass.set_bind_group(0, &groups.slide[set], &[]);
+                let mut run = |p, groups: (u32, u32)| {
+                    pass.set_pipeline(p);
+                    pass.dispatch_workgroups(groups.0, groups.1, 1);
+                };
+                if release {
+                    run(reset, (tx, ty));
+                    run(spawn, (tx, ty));
+                } else {
+                    run(unstamp, (tx, ty));
+                }
+                for _ in 0..substeps {
+                    run(clear_grid, (node_groups, 1));
+                    run(p2g, (particle_groups, 1));
+                    run(update, (node_groups, 1));
+                    run(g2p, (particle_groups, 1));
+                }
+                run(stamp, (particle_groups, 1));
+                if settle {
+                    run(forget, (tx, ty));
                 }
             }
             FrameCmd::Water {

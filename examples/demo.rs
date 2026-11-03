@@ -43,6 +43,8 @@ use bevy_erosion::ui::ErosionParamsPlugin;
 use bevy_erosion::{
     ErosionConfig,
     boulders::{Boulder, BoulderEdits, BoulderList},
+    drainage::DrainageArea,
+    landslide::Landslides,
     brush::{BrushMode, TerrainSurface, WaterBrush, WaterBrushPlugin},
     camera::{OrbitCameraPlugin, OrbitController},
     sun::{Sun, SunController, SunPlugin},
@@ -261,6 +263,7 @@ fn log_frame_times(
     mut water: ResMut<WaterControl>,
     mut brush: ResMut<WaterBrush>,
     mut boulders: ResMut<BoulderEdits>,
+    (mut slides, drainage): (ResMut<Landslides>, Res<DrainageArea>),
     mut exit: MessageWriter<AppExit>,
     mut window: Local<(f32, u32)>,
     mut bench: Local<Option<f32>>,
@@ -324,8 +327,18 @@ fn log_frame_times(
                 boulders.place(Boulder::at(at + Vec2::from_angle(a) * r, diameter), &list);
             }
         }
+        // Release a landslide there, 20 texels across.
+        let slide = texel("EROSION_BENCH_LANDSLIDE");
+        if let Some(at) = slide {
+            slides.release(at, 10.0, &drainage.heights, drainage.size, &scale);
+        }
         // Look at the pour or the river's source from close by.
-        if let Some(focus) = texel("EROSION_BENCH_TARGET").or(pour).or(river).or(dropped) {
+        if let Some(focus) = texel("EROSION_BENCH_TARGET")
+            .or(pour)
+            .or(river)
+            .or(dropped)
+            .or(slide)
+        {
             let size = progress.get().size.as_vec2();
             let width = scale.map_metres(size.as_uvec2()).x;
             let half = width * 0.5;
