@@ -19,7 +19,11 @@ use bevy::{
     window::ExitCondition,
     winit::WinitPlugin,
 };
-use bevy_erosion::{drainage::DrainageArea, *};
+use bevy_erosion::{
+    boulders::{Boulder, BoulderEdits, BoulderList},
+    drainage::DrainageArea,
+    *,
+};
 use std::{
     f32::consts::PI,
     sync::{Arc, Mutex},
@@ -3053,4 +3057,75 @@ fn inspect_boulder_steps() {
     let fines = step_relief(0.0);
     let boulders = step_relief(1.0);
     println!("steps: relief {fines:.3} of the initial with fines, {boulders:.3} with boulder lips");
+}
+
+/// Boulders placed at x = 30 across a flume of slope 0.004 under a strong spring, run for ten
+/// seconds: how far (texels) each moved downstream (infinite once carried off the map), and the
+/// mean water depth just upstream (x 27..28 by the centre line, clear of the bumps; the flow is
+/// fast, so the backwater fades within a few texels).
+fn boulder_run(diameters: &[f32]) -> (Vec<f32>, f32) {
+    let bed = |x: u32, y: u32| {
+        0.02 + 0.004 * (N - 1 - x) as f32 + 0.0005 * (y as f32 + 0.5 - N as f32 / 2.0).abs()
+    };
+    let mut h = Harness::new(WaterSolver::Swe, &bed);
+    h.water().springs.push(Spring {
+        center: Vec2::new(10.0, N as f32 / 2.0),
+        radius: 6.0,
+        rate: 0.2 / TIME,
+    });
+    h.run(8.0);
+    let mid = N as f32 / 2.0;
+    let starts: Vec<Vec2> = (0..diameters.len())
+        .map(|k| Vec2::new(30.0, mid - 0.5 * (diameters.len() as f32 - 1.0) + k as f32))
+        .collect();
+    {
+        let list = BoulderList::default();
+        let mut edits = h.app.world_mut().resource_mut::<BoulderEdits>();
+        for (p, d) in starts.iter().zip(diameters) {
+            edits.place(Boulder::at(*p, *d), &list);
+        }
+    }
+    h.run(10.0);
+    let water = h.read_water();
+    let upstream: Vec<f32> = (27..29)
+        .flat_map(|x| (N / 2 - 2..N / 2 + 2).map(move |y| idx(x, y)))
+        .map(|i| water[i].depth)
+        .collect();
+    if std::env::var("TEST_PROFILE").is_ok() {
+        for x in 24..36 {
+            let row: Vec<String> = (N / 2 - 4..N / 2 + 4)
+                .map(|y| format!("{:.4}", water[idx(x, y)].depth))
+                .collect();
+            println!("x {x}: {}", row.join(" "));
+        }
+    }
+    let list = h.app.world().resource::<BoulderList>();
+    let moved = (0..diameters.len())
+        .map(|k| {
+            list.boulders
+                .get(k)
+                .filter(|b| b.alive != 0)
+                .map_or(f32::INFINITY, |b| b.pos.x - starts[k].x)
+        })
+        .collect();
+    (moved, upstream.iter().sum::<f32>() / upstream.len() as f32)
+}
+
+/// Boulders as bodies: under the same flow a small boulder is carried downstream and a large one
+/// stays put, and boulders across the channel back the water up behind them.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn flow_carries_small_boulders() {
+    // On 10 m texels: 1 m and 12 m boulders.
+    let (moved, _) = boulder_run(&[1.0, 12.0]);
+    let (_, plain) = boulder_run(&[]);
+    let (_, dammed) = boulder_run(&[12.0; 15]);
+    println!(
+        "boulders: moved {:.2} (1 m) and {:.2} (12 m) texels; depth upstream {plain:.5} without, \
+         {dammed:.5} behind a line of 12 m boulders",
+        moved[0], moved[1]
+    );
+    assert!(moved[0] > 2.0, "the small boulder stayed ({})", moved[0]);
+    assert!(moved[1].abs() < 0.5, "the large boulder moved ({})", moved[1]);
+    assert!(dammed > 1.05 * plain, "the boulders did not back the water up ({dammed} against {plain})");
 }

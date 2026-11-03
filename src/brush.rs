@@ -10,6 +10,8 @@
 //!   Alt + click places a [`Spring`] that keeps pouring at the brush's rate, so rivers keep
 //!   flowing; Alt + Shift + click removes the springs under the brush.
 //!
+//! * [`BrushMode::Boulders`] drops boulders under the brush ([`crate::boulders`]); Shift removes
+//!   them.
 //! * [`BrushMode::River`]: a click places a river ([`crate::river`]). It routes itself down the
 //!   eroded terrain from the click, gets a carved bed with steps, pools and point bars, and a
 //!   spring at its source; Shift + click removes the rivers starting under the brush.
@@ -80,16 +82,19 @@ pub enum BrushMode {
     WaterBody,
     /// Click to place a river that routes itself downhill, with a carved bed.
     River,
+    /// Drop boulders that the flow can move ([`crate::boulders`]).
+    Boulders,
 }
 
 impl BrushMode {
-    /// Rain → Terrain → Water Body → River → Rain.
+    /// Rain → Terrain → Water Body → River → Boulders → Rain.
     pub fn next(self) -> Self {
         match self {
             Self::Rain => Self::Terrain(TerrainTool::Raise),
             Self::Terrain(_) => Self::WaterBody,
             Self::WaterBody => Self::River,
-            Self::River => Self::Rain,
+            Self::River => Self::Boulders,
+            Self::Boulders => Self::Rain,
         }
     }
 
@@ -102,6 +107,7 @@ impl BrushMode {
             Self::Terrain(TerrainTool::Smooth) => "Terrain: Smooth",
             Self::WaterBody => "Water Body",
             Self::River => "River",
+            Self::Boulders => "Boulders",
         }
     }
 }
@@ -713,6 +719,7 @@ fn draw_brush(
             BrushMode::Terrain(_) => Color::srgb(0.95, 0.8, 0.4),
             BrushMode::WaterBody => Color::srgb(0.3, 0.7, 1.0),
             BrushMode::River => Color::srgb(0.35, 0.85, 0.95),
+            BrushMode::Boulders => Color::srgb(0.8, 0.78, 0.72),
         }
     };
     ring(hit.texel, brush.radius, color);

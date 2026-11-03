@@ -200,6 +200,9 @@ enum ErosionSliderFieldKind {
     BedLoadAbrasion,
     BedLoadRockHardness,
     RiverBrushCatchment,
+    BoulderDiameter,
+    BoulderDrag,
+    BoulderFriction,
     RiverBrushArmour,
     RiverBrushDetail,
     RiverBrushBreach,
@@ -337,6 +340,9 @@ impl ErosionSliderFieldKind {
             Self::AgeStrength => params.age_strength = value,
             Self::BrushRadius => brush.radius = value,
             Self::RiverBrushCatchment => brush.river.catchment = value,
+            Self::BoulderDiameter => water.boulders.diameter = value,
+            Self::BoulderDrag => water.boulders.drag = value,
+            Self::BoulderFriction => water.boulders.friction_static = value,
             Self::RiverBrushArmour => brush.river.armour = value,
             Self::RiverBrushDetail => brush.river.bed_detail = value,
             Self::RiverBrushBreach => brush.river.breach_depth = value,
@@ -420,6 +426,9 @@ impl ErosionSliderFieldKind {
                 | Self::BedLoadRockHardness
                 // New rivers take the discharge; armour re-sends the existing beds.
                 | Self::RiverBrushCatchment
+                | Self::BoulderDiameter
+                | Self::BoulderDrag
+                | Self::BoulderFriction
                 | Self::RiverBrushArmour
         )
     }
@@ -678,6 +687,7 @@ fn update_brush_ui(
             BrushMode::Terrain(_) => "Drag: edit · Shift+drag: undo edits",
             BrushMode::WaterBody => "Drag: pour · Shift: remove · Alt+click: spring",
             BrushMode::River => "Click: river from here · Shift+click: remove",
+            BrushMode::Boulders => "Drag: drop boulders · Shift+drag: remove",
         }
     };
     for mut text in &mut hints {
@@ -850,6 +860,8 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl, world: WorldScale)
                             @brush_mode_button("Water", BrushMode::WaterBody)
                             --
                             @brush_mode_button("River", BrushMode::River)
+                            --
+                            @brush_mode_button("Boulders", BrushMode::Boulders)
                         })
                         --
                         Node {
@@ -894,6 +906,25 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl, world: WorldScale)
                             }
                             on(|_: On<Activate>, mut brush: ResMut<WaterBrush>| {
                                 brush.clear_rivers = true;
+                            })
+                        })
+                    })
+                    --
+                    @section("Boulder Brush", true, bsn_list! {
+                        @note_text("Drag to drop boulders (±30 % in size); the flow moves them when its drag beats their friction.")
+                        --
+                        @slider_row(world, "Boulder Size (m)", 0.5, 20.0, water.boulders.diameter, ErosionSliderFieldKind::BoulderDiameter)
+                        --
+                        @slider_row(world, "Drag Coefficient", 0.1, 2.0, water.boulders.drag, ErosionSliderFieldKind::BoulderDrag)
+                        --
+                        @slider_row(world, "Friction (tan pivot angle)", 0.1, 2.0, water.boulders.friction_static, ErosionSliderFieldKind::BoulderFriction)
+                        --
+                        @button_row(bsn_list! {
+                            @FeathersButton {
+                                @caption: bsn! { Text("Clear Boulders") ThemedText },
+                            }
+                            on(|_: On<Activate>, mut edits: ResMut<crate::boulders::BoulderEdits>| {
+                                edits.clear_all();
                             })
                         })
                     })

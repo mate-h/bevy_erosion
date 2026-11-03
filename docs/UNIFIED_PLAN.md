@@ -418,6 +418,28 @@ Boulders view shows the surface fraction.
 - Drawn as instanced rock meshes. Rigid-body contacts between boulders (Rapier, or Dimforge's
   GPU nexus) only if they must stack.
 
+Status (Phase 8): built (`src/boulders.rs`, `assets/boulders.wgsl`).
+
+- **Bodies**: up to 4096 spheres in a GPU buffer (position in texels, velocity, radius). Each
+  frame, in substeps of at most half a texel of travel, each feels drag ½ρC_d·A|u−v|(u−v) and lift
+  ½ρC_L·A|u|² on its frontal area A = 2r·min(h, 2r), buoyancy on its submerged share, and gravity
+  down the bed slope over its footprint. At rest it stays while the drive is below
+  μ_s × the normal force; moving, kinetic friction μ_k opposes it. Defaults: C_d 0.5, C_L 0.2,
+  μ_s 0.8, μ_k 0.5, density 2.65. Boulders that leave the map or reach the sea are removed.
+- **On the water**: each boulder stamps a bump of its own volume (peak at most its diameter, rim
+  at the larger of its radius and one texel) into an obstacle field that only the shallow-water
+  solver's bed sees (`swe_export`), and the water surface drawing. The erosion heights stay the
+  terrain's, so a boulder that moves leaves no hole; the bed load sees the faster flow beside it.
+- **CPU side**: the Boulders brush writes new boulders into free slots (`BoulderEdits`); the
+  buffer is read back every frame (`BoulderList`) to draw a lumpy rock mesh per boulder, rolled
+  by the distance it travelled.
+- **Test**: `flow_carries_small_boulders`: on a 40 % flume a 1 m boulder is carried off the map
+  and a 12 m one stays, and a line of 12 m boulders raises the depth just upstream by 15 %.
+- Not yet: boulder–boulder contacts (they overlap freely; the plan's Rapier or nexus option),
+  boulders settling into the bed or jamming into step lines, boulders from the bed's own boulder
+  fraction (Phase 7) entraining as bodies, and rocks drawn white in the simple view (its lighting
+  is set for the terrain's own shading).
+
 ### Phase 9: mass movement with MPM
 
 - MPM with a Drucker–Prager granular model handles collapse and runout. A 3D domain over the
@@ -467,7 +489,7 @@ Decisions taken while implementing, where they differ from or sharpen the plan a
 
 ### Status
 
-Done: Phases 1–6 as above, with every GPU test (`water_swe_gpu`, all but the `validate_` and
+Done: Phases 1–8 as above (7 and 8 under Rocks and boulders), with every GPU test (`water_swe_gpu`, all but the `validate_` and
 `inspect_` sweeps) passing at the old-equivalent settings.
 
 Not done:

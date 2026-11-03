@@ -97,6 +97,22 @@ Shift + click removes the rivers starting under the brush, and Clear Rivers remo
 Rivers survive reruns of the cascade: once it finishes, each one is carved again into the new
 terrain along the same path, with the flows of the new drainage area.
 
+## Boulders
+
+With the Boulders brush, dragging drops boulders under the brush (Boulder Size, ±30 %), and
+Shift + drag removes them. Each is a body on the GPU: the water's drag and lift, buoyancy and
+gravity down the slope move it once they beat its friction (Coulomb, at rest the tangent of its
+pivot angle), so the flow carries small boulders and leaves large ones, and boulders roll off
+steep slopes. Each one adds a bump of its own volume to the shallow-water solver's bed (not to the
+terrain), so the water piles up in front of it and speeds up past it. Clear Boulders removes them
+all. Up to 4096 at a time.
+
+| Setting | Effect |
+|---|---|
+| Boulder Size | Diameter (m) of the boulders the brush drops |
+| Drag Coefficient | C_d on the frontal area in the flow |
+| Friction | Tangent of the pivot angle: how hard a resting boulder is to set moving |
+
 ## KTT rivers
 
 **Do Rivers** turns on KTT's river momentum: every trail leaves momentum behind it, and where it

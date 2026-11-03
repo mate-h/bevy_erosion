@@ -87,6 +87,8 @@ struct WaterParams {
 // Surface and velocity for bevy_fft's renderer (`water_surface`).
 @group(1) @binding(5) var surface_out: texture_storage_2d<rgba32float, write>;
 @group(1) @binding(6) var surface_velocity_out: texture_storage_2d<rgba32float, write>;
+// Height the boulders add to the solver's bed (height units; `boulders.wgsl`).
+@group(1) @binding(7) var obstacle: texture_2d<f32>;
 
 fn inside(p: vec2<i32>) -> bool {
     return all(p >= vec2<i32>(0)) && all(p < vec2<i32>(params.size));
@@ -337,7 +339,8 @@ fn swe_export(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec2<i32>(gid.xy);
     if (!inside(p)) { return; }
     let ground = terrain(p);
-    textureStore(swe_bed, p, vec4<f32>(ground * CELLS_PER_HEIGHT, 0.0, 0.0, 0.0));
+    let bed = ground + textureLoad(obstacle, p, 0).x;
+    textureStore(swe_bed, p, vec4<f32>(bed * CELLS_PER_HEIGHT, 0.0, 0.0, 0.0));
     let edge = any(p == vec2<i32>(0)) || any(p == vec2<i32>(params.size) - 1);
     let sink = select(0.0, 1.0, edge || is_ocean(ground));
     let rate = source_depth(p) / params.step_seconds * CELLS_PER_HEIGHT * params.solver_seconds;
@@ -395,7 +398,9 @@ fn water_surface(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     // Dry cells sit below the terrain, so the water surface dives under its banks and the
     // terrain hides it (and depth-tests it away) instead of covering dry ground.
-    let bed = select(ground, ground - DRY_SINK, d < params.wet_depth);
+    // The water stands on the boulders' bumps too.
+    let top = ground + textureLoad(obstacle, p, 0).x;
+    let bed = select(top, ground - DRY_SINK, d < params.wet_depth);
     textureStore(surface_out, p, vec4<f32>(bed, d, 0.0, 0.0));
     textureStore(surface_velocity_out, p, vec4<f32>(v, 0.0, 0.0));
 }

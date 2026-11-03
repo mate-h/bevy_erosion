@@ -30,6 +30,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+pub mod boulders;
 pub mod brush;
 pub mod camera;
 pub mod drainage;
@@ -48,6 +49,7 @@ const WATER_BED_SHADER: &str = "water_bed.wgsl";
 const WATER_MORPHO_SHADER: &str = "water_morpho.wgsl";
 const WATER_SPLAT_SHADER: &str = "water_splat.wgsl";
 const RIVER_SHADER: &str = "river.wgsl";
+const BOULDER_SHADER: &str = "boulders.wgsl";
 /// Erode dispatches per `writeBack` at geological age 0 (`Compute_Erosion.iterations`).
 const ERODE_ITERS_PER_WRITEBACK: u32 = 200;
 /// Erode dispatches between our `writeBack`s. KTT runs one per level, after every batch of
@@ -371,6 +373,9 @@ pub struct ErosionImages {
     pub debug_bed: Handle<Image>,
     /// Drainage area in m² (R32Float, map size), written on the CPU by [`drainage`].
     pub drainage: Handle<Image>,
+    /// Height the boulders add to the shallow-water solver's bed (height units;
+    /// `boulders.wgsl`).
+    pub obstacle: Handle<Image>,
 }
 
 /// Creates all erosion render-target images for the given map size and adds them to `images`.
@@ -401,6 +406,7 @@ pub fn create_erosion_images(images: &mut Assets<Image>, size: UVec2) -> Erosion
         debug_discharge: add(images, TextureFormat::Rgba16Float),
         debug_bed: add(images, TextureFormat::Rgba16Float),
         drainage: images.add(cpu_image(size, TextureFormat::R32Float, 4)),
+        obstacle: add(images, TextureFormat::R32Float),
     }
 }
 
@@ -438,6 +444,8 @@ pub struct WaterFields {
     /// over a few seconds (height units × texels per second), z = averaged depth, w = KTT's river
     /// momentum scaled to the same units as xy (0 unless Do Rivers is on).
     pub discharge: Handle<ShaderBuffer>,
+    /// [`boulders::MAX_BOULDERS`] [`boulders::Boulder`] slots, owned by the GPU.
+    pub boulders: Handle<ShaderBuffer>,
 }
 
 impl WaterFields {
@@ -446,8 +454,14 @@ impl WaterFields {
         let n = (size.x * size.y) as usize;
         let mut discharge = ShaderBuffer::new(vec![Vec4::ZERO; n], RenderAssetUsages::RENDER_WORLD);
         discharge.label = Cow::Borrowed("water_discharge");
+        let mut boulders = ShaderBuffer::new(
+            vec![boulders::Boulder::default(); boulders::MAX_BOULDERS],
+            RenderAssetUsages::RENDER_WORLD,
+        );
+        boulders.label = Cow::Borrowed("boulders");
         Self {
             discharge: buffers.add(discharge),
+            boulders: buffers.add(boulders),
         }
     }
 }
@@ -1155,6 +1169,8 @@ pub struct WaterControl {
     /// With KTT's Do Rivers on, raise its river momentum to the water's discharge, so trails on
     /// the finest level follow the rivers the water has made.
     pub steer_rivers: bool,
+    /// Boulders as bodies ([`boulders`]).
+    pub boulders: boulders::BoulderPhysics,
 }
 
 /// Standard gravity (m/s²).
@@ -1489,6 +1505,7 @@ impl Default for WaterControl {
             bed_load: BedLoad::default(),
             refine_generation: 0,
             steer_rivers: true,
+            boulders: boulders::BoulderPhysics::default(),
         }
     }
 }
@@ -1589,6 +1606,26 @@ struct MorphoParams {
     active_layer: f32,
     abrasion: f32,
     reset_boulders: u32,
+}
+
+/// `BoulderParams` in `boulders.wgsl`.
+#[derive(Clone, Copy, Debug, Default, ShaderType)]
+struct BoulderParams {
+    size: UVec2,
+    pad_offset: UVec2,
+    grid_size: UVec2,
+    slots: u32,
+    seconds: f32,
+    step_seconds: f32,
+    metres_per_texel: f32,
+    metres_per_height: f32,
+    gravity: f32,
+    density: f32,
+    drag: f32,
+    lift: f32,
+    friction_static: f32,
+    friction_kinetic: f32,
+    sea_level: f32,
 }
 
 /// Floats per cell in the morpho state (`STATE_STRIDE` in `water_morpho.wgsl`).
@@ -1760,7 +1797,7 @@ impl Plugin for ErosionComputePlugin {
                 ExtractResourcePlugin::<WaterControl>::default(),
                 ExtractResourcePlugin::<river::RiverBed>::default(),
             ))
-            .add_plugins(drainage::DrainagePlugin)
+            .add_plugins((drainage::DrainagePlugin, boulders::BoulderPlugin))
             .init_resource::<TerrainView>()
             .add_systems(Startup, setup_erosion_resources)
             .add_systems(PostUpdate, (update_water_time, sync_terrain_view));
@@ -1832,6 +1869,9 @@ struct ErosionPipeline {
     layout_river: BindGroupLayoutDescriptor,
     /// `river.wgsl`: carve, armour.
     pipelines_river: [CachedComputePipelineId; 2],
+    layout_boulders: BindGroupLayoutDescriptor,
+    /// `boulders.wgsl`: move, obstacle clear, obstacle stamp.
+    pipelines_boulders: [CachedComputePipelineId; 3],
 }
 
 impl ErosionPipeline {
@@ -2094,6 +2134,8 @@ fn init_erosion_pipeline(
                 // Water surface and velocity for bevy_fft's heightfield.
                 texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly),
                 texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly),
+                // Boulders on the solver's bed (`boulders.wgsl`).
+                texture_2d(TextureSampleType::Float { filterable: false }),
             ),
         ),
     );
@@ -2245,9 +2287,29 @@ fn init_erosion_pipeline(
     let pipelines_river = ["river_carve", "river_armour"]
         .map(|entry| compute(vec![layout_river.clone()], &river_shader, entry));
 
+    let layout_boulders = BindGroupLayoutDescriptor::new(
+        "BoulderGroup0",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                storage_buffer_read_only::<u32>(false), // work set height (fixed-point)
+                storage_buffer_read_only::<f32>(false), // water depth
+                storage_buffer_read_only::<Vec2>(false), // water velocity
+                storage_buffer::<boulders::Boulder>(false),
+                uniform_buffer::<BoulderParams>(false),
+                texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadWrite),
+            ),
+        ),
+    );
+    let boulder_shader = asset_server.load(BOULDER_SHADER);
+    let pipelines_boulders = ["boulder_move", "obstacle_clear", "obstacle_stamp"]
+        .map(|entry| compute(vec![layout_boulders.clone()], &boulder_shader, entry));
+
     commands.insert_resource(ErosionPipeline {
         layout_river,
         pipelines_river,
+        layout_boulders,
+        pipelines_boulders,
         layout_erosion,
         layout_water_splat,
         pipelines_water_splat,
@@ -2363,6 +2425,7 @@ struct WaterBuffers {
     /// it leaves.
     river: StorageBuffer<Vec<Vec4>>,
     river_band: StorageBuffer<Vec<Vec2>>,
+    boulder_params: UniformBuffer<BoulderParams>,
 }
 
 /// bevy_fft solver grid and its inputs at base map size ([`WaterSolver::Swe`]).
@@ -2475,6 +2538,7 @@ impl WaterBuffers {
             }),
             river: StorageBuffer::from(vec![Vec4::new(river::NO_RIVER, 1.0, 0.0, 0.0); n]),
             river_band: StorageBuffer::from(vec![Vec2::ZERO; n]),
+            boulder_params: UniformBuffer::from(BoulderParams::default()),
         };
         b.depth.write_buffer(device, queue);
         b.flux.write_buffer(device, queue);
@@ -2493,6 +2557,7 @@ impl WaterBuffers {
         b.morpho_params.write_buffer(device, queue);
         b.river.write_buffer(device, queue);
         b.river_band.write_buffer(device, queue);
+        b.boulder_params.write_buffer(device, queue);
         b
     }
 }
@@ -2520,6 +2585,8 @@ struct ErosionBindGroups {
     water_splat: [BindGroup; 2],
     /// River brush beds, indexed by work set.
     river: [BindGroup; 2],
+    /// Boulders, indexed by work set.
+    boulders: [BindGroup; 2],
     blit: BindGroup,
     blit_blur: BindGroup,
     /// Debug view outputs of `blit_fields` and `morpho_debug`.
@@ -2565,7 +2632,11 @@ fn prepare_erosion_bind_groups(
     render_device: Res<RenderDevice>,
 ) {
     let Some(buffers) = buffers else { return };
-    let Some(discharge) = fields.and_then(|f| gpu_buffers.get(&f.discharge)) else {
+    let Some(fields) = fields else { return };
+    let (Some(discharge), Some(boulder_buffer)) = (
+        gpu_buffers.get(&fields.discharge),
+        gpu_buffers.get(&fields.boulders),
+    ) else {
         return;
     };
     let discharge = discharge.buffer.as_entire_binding();
@@ -2590,6 +2661,7 @@ fn prepare_erosion_bind_groups(
         Some(view_debug_layers),
         Some(view_debug_discharge),
         Some(view_debug_bed),
+        Some(view_obstacle),
     ) = (
         gpu_images.get(&images.height),
         gpu_images.get(&images.color),
@@ -2605,6 +2677,7 @@ fn prepare_erosion_bind_groups(
         gpu_images.get(&images.debug_layers),
         gpu_images.get(&images.debug_discharge),
         gpu_images.get(&images.debug_bed),
+        gpu_images.get(&images.obstacle),
     )
     else {
         return;
@@ -2789,6 +2862,21 @@ fn prepare_erosion_bind_groups(
                 )),
             )
         }),
+        boulders: [0, 1].map(|set| {
+            let w = &buffers.water;
+            render_device.create_bind_group(
+                None,
+                &layout(&pipeline.layout_boulders),
+                &BindGroupEntries::sequential((
+                    buffers.sets[set].height.binding().unwrap(),
+                    w.depth.binding().unwrap(),
+                    w.velocity.binding().unwrap(),
+                    boulder_buffer.buffer.as_entire_binding(),
+                    w.boulder_params.binding().unwrap(),
+                    &view_obstacle.texture_view,
+                )),
+            )
+        }),
         river: [0, 1].map(|set| {
             let w = &buffers.water;
             render_device.create_bind_group(
@@ -2815,6 +2903,7 @@ fn prepare_erosion_bind_groups(
                 &buffers.water.swe.textures.velocity,
                 &view_water_surface.texture_view,
                 &view_water_velocity.texture_view,
+                &view_obstacle.texture_view,
             )),
         ),
         blit: render_device.create_bind_group(
@@ -2891,6 +2980,8 @@ enum FrameCmd {
         bed_load: bool,
         /// Raise KTT's river momentum to the water's discharge (`morpho_steer`).
         steer: bool,
+        /// Boulder slots in use: they move after the steps and stamp the solver's bed.
+        boulders: u32,
     },
     /// Rebuild the beds under the current water (`water_bed.wgsl`); `offsets` per SOR parity.
     /// With `swe`, the new depth is handed to bevy_fft's solver afterwards.
@@ -2943,6 +3034,8 @@ struct ErosionState {
     helical_parity: u32,
     /// Boulder settings the bed's surface layer was set from (base, rock, scree).
     boulder_settings: [f32; 3],
+    /// [`boulders::BoulderEdits::generation`] last written to the GPU.
+    boulder_generation: u64,
     /// Cascade was finished last frame (AO refresh on the frame it finishes).
     was_finished: bool,
     /// Finest-level displays since AO was last computed (`None` before the first one).
@@ -2968,8 +3061,29 @@ fn plan_erosion_frame(
     swe_pipelines: Option<Res<ShallowWaterPipelines>>,
     river_bed: Option<Res<river::RiverBed>>,
     scale: Res<WorldScale>,
+    (boulder_edits, fields, gpu_buffers): (
+        Option<Res<boulders::BoulderEdits>>,
+        Option<Res<WaterFields>>,
+        Res<RenderAssets<GpuShaderBuffer>>,
+    ),
 ) {
     let state = &mut *state;
+    // Boulders placed or removed on the CPU go into their slots of the GPU buffer once.
+    let boulder_buffer = fields.and_then(|f| gpu_buffers.get(&f.boulders));
+    let boulder_slots = boulder_edits.as_ref().map_or(0, |e| e.slots);
+    if let (Some(edits), Some(gpu)) = (&boulder_edits, boulder_buffer)
+        && edits.generation != state.boulder_generation
+    {
+        state.boulder_generation = edits.generation;
+        let size = std::mem::size_of::<boulders::Boulder>() as u64;
+        if edits.clear {
+            let zeros = vec![boulders::Boulder::default(); boulders::MAX_BOULDERS];
+            queue.write_buffer(&gpu.buffer, 0, bytemuck::cast_slice(&zeros));
+        }
+        for (slot, boulder) in &edits.writes {
+            queue.write_buffer(&gpu.buffer, *slot as u64 * size, bytemuck::bytes_of(boulder));
+        }
+    }
     let step = water.step_seconds(&scale);
     state.frame.clear();
     state.steps.clear();
@@ -3150,7 +3264,9 @@ fn plan_erosion_frame(
     if (water.stroke_active && water.rate > 0.0)
         || !water.springs.is_empty()
         || water.rainfall > water.infiltration
+        || boulder_slots > 0
     {
+        // (Boulders roll on dry slopes too, and the solver steps move them.)
         state.water_active = true;
     }
     // bevy_fft's solver, once its kernels have compiled; until then the pipes move the water.
@@ -3286,6 +3402,28 @@ fn plan_erosion_frame(
             .water
             .morpho_params
             .write_buffer(&render_device, &queue);
+        let physics = &water.boulders;
+        buffers.water.boulder_params.set(BoulderParams {
+            size: params.map_size,
+            pad_offset,
+            grid_size: finest_size,
+            slots: boulder_slots,
+            seconds: steps as f32 * step,
+            step_seconds: step,
+            metres_per_texel: scale.metres_per_texel,
+            metres_per_height: scale.metres_per_height(),
+            gravity: water.gravity,
+            density: physics.density,
+            drag: physics.drag,
+            lift: physics.lift,
+            friction_static: physics.friction_static,
+            friction_kinetic: physics.friction_kinetic,
+            sea_level,
+        });
+        buffers
+            .water
+            .boulder_params
+            .write_buffer(&render_device, &queue);
         if swe && let Some(solver) = &buffers.water.swe.solver {
             let unit = water.solver_seconds(&scale);
             // Sources, sinks and the map border come in through `swe_export`, so the borders
@@ -3314,6 +3452,7 @@ fn plan_erosion_frame(
                 import: swe && !state.last_swe && !clear,
                 bed_load: mor_fac > 0.0,
                 steer: water.steer_rivers && params.do_rivers != 0,
+                boulders: boulder_slots,
             });
             state.last_swe = swe;
             if steps > 0 {
@@ -3534,6 +3673,7 @@ fn erosion_compute(
                 import,
                 bed_load,
                 steer,
+                boulders,
             } => {
                 let (gx, gy) = dispatch_grid(params.map_size);
                 let [p_discharge, p_helical, p_bed_flux, p_exner, p_steer] =
@@ -3628,6 +3768,24 @@ fn erosion_compute(
                     if steer && let Some(p) = p_steer {
                         pass.set_pipeline(p);
                         pass.dispatch_workgroups(gx, gy, 1);
+                    }
+                }
+                // Boulders move under this frame's flow, then stamp the solver's bed for the
+                // next frame (cleared every frame, so removed boulders leave no bump).
+                let [p_move, p_obstacle_clear, p_stamp] = pipes.pipelines_boulders.map(get);
+                if steps > 0
+                    && let (Some(m), Some(c), Some(st)) = (p_move, p_obstacle_clear, p_stamp)
+                {
+                    pass.set_bind_group(0, &groups.boulders[set], &[]);
+                    if boulders > 0 {
+                        pass.set_pipeline(m);
+                        pass.dispatch_workgroups(boulders.div_ceil(64), 1, 1);
+                    }
+                    pass.set_pipeline(c);
+                    pass.dispatch_workgroups(gx, gy, 1);
+                    if boulders > 0 {
+                        pass.set_pipeline(st);
+                        pass.dispatch_workgroups(boulders, 1, 1);
                     }
                 }
                 if let Some(p) = p_record {

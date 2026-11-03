@@ -42,6 +42,7 @@ use bevy::{
 use bevy_erosion::ui::ErosionParamsPlugin;
 use bevy_erosion::{
     ErosionConfig,
+    boulders::{Boulder, BoulderEdits, BoulderList},
     brush::{BrushMode, TerrainSurface, WaterBrush, WaterBrushPlugin},
     camera::{OrbitCameraPlugin, OrbitController},
     sun::{Sun, SunController, SunPlugin},
@@ -259,6 +260,7 @@ fn log_frame_times(
     scale: Res<WorldScale>,
     mut water: ResMut<WaterControl>,
     mut brush: ResMut<WaterBrush>,
+    mut boulders: ResMut<BoulderEdits>,
     mut exit: MessageWriter<AppExit>,
     mut window: Local<(f32, u32)>,
     mut bench: Local<Option<f32>>,
@@ -311,8 +313,19 @@ fn log_frame_times(
                 rate: 0.05 / LEGACY_SECONDS,
             });
         }
+        // Drop boulders there: forty within ten texels, 1 to 10 m across.
+        let dropped = texel("EROSION_BENCH_BOULDERS");
+        if let Some(at) = dropped {
+            let list = BoulderList::default();
+            for k in 0..40 {
+                let a = k as f32 * 2.399;
+                let r = 10.0 * ((k as f32 + 0.5) / 40.0).sqrt();
+                let diameter = 1.0 + 9.0 * ((k * 7) % 40) as f32 / 39.0;
+                boulders.place(Boulder::at(at + Vec2::from_angle(a) * r, diameter), &list);
+            }
+        }
         // Look at the pour or the river's source from close by.
-        if let Some(focus) = texel("EROSION_BENCH_TARGET").or(pour).or(river) {
+        if let Some(focus) = texel("EROSION_BENCH_TARGET").or(pour).or(river).or(dropped) {
             let size = progress.get().size.as_vec2();
             let width = scale.map_metres(size.as_uvec2()).x;
             let half = width * 0.5;
