@@ -1171,6 +1171,8 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl, world: WorldScale)
                             @view_button(PreviewMode::Rivers)
                             --
                             @view_button(PreviewMode::Age)
+                            --
+                            @view_button(PreviewMode::Drainage)
                         })
                     })
                     --

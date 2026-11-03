@@ -46,6 +46,8 @@ struct SeaParams {
 @group(constants::MATERIAL_BIND_GROUP) @binding(112) var debug_layers_tex: texture_2d<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(113) var debug_discharge_tex: texture_2d<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(114) var debug_bed_tex: texture_2d<f32>;
+// Drainage area (m²), from the CPU (`drainage.rs`).
+@group(constants::MATERIAL_BIND_GROUP) @binding(115) var drainage_tex: texture_2d<f32>;
 
 // Water depth above the terrain at `uv`: lakes and rivers from the solver, plus the ocean.
 fn water_depth_at(uv: vec2<f32>, ground: f32) -> f32 {
@@ -131,6 +133,7 @@ const MODE_RIVER_DISCHARGE: u32 = 24u;
 const MODE_BED_LOAD: u32 = 25u;
 const MODE_HELICAL: u32 = 26u;
 const MODE_BED_CHANGE: u32 = 27u;
+const MODE_DRAINAGE: u32 = 28u;
 
 // Convert HSV to RGB (hue, saturation, value all in [0, 1])
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
@@ -322,6 +325,11 @@ fn get_preview_color(mode: u32, uv: vec2<f32>, world_normal: vec3<f32>) -> vec4<
         }
         case MODE_BED_CHANGE: {
             return vec4<f32>(diverging(load(debug_bed_tex, uv).z * 100000.0 * g), 1.0);
+        }
+        case MODE_DRAINAGE: {
+            // 100 m² (one 10 m texel) to 100 km².
+            let a = load(drainage_tex, uv).x;
+            return heat((log2(max(a, 1.0)) / 3.3219 - 2.0) / 6.0 * g);
         }
         default: {
             // PBR, simple and albedo: the computed colour bands with linear sampling.

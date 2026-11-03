@@ -32,6 +32,7 @@ use std::{
 
 pub mod brush;
 pub mod camera;
+pub mod drainage;
 pub mod river;
 pub mod sun;
 
@@ -368,6 +369,8 @@ pub struct ErosionImages {
     /// Debug views of the bed load (Rgba16Float, map size): R = bed load through the cell,
     /// G = helical intensity, B = bed change not yet written to the heights.
     pub debug_bed: Handle<Image>,
+    /// Drainage area in m² (R32Float, map size), written on the CPU by [`drainage`].
+    pub drainage: Handle<Image>,
 }
 
 /// Creates all erosion render-target images for the given map size and adds them to `images`.
@@ -397,6 +400,7 @@ pub fn create_erosion_images(images: &mut Assets<Image>, size: UVec2) -> Erosion
         debug_layers: add(images, TextureFormat::Rgba16Float),
         debug_discharge: add(images, TextureFormat::Rgba16Float),
         debug_bed: add(images, TextureFormat::Rgba16Float),
+        drainage: images.add(cpu_image(size, TextureFormat::R32Float, 4)),
     }
 }
 
@@ -450,6 +454,11 @@ impl WaterFields {
 
 /// A cleared [`ErosionImages::terrain_edit`] layer.
 pub fn empty_terrain_edit_image(size: UVec2) -> Image {
+    cpu_image(size, TextureFormat::Rgba32Float, 16)
+}
+
+/// A zeroed image the CPU writes and the GPU samples, `texel_bytes` per texel.
+fn cpu_image(size: UVec2, format: TextureFormat, texel_bytes: usize) -> Image {
     let mut image = Image::new_fill(
         Extent3d {
             width: size.x,
@@ -457,8 +466,8 @@ pub fn empty_terrain_edit_image(size: UVec2) -> Image {
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
-        &[0u8; 16],
-        TextureFormat::Rgba32Float,
+        &vec![0u8; texel_bytes],
+        format,
         RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
     );
     image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
@@ -510,10 +519,12 @@ pub enum PreviewMode {
     BedLoad = 25,
     Helical = 26,
     BedChange = 27,
+    /// Drainage area, log scale.
+    Drainage = 28,
 }
 
 impl PreviewMode {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::Pbr,
         Self::Simple,
         Self::Albedo,
@@ -542,6 +553,7 @@ impl PreviewMode {
         Self::BedLoad,
         Self::Helical,
         Self::BedChange,
+        Self::Drainage,
     ];
 
     /// Shaded views draw the atmosphere and water; the rest show the bare field.
@@ -555,6 +567,7 @@ impl PreviewMode {
             2..=8 => "Terrain",
             9..=13 => "Erosion",
             14..=18 => "Masks & Layers",
+            28 => "Erosion",
             _ => "Water",
         }
     }
@@ -589,6 +602,7 @@ impl PreviewMode {
             Self::BedLoad => "Bed Load",
             Self::Helical => "Helical",
             Self::BedChange => "Bed Change",
+            Self::Drainage => "Drainage",
         }
     }
 
@@ -631,6 +645,9 @@ impl PreviewMode {
             Self::BedLoad => "Bed load through each cell (heat).",
             Self::Helical => "Helical (secondary) flow intensity: blue one way, red the other.",
             Self::BedChange => "Bed change not yet written: blue scour, red deposit.",
+            Self::Drainage => {
+                "Drainage area (heat, log scale: 100 m² to 100 km²), after the cascade finishes."
+            }
         }
     }
 }
@@ -742,6 +759,8 @@ pub struct TerrainExtension {
     pub debug_discharge_tex: Handle<Image>,
     #[texture(114)]
     pub debug_bed_tex: Handle<Image>,
+    #[texture(115, sample_type = "float", filterable = false)]
+    pub drainage_tex: Handle<Image>,
 }
 
 impl TerrainExtension {
@@ -759,6 +778,7 @@ impl TerrainExtension {
             debug_layers_tex: images.debug_layers.clone(),
             debug_discharge_tex: images.debug_discharge.clone(),
             debug_bed_tex: images.debug_bed.clone(),
+            drainage_tex: images.drainage.clone(),
             ..default()
         }
     }
@@ -780,6 +800,7 @@ impl Default for TerrainExtension {
             debug_layers_tex: Default::default(),
             debug_discharge_tex: Default::default(),
             debug_bed_tex: Default::default(),
+            drainage_tex: Default::default(),
         }
     }
 }
@@ -1630,6 +1651,7 @@ impl Plugin for ErosionComputePlugin {
                 ExtractResourcePlugin::<WaterControl>::default(),
                 ExtractResourcePlugin::<river::RiverBed>::default(),
             ))
+            .add_plugins(drainage::DrainagePlugin)
             .init_resource::<TerrainView>()
             .add_systems(Startup, setup_erosion_resources)
             .add_systems(PostUpdate, (update_water_time, sync_terrain_view));
