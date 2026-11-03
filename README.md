@@ -55,6 +55,22 @@ https://samk9632.gumroad.com/l/KTTforHoudini
 | `[` / `]` | Shrink / grow the brush |
 | `C` | Clear water |
 | `X` | Reset terrain edits |
+| `G` | Shape beds: cut channels sized by their discharge, and lake bowls, under the current water |
+| `M` | Refine beds: run the bed load under the current flow for Refine hours, sped up |
+
+## Units
+
+The map has a physical size: `EROSION_METRES_PER_TEXEL` (default 10 m, a 5 km map) sets the
+texel size, and the scene is drawn at that scale, so the atmosphere, shadows and water optics see
+real distances. Heights are isotropic with the grid (100 texels per height unit: 1 km of relief
+at 10 m texels). The panel shows lengths, depths and wavelengths in metres, rain and
+infiltration in mm/h, discharge in m³/s and grain size in mm.
+
+The water runs in seconds with real gravity, Manning roughness in s/m^⅓ and a time step set by
+the CFL condition; Time Scale sets how many simulated seconds pass per second. Bed load follows
+Wong & Parker (2006) for the grain size. River channels come from one model: a catchment of
+A km² carries a bankfull Q = k·A^0.8 m³/s in a channel 4.4·Q^0.5 m wide and 0.3·Q^0.4 m deep.
+The Drainage view shows the catchment of every texel. See `docs/UNIFIED_PLAN.md`.
 
 ## River brush
 
@@ -64,21 +80,22 @@ run before you click.
 - **Route:** from the click it runs down the eroded terrain's valleys until it reaches the sea,
   standing water, another river or the map edge. It fills any hollow on the way and leaves over
   its lowest rim.
-- **Bed:** cut into the terrain, with its width and depth set by the discharge (Shape Beds'
-  River Depth, River Width, profile and bank grading). Steep reaches get step-pools, gentler
-  ones riffle-pools, and bends get point bars.
+- **Bed:** cut into the terrain, sized by the bankfull discharge along it: that of its
+  drainage area plus the Upstream Catchment, through the channel model (Lake & River Beds), with
+  Shape Beds' profile and bank grading. Steep reaches get step-pools, gentler ones riffle-pools,
+  and bends get point bars.
 - **Water:** a spring at the source keeps it flowing.
 
 | Setting | Effect |
 |---|---|
-| Discharge | Size of the next river placed |
+| Upstream Catchment | Area (km²) draining into the next river beyond what the map drains to it: rivers from off the map or from a larger range |
 | Armour | How much of the bed the water may rework. 1 keeps every step up and every pool open; 0 lets the water erosion, slumping and bed load wear the steps down and fill the pools. |
 | Bed Detail | Strength of the steps, pools and point bars |
 | Breach Depth | Highest rise the bed cuts through; behind a higher one the water fills a lake and spills over |
 
 Shift + click removes the rivers starting under the brush, and Clear Rivers removes them all.
 Rivers survive reruns of the cascade: once it finishes, each one is carved again into the new
-terrain along the same path.
+terrain along the same path, with the flows of the new drainage area.
 
 ## KTT rivers
 

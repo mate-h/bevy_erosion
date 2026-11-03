@@ -383,6 +383,29 @@ Decisions taken while implementing, where they differ from or sharpen the plan a
 - **Defaults keep the look.** n = 0.2 and 1.5 m grains at 10 m texels reproduce the old water:
   a boulder-bed mountain torrent, which is what the default terrain's 5–25 % slopes are.
 
+- **Drainage area comes from the f16 height readback**, so flats (0.5 m steps at 10 m texels)
+  route by the fill gradient; the Drainage view shows a checkerboard there. Reading the
+  fixed-point heights would fix it.
+- **Shape Beds sizes channels from the simulated discharge** with the shared `ChannelModel`
+  (converted to m³/s), rather than carving a network from the drainage area. The river brush
+  uses the drainage area plus its Upstream Catchment, which also stands in for edge inlets.
+
+### Status
+
+Done: Phases 1–6 as above, with every GPU test (`water_swe_gpu`, all but the `validate_` and
+`inspect_` sweeps) passing at the old-equivalent settings.
+
+Not done:
+- **The texel size is set at startup** (`EROSION_METRES_PER_TEXEL`), not from the panel: the
+  scene, the panel's metre values and the camera are built from it once.
+- **Realistic defaults.** The defaults keep the old look (n = 0.2, 1.5 m grains, grid-relative
+  wet depths). Sweeping n = 0.035–0.07, gravel grains and absolute wet depths against the
+  acceptance checks below is the next step; the `validate_` sweeps have not been rerun.
+- **A channel-head threshold** (A_c) and separate edge inlets.
+- **Refitting `KTT_DISCHARGE_SCALE`** at two texel sizes; it is the old fit converted.
+- **Full PBR at 10 m texels** was seen once with the water drawn only inside a rectangle and
+  84 ms frames during Phase 2; not investigated (benches since ran in simple mode).
+
 ## Acceptance
 
 Checked at dx = 2 m and dx = 10 m, against screenshots and the `validate_*` CSVs:

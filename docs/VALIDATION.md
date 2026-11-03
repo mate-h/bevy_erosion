@@ -9,7 +9,10 @@ The water and bed model (Phases 4 and 6 of `WATER_PLAN.md`) checked against prim
 - Papers live in `.dev/papers` (not committed) and were converted to markdown with MinerU 4
   (`~/git/papers/convert.sh`).
 - Units are the solver's: depths in cells (height × 100), speeds in cells per second,
-  g = 2000 cells/s², Manning n = 0.01 unless stated.
+  g = 2000 cells/s², Manning n = 0.01 unless stated. Since the water runs in metres and seconds
+  (`docs/UNIFIED_PLAN.md`), the GPU tests run at the Froude-similar settings: 10 m texels, time
+  in old seconds (`LEGACY_SECONDS` = 45 SI seconds each), n ≈ 0.21 and 1.5 m grains, so these
+  numbers carry over. The sweeps below were run before that change.
 
 ## Summary
 
