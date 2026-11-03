@@ -3064,6 +3064,17 @@ fn inspect_boulder_steps() {
 /// mean water depth just upstream (x 27..28 by the centre line, clear of the bumps; the flow is
 /// fast, so the backwater fades within a few texels).
 fn boulder_run(diameters: &[f32]) -> (Vec<f32>, f32) {
+    let mid = N as f32 / 2.0;
+    let placed: Vec<(Vec2, f32)> = diameters
+        .iter()
+        .enumerate()
+        .map(|(k, d)| (Vec2::new(30.0, mid - 0.5 * (diameters.len() as f32 - 1.0) + k as f32), *d))
+        .collect();
+    boulders_in_flume(&placed)
+}
+
+/// [`boulder_run`] with boulders at the given texels and diameters (m).
+fn boulders_in_flume(placed: &[(Vec2, f32)]) -> (Vec<f32>, f32) {
     let bed = |x: u32, y: u32| {
         0.02 + 0.004 * (N - 1 - x) as f32 + 0.0005 * (y as f32 + 0.5 - N as f32 / 2.0).abs()
     };
@@ -3074,14 +3085,10 @@ fn boulder_run(diameters: &[f32]) -> (Vec<f32>, f32) {
         rate: 0.2 / TIME,
     });
     h.run(8.0);
-    let mid = N as f32 / 2.0;
-    let starts: Vec<Vec2> = (0..diameters.len())
-        .map(|k| Vec2::new(30.0, mid - 0.5 * (diameters.len() as f32 - 1.0) + k as f32))
-        .collect();
     {
         let list = BoulderList::default();
         let mut edits = h.app.world_mut().resource_mut::<BoulderEdits>();
-        for (p, d) in starts.iter().zip(diameters) {
+        for (p, d) in placed {
             edits.place(Boulder::at(*p, *d), &list);
         }
     }
@@ -3100,12 +3107,12 @@ fn boulder_run(diameters: &[f32]) -> (Vec<f32>, f32) {
         }
     }
     let list = h.app.world().resource::<BoulderList>();
-    let moved = (0..diameters.len())
+    let moved = (0..placed.len())
         .map(|k| {
             list.boulders
                 .get(k)
                 .filter(|b| b.alive != 0)
-                .map_or(f32::INFINITY, |b| b.pos.x - starts[k].x)
+                .map_or(f32::INFINITY, |b| b.pos.x - placed[k].0.x)
         })
         .collect();
     (moved, upstream.iter().sum::<f32>() / upstream.len() as f32)
@@ -3128,4 +3135,23 @@ fn flow_carries_small_boulders() {
     assert!(moved[0] > 2.0, "the small boulder stayed ({})", moved[0]);
     assert!(moved[1].abs() < 0.5, "the large boulder moved ({})", moved[1]);
     assert!(dammed > 1.05 * plain, "the boulders did not back the water up ({dammed} against {plain})");
+}
+
+/// Contacts: a 2 m boulder that the flow carries on its own stays when it rests against the
+/// upstream side of a 15 m one, and pushes it no further than the large boulder's own friction
+/// allows.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn boulders_jam_against_a_big_one() {
+    let mid = N as f32 / 2.0;
+    let (alone, _) = boulders_in_flume(&[(Vec2::new(30.0, mid), 2.0)]);
+    // Touching: 1 m + 7.5 m apart, on 10 m texels.
+    let (jammed, _) = boulders_in_flume(&[(Vec2::new(30.0, mid), 2.0), (Vec2::new(30.85, mid), 15.0)]);
+    println!(
+        "contacts: a 2 m boulder moved {:.2} texels alone, {:.2} against a 15 m one (which moved {:.2})",
+        alone[0], jammed[0], jammed[1]
+    );
+    assert!(alone[0] > 2.0, "the lone boulder stayed ({})", alone[0]);
+    assert!(jammed[0] < 0.5, "the small boulder went through the large one ({})", jammed[0]);
+    assert!(jammed[1].abs() < 0.5, "the large boulder was pushed away ({})", jammed[1]);
 }

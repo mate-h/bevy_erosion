@@ -435,8 +435,14 @@ Status (Phase 8): built (`src/boulders.rs`, `assets/boulders.wgsl`).
   by the distance it travelled.
 - **Test**: `flow_carries_small_boulders`: on a 40 % flume a 1 m boulder is carried off the map
   and a 12 m one stays, and a line of 12 m boulders raises the depth just upstream by 15 %.
-- Not yet: boulder–boulder contacts (they overlap freely; the plan's Rapier or nexus option),
-  boulders settling into the bed or jamming into step lines, boulders from the bed's own boulder
+- **Contacts** (soft, as in DEM): each frame runs substeps of at most 0.1 s, each three passes:
+  forces from the flow and slope, then a spring and damper between every overlapping pair (discs
+  in plan view, stiffness a fifth of the pair's mass over dt²), then friction and the move. A
+  pushed boulder passes the push on, so groups jam when their friction together beats the flow.
+  `boulders_jam_against_a_big_one`: a 2 m boulder the flow carries off the map alone moves 0.04
+  texels resting against a 15 m one. Pairs are found by looping over all slots (fine at a few
+  thousand); no stacking in height.
+- Not yet: boulders settling into the bed or jamming into step lines, boulders from the bed's own boulder
   fraction (Phase 7) entraining as bodies, and rocks drawn white in the simple view (its lighting
   is set for the terrain's own shading).
 

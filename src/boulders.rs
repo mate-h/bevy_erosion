@@ -50,6 +50,12 @@ pub struct Boulder {
     pub rolled: f32,
     /// 0 = free slot.
     pub alive: u32,
+    /// GPU scratch for the substep passes (`boulders.wgsl`).
+    pub drive: Vec2,
+    pub contact: Vec2,
+    pub normal: f32,
+    pub wet: f32,
+    pub pad: Vec2,
 }
 
 impl Boulder {

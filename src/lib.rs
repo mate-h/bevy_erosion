@@ -1608,6 +1608,16 @@ struct MorphoParams {
     reset_boulders: u32,
 }
 
+/// Longest boulder substep (s): contacts and friction stay stable, and at the fastest a boulder
+/// moves 3 m.
+const BOULDER_SUBSTEP: f32 = 0.1;
+const MAX_BOULDER_SUBSTEPS: u32 = 16;
+
+/// Boulder substeps for `seconds` of water time.
+fn boulder_substeps(seconds: f32) -> u32 {
+    ((seconds / BOULDER_SUBSTEP).ceil() as u32).clamp(1, MAX_BOULDER_SUBSTEPS)
+}
+
 /// `BoulderParams` in `boulders.wgsl`.
 #[derive(Clone, Copy, Debug, Default, ShaderType)]
 struct BoulderParams {
@@ -1870,8 +1880,8 @@ struct ErosionPipeline {
     /// `river.wgsl`: carve, armour.
     pipelines_river: [CachedComputePipelineId; 2],
     layout_boulders: BindGroupLayoutDescriptor,
-    /// `boulders.wgsl`: move, obstacle clear, obstacle stamp.
-    pipelines_boulders: [CachedComputePipelineId; 3],
+    /// `boulders.wgsl`: forces, contacts, integrate, obstacle clear, obstacle stamp.
+    pipelines_boulders: [CachedComputePipelineId; 5],
 }
 
 impl ErosionPipeline {
@@ -2302,7 +2312,13 @@ fn init_erosion_pipeline(
         ),
     );
     let boulder_shader = asset_server.load(BOULDER_SHADER);
-    let pipelines_boulders = ["boulder_move", "obstacle_clear", "obstacle_stamp"]
+    let pipelines_boulders = [
+        "boulder_forces",
+        "boulder_contacts",
+        "boulder_integrate",
+        "obstacle_clear",
+        "obstacle_stamp",
+    ]
         .map(|entry| compute(vec![layout_boulders.clone()], &boulder_shader, entry));
 
     commands.insert_resource(ErosionPipeline {
@@ -2982,6 +2998,8 @@ enum FrameCmd {
         steer: bool,
         /// Boulder slots in use: they move after the steps and stamp the solver's bed.
         boulders: u32,
+        /// Boulder substeps this frame.
+        boulder_substeps: u32,
     },
     /// Rebuild the beds under the current water (`water_bed.wgsl`); `offsets` per SOR parity.
     /// With `swe`, the new depth is handed to bevy_fft's solver afterwards.
@@ -3403,12 +3421,13 @@ fn plan_erosion_frame(
             .morpho_params
             .write_buffer(&render_device, &queue);
         let physics = &water.boulders;
+        let boulder_substeps = boulder_substeps(steps as f32 * step);
         buffers.water.boulder_params.set(BoulderParams {
             size: params.map_size,
             pad_offset,
             grid_size: finest_size,
             slots: boulder_slots,
-            seconds: steps as f32 * step,
+            seconds: steps as f32 * step / boulder_substeps as f32,
             step_seconds: step,
             metres_per_texel: scale.metres_per_texel,
             metres_per_height: scale.metres_per_height(),
@@ -3453,6 +3472,7 @@ fn plan_erosion_frame(
                 bed_load: mor_fac > 0.0,
                 steer: water.steer_rivers && params.do_rivers != 0,
                 boulders: boulder_slots,
+                boulder_substeps,
             });
             state.last_swe = swe;
             if steps > 0 {
@@ -3674,6 +3694,7 @@ fn erosion_compute(
                 bed_load,
                 steer,
                 boulders,
+                boulder_substeps,
             } => {
                 let (gx, gy) = dispatch_grid(params.map_size);
                 let [p_discharge, p_helical, p_bed_flux, p_exner, p_steer] =
@@ -3772,14 +3793,20 @@ fn erosion_compute(
                 }
                 // Boulders move under this frame's flow, then stamp the solver's bed for the
                 // next frame (cleared every frame, so removed boulders leave no bump).
-                let [p_move, p_obstacle_clear, p_stamp] = pipes.pipelines_boulders.map(get);
+                let [p_forces, p_contacts, p_integrate, p_obstacle_clear, p_stamp] =
+                    pipes.pipelines_boulders.map(get);
                 if steps > 0
-                    && let (Some(m), Some(c), Some(st)) = (p_move, p_obstacle_clear, p_stamp)
+                    && let (Some(f), Some(k), Some(m), Some(c), Some(st)) =
+                        (p_forces, p_contacts, p_integrate, p_obstacle_clear, p_stamp)
                 {
                     pass.set_bind_group(0, &groups.boulders[set], &[]);
                     if boulders > 0 {
-                        pass.set_pipeline(m);
-                        pass.dispatch_workgroups(boulders.div_ceil(64), 1, 1);
+                        for _ in 0..boulder_substeps {
+                            for p in [f, k, m] {
+                                pass.set_pipeline(p);
+                                pass.dispatch_workgroups(boulders.div_ceil(64), 1, 1);
+                            }
+                        }
                     }
                     pass.set_pipeline(c);
                     pass.dispatch_workgroups(gx, gy, 1);
