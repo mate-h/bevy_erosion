@@ -109,6 +109,10 @@ struct ErodeParams {
     trail_damping: f32,
     // Bevy-only: this writeBack's share of the level's iterations.
     writeback_fraction: f32,
+    // Bevy-only: 1 = init takes the used masks from `source_masks` instead of mask noise.
+    mask_source: u32,
+    // Bevy-only: shifts the trails' random start points (0 = the original sequence).
+    trail_seed: u32,
 }
 
 @group(0) @binding(1) var<uniform> params: ErodeParams;
@@ -223,6 +227,9 @@ fn outflow_source(gid: vec2<u32>, h: f32) -> f32 {
 // Terrain brush edits (`ErosionImages::terrain_edit`), only bound for init_fbm:
 // R = height offset, G = flatten weight, B = flatten target, A = smooth weight.
 @group(1) @binding(0) var terrain_edit: texture_2d<f32>;
+// Source masks (`ErosionImages::source_masks`), read by init_fbm when `mask_source` is 1:
+// softness, outflow, erode mask, uplift, as in `masks`.
+@group(1) @binding(1) var source_masks: texture_2d<f32>;
 // Smooth brush: radius (texels) of the fbm average.
 const SMOOTH_RADIUS: f32 = 6.0;
 
@@ -274,17 +281,24 @@ fn init_fbm(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&m[2u * idx + 1u], 0u);
 
     var cell_mask = vec4<f32>(1.0, 0.0, 1.0, 1.0);
+    // Masks from a file (`mask_source` 1) or from mask noise; the outflow also takes the
+    // procedural sea and border, so a file's outflow can be combined with a draining border.
+    let file_mask = textureLoad(source_masks, vec2<i32>(gid.xy), 0);
+    let from_file = params.mask_source != 0u;
     if (params.use_softness_mask != 0u) {
-        cell_mask.x = mask_noise(uv, MASK_SOFTNESS_SEED);
+        cell_mask.x = select(mask_noise(uv, MASK_SOFTNESS_SEED), file_mask.x, from_file);
     }
     if (params.use_outflow != 0u) {
         cell_mask.y = outflow_source(gid.xy, hval);
+        if (from_file) {
+            cell_mask.y = max(cell_mask.y, file_mask.y);
+        }
     }
     if (params.use_erosion_mask != 0u) {
-        cell_mask.z = mask_noise(uv, MASK_ERODE_SEED);
+        cell_mask.z = select(mask_noise(uv, MASK_ERODE_SEED), file_mask.z, from_file);
     }
     if (params.use_uplift_map != 0u) {
-        cell_mask.w = mask_noise(uv, MASK_UPLIFT_SEED);
+        cell_mask.w = select(mask_noise(uv, MASK_UPLIFT_SEED), file_mask.w, from_file);
     }
     masks[idx] = cell_mask;
     layers[idx] = vec2<f32>(bedrock, 0.0);
@@ -493,7 +507,8 @@ fn erode(@builtin(global_invocation_id) gid: vec3<u32>) {
     var max_deposit_angle = params.max_deposit_angle * 3.14159265 / 180.0;
     max_deposit_angle = tan(max_deposit_angle) / CELLS_PER_HEIGHT;
 
-    var p = random22(vec2<f32>(f32(gidx), f32(gidy) - f32(iteration) * 5.643));
+    let seed_shift = f32(params.trail_seed % 65536u) * 0.7548777;
+    var p = random22(vec2<f32>(f32(gidx) + seed_shift, f32(gidy) - f32(iteration) * 5.643));
     if (brush) {
         // Uniform point in the brush disc.
         let r = params.spawn_radius * sqrt(p.x);
@@ -1216,4 +1231,26 @@ fn blit_fields(@builtin(global_invocation_id) gid: vec3<u32>) {
         above_bedrock = max(h - layers[idx].x, 0.0);
     }
     textureStore(layers_out, out_px, vec4<f32>(above_bedrock, layers[idx].y, 0.0, 1.0));
+}
+
+// Headless export (`FieldExport`): the finest fields at full precision, on the base map.
+// A = height, loose sediment (deposition), cut (erosion), flow; B = age, river momentum x and y,
+// and the river momentum the river terms see (`river_momentum`). Height units, as the buffers.
+@group(1) @binding(0) var export_a: texture_storage_2d<rgba32float, write>;
+@group(1) @binding(1) var export_b: texture_storage_2d<rgba32float, write>;
+
+@compute @workgroup_size(8,8,1)
+fn export_fields(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let out_px = vec2<i32>(gid.xy);
+    if (any(gid.xy >= textureDimensions(export_a))) { return; }
+    let p = vec2<i32>(i32(gid.x + params.pad_offset.x), i32(gid.y + params.pad_offset.y));
+    let idx = u32(p.y * i32(params.map_size.x) + p.x);
+    let h = f32(atomicLoad(&height[idx])) / HEIGHT_SCALE;
+    let dep = f32(atomicLoad(&deposition[idx])) / DEPOSITION_SCALE;
+    let cut = f32(atomicLoad(&erosion_buffer[idx])) / 100000.0;
+    let flow = f32(atomicLoad(&flow_buffer[idx])) / 10000.0;
+    textureStore(export_a, out_px, vec4<f32>(h, dep, cut, flow));
+    let mx = bitcast<f32>(atomicLoad(&m[2u * idx]));
+    let my = bitcast<f32>(atomicLoad(&m[2u * idx + 1u]));
+    textureStore(export_b, out_px, vec4<f32>(layers[idx].y, mx, my, river_momentum_at_idx(idx)));
 }

@@ -175,6 +175,88 @@ slider reruns the cascade.
 KTT applies uplift and river channeling once per pyramid level. Here they run every 20
 iterations, each its share of the level, so channels show and feed back while a level runs.
 
+## Headless file runner
+
+`examples/headless.rs` erodes a heightfield read from a file, without a window, in one untiled
+pass (flow and river fields need the whole catchment), and writes the eroded heights and KTT's
+fields as raw f32 files plus a `run.json`.
+
+```bash
+cargo run --release --example headless -- --height in/dem.f32 --out sim_raw \
+    [--grid in/dem.json] [--params params.json] \
+    [--softness in/soft.f32] [--erosion-mask in/erode.f32] [--outflow in/outflow.f32] [--uplift in/uplift.f32] \
+    [--iters-per-frame 64] [--no-repro-check]
+```
+
+**Inputs.** Every raster is row-major little-endian f32, one value per texel, first row first,
+all on one grid. The grid sidecar is `--grid`, else `<height>.json`, else `grid.json` next to the
+heights: `width`, `height`, the texel size as `metres_per_texel` (or `texel_size_m` or `dx`) and
+optionally `origin` and `crs`, which are copied to `run.json`. Heights are metres and must be
+finite. Masks are optional; each one given switches its KTT toggle on:
+
+| Flag | Mask | KTT |
+|---|---|---|
+| `--softness` | 0 hard to 1 soft, scales Rock Softness | `Use_Softness_Mask` |
+| `--erosion-mask` | trails start only where > 0, scaled by it | `Use_Erosion_Mask` |
+| `--outflow` | 1 = drains: no erosion, deposition or uplift | `Use_Outflow_Map` |
+| `--uplift` | scales Uplift Amount | `Use_Uplift_Map` |
+
+**Params.** A JSON object that sets any `ErodeParams` field by name (`feature_size`,
+`erosion_amount`, `use_bedrock`, `do_rivers`, ...), plus:
+
+| Key | Meaning | Default |
+|---|---|---|
+| `seed` | the trails' random start points (`trail_seed`) | 1 |
+| `base_m` | height subtracted before the simulation (it keeps heights ≥ 0) | 10 m below the lowest texel |
+| `bedrock_depth_m` | `bedrock_depth` in metres | |
+| `outflow_sea_level_m` | `outflow_sea_level` in metres | no sea |
+
+Unknown keys are an error. The procedural sea is off unless asked for; map borders drain only
+with `outflow_border`. The simulation runs in height units of `100 × dx` metres
+(`CELLS_PER_HEIGHT`), so slopes and angles are physical; lengths such as `flow_length` and
+`feature_size` are in texels.
+
+**Outputs** in `--out` (the base map, same grid and layout as the input):
+
+| File | Content |
+|---|---|
+| `eroded_height.f32` | eroded heights, m |
+| `deposition.f32` | loose sediment, height units (× `metres_per_height` for m), signed |
+| `erosion.f32` | cut accumulated by the trails, height units |
+| `flow.f32` | KTT flow accumulation |
+| `drainage_area.f32` | drainage area, m² (CPU MFD on the eroded heights, the map border as the outlet) |
+| `age.f32` | KTT `__Age` |
+| `momentum_x.f32`, `momentum_y.f32` | KTT river momentum `__m` |
+| `rivers.f32` | river momentum magnitude (0 unless `do_rivers`) |
+| `run.json` | settings, provenance and checks |
+
+`run.json` keeps experiment 8's keys (`width`, `height`, `dx`, `base_m`, `metres_per_height`,
+`feature_size`, `erosion_amount`, `bedrock_depth_m`, `rivers`, `softness`, `levels`, `frames`,
+`cascade_seconds`, `total_seconds`, `drainage`) and adds the seed, the git sha and dirty flag of
+this checkout, the GPU adapter, every input's path and sha256, the params as given and as run, the
+pyramid levels, every output's sha256 and min / max / mean, the units, and `dz_m` (eroded minus
+input).
+
+**Reproducibility.** The erosion kernels scatter through atomics and trails read heights other
+trails are writing (`update_cell_height` in `assets/erosion.wgsl`), so two runs are not
+byte-identical. By default the runner erodes the same input a second time and records the
+difference in `run.json` `repro`: `dz_rms_m`, `dz_max_m`, the RMS after low-passes at 8, 32 and
+128 m, the deposition, flow and drainage differences, and `pass` = dz RMS < 1 cm. A failing check
+still writes the first run's outputs and exits with status 3. `--no-repro-check` skips the second
+run. Measured on an Apple M5 (feature size 16, erosion amount 0.1, 4 m bedrock):
+
+| Input | Cascade | dz RMS between runs | after 128 m low-pass |
+|---|---|---|---|
+| 2048 × 2048 at 1 m (experiment 6) | 6.6 s | 3.2 cm | 0.7 cm |
+| 3572 × 2112 at 2 m (Duffey size) | 6.5 s | 5.8 cm | 3.0 cm |
+
+so these settings do not meet the 1 cm bar yet. The 2 m run peaks at 5.5 GB of memory.
+
+`scripts/headless_check.py` builds the runner and runs it on a synthetic 300 × 200 heightfield
+with softness and outflow masks, then on experiment 6's inputs if present
+(`~/datasets/terracraft/erosion_upres_test/inputs`, or `$EROSION_EXP6_INPUTS`); outputs go to
+`target/headless_check`. It reports the repro check for each run, and `--strict` fails on it.
+
 ## Running
 
 ```bash

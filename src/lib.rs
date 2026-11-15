@@ -383,6 +383,9 @@ pub struct ErosionImages {
     /// The finest heights at full precision (height units), for CPU readbacks: [`Self::height`]
     /// is f16, which steps about 0.24 m on 10 m texels and turns gentle ground into flats.
     pub height_exact: Handle<Image>,
+    /// Masks from a file (Rgba32Float, map size), read at init when [`ErodeParams::mask_source`]
+    /// is 1: R = softness, G = outflow, B = erode mask, A = uplift (as `masks` in `erosion.wgsl`).
+    pub source_masks: Handle<Image>,
 }
 
 /// Creates all erosion render-target images for the given map size and adds them to `images`.
@@ -415,6 +418,39 @@ pub fn create_erosion_images(images: &mut Assets<Image>, size: UVec2) -> Erosion
         drainage: images.add(cpu_image(size, TextureFormat::R32Float, 4)),
         obstacle: add(images, TextureFormat::R32Float),
         height_exact: add(images, TextureFormat::R32Float),
+        source_masks: images.add(cpu_image(size, TextureFormat::Rgba32Float, 16)),
+    }
+}
+
+/// Full-precision copies of the finest fields, for headless runs that write them to files
+/// (`examples/headless.rs`). When this resource exists, every display of the finest level also
+/// runs `export_fields` (`erosion.wgsl`) into these two images (Rgba32Float, map size), which a
+/// `Readback::texture` then reads:
+///
+/// - `a`: height, loose sediment (deposition), cut (erosion), flow;
+/// - `b`: age, river momentum x and y, and the river momentum the river terms see.
+///
+/// All in height units (texels for the age), as in the simulation buffers.
+#[derive(Resource, Clone, ExtractResource)]
+#[extract_app(RenderApp)]
+pub struct FieldExport {
+    pub a: Handle<Image>,
+    pub b: Handle<Image>,
+}
+
+impl FieldExport {
+    /// Two export images for a map of `size` texels.
+    pub fn new(images: &mut Assets<Image>, size: UVec2) -> Self {
+        let mut add = || {
+            let mut image =
+                Image::new_target_texture(size.x, size.y, TextureFormat::Rgba32Float, None);
+            image.asset_usage = RenderAssetUsages::RENDER_WORLD;
+            image.texture_descriptor.usage = TextureUsages::COPY_SRC
+                | TextureUsages::STORAGE_BINDING
+                | TextureUsages::TEXTURE_BINDING;
+            images.add(image)
+        };
+        Self { a: add(), b: add() }
     }
 }
 
@@ -999,6 +1035,13 @@ pub struct ErodeParams {
     /// Bevy-only: this `writeBack`'s share of the level's erosion iterations (uplift, compaction,
     /// river channeling and momentum decay are scaled by it).
     pub writeback_fraction: f32,
+    /// Bevy-only: 1 = init takes the masks it uses (`use_softness_mask`, `use_outflow`,
+    /// `use_erosion_mask`, `use_uplift_map`) from [`ErosionImages::source_masks`] instead of mask
+    /// noise; the outflow is the larger of the file's and the procedural sea and border.
+    pub mask_source: u32,
+    /// Bevy-only: shifts the trails' random start points, so each seed is a different (equally
+    /// likely) erosion of the same terrain. 0 keeps the original sequence.
+    pub trail_seed: u32,
 }
 
 impl Default for ErodeParams {
@@ -1089,6 +1132,8 @@ impl Default for ErodeParams {
             river_threshold: 0.0,
             trail_damping: 0.3,
             writeback_fraction: 1.0,
+            mask_source: 0,
+            trail_seed: 0,
         }
     }
 }
@@ -1823,6 +1868,7 @@ impl Plugin for ErosionComputePlugin {
                 ExtractResourcePlugin::<ErosionImages>::default(),
                 ExtractResourcePlugin::<WaterFields>::default(),
                 ExtractResourcePlugin::<ErodeParams>::default(),
+                ExtractResourcePlugin::<FieldExport>::default(),
                 ExtractResourcePlugin::<ResetSim>::default(),
                 ExtractResourcePlugin::<SimControl>::default(),
                 ExtractResourcePlugin::<BrushStroke>::default(),
@@ -1876,6 +1922,8 @@ struct ErosionPipeline {
     layout_debug_out: BindGroupLayoutDescriptor,
     /// `blit_fields`: the debug outputs and [`ErosionImages::height_exact`].
     layout_fields_out: BindGroupLayoutDescriptor,
+    /// `export_fields`: the two [`FieldExport`] images.
+    layout_export_out: BindGroupLayoutDescriptor,
     layout_upscale_height: BindGroupLayoutDescriptor,
     layout_upscale_rivers: BindGroupLayoutDescriptor,
     layout_upscale_masks: BindGroupLayoutDescriptor,
@@ -1892,6 +1940,7 @@ struct ErosionPipeline {
     pipeline_blur_v: CachedComputePipelineId,
     /// Debug views: `blit_fields` (`erosion.wgsl`) and `morpho_debug` (`water_morpho.wgsl`).
     pipeline_blit_fields: CachedComputePipelineId,
+    pipeline_export: CachedComputePipelineId,
     pipeline_morpho_debug: CachedComputePipelineId,
     /// `water.wgsl`: clear, flux, depth, erode, advect, copy, the bevy_fft solver's export,
     /// gather and import, apply (the staged erosion), and the surface for bevy_fft's renderer.
@@ -1919,8 +1968,10 @@ struct ErosionPipeline {
 
 impl ErosionPipeline {
     /// Pipelines the cascade needs before it can start.
-    fn required(&self) -> [CachedComputePipelineId; 8] {
+    fn required(&self) -> [CachedComputePipelineId; 10] {
         [
+            self.pipeline_blit_fields,
+            self.pipeline_export,
             self.pipeline_init,
             self.pipeline_init_color,
             self.pipeline_erode,
@@ -2010,6 +2061,18 @@ fn init_erosion_pipeline(
         ),
     );
 
+    // `export_fields`: the finest fields at full precision ([`FieldExport`]).
+    let layout_export_out = BindGroupLayoutDescriptor::new(
+        "ErosionExportGroup1",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly),
+                texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly),
+            ),
+        ),
+    );
+
     // Level transition: height + deposition (Update_Upscaled_Fields + Smooth_Flows).
     let layout_upscale_height = BindGroupLayoutDescriptor::new(
         "PyramidUpscaleHeight",
@@ -2080,7 +2143,10 @@ fn init_erosion_pipeline(
         "ErosionTerrainEditGroup1",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
-            (texture_2d(TextureSampleType::Float { filterable: false }),),
+            (
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                texture_2d(TextureSampleType::Float { filterable: false }),
+            ),
         ),
     );
 
@@ -2263,6 +2329,11 @@ fn init_erosion_pipeline(
         &shader,
         "blit_fields",
     );
+    let pipeline_export = compute(
+        vec![layout_erosion.clone(), layout_export_out.clone()],
+        &shader,
+        "export_fields",
+    );
 
     let water_shader = asset_server.load(WATER_SHADER);
     let pipelines_water = [
@@ -2423,6 +2494,7 @@ fn init_erosion_pipeline(
         layout_blit_blur,
         layout_debug_out,
         layout_fields_out,
+        layout_export_out,
         layout_upscale_height,
         layout_upscale_rivers,
         layout_upscale_masks,
@@ -2438,6 +2510,7 @@ fn init_erosion_pipeline(
         pipeline_blur_h,
         pipeline_blur_v,
         pipeline_blit_fields,
+        pipeline_export,
         pipeline_morpho_debug,
         pipelines_water,
     });
@@ -2759,6 +2832,8 @@ struct ErosionBindGroups {
     /// Debug view outputs of `blit_fields` and `morpho_debug`.
     debug_fields: BindGroup,
     debug_water: BindGroup,
+    /// [`FieldExport`] outputs, when that resource exists.
+    export: Option<BindGroup>,
 }
 
 fn prepare_erosion_buffers(
@@ -2798,6 +2873,7 @@ fn prepare_erosion_bind_groups(
     gpu_buffers: Res<RenderAssets<GpuShaderBuffer>>,
     buffers: Option<Res<ErosionBuffers>>,
     render_device: Res<RenderDevice>,
+    export: Option<Res<FieldExport>>,
 ) {
     let Some(buffers) = buffers else { return };
     let Some(fields) = fields else { return };
@@ -2833,6 +2909,7 @@ fn prepare_erosion_bind_groups(
         Some(view_obstacle),
         Some(view_drainage),
         Some(view_height_exact),
+        Some(view_source_masks),
     ) = (
         gpu_images.get(&images.height),
         gpu_images.get(&images.color),
@@ -2851,6 +2928,7 @@ fn prepare_erosion_bind_groups(
         gpu_images.get(&images.obstacle),
         gpu_images.get(&images.drainage),
         gpu_images.get(&images.height_exact),
+        gpu_images.get(&images.source_masks),
     )
     else {
         return;
@@ -2940,7 +3018,10 @@ fn prepare_erosion_bind_groups(
         terrain_edit: render_device.create_bind_group(
             None,
             &layout(&pipeline.layout_terrain_edit),
-            &BindGroupEntries::sequential((&view_terrain_edit.texture_view,)),
+            &BindGroupEntries::sequential((
+                &view_terrain_edit.texture_view,
+                &view_source_masks.texture_view,
+            )),
         ),
         water: [0, 1].map(|set| {
             let w = &buffers.water;
@@ -3135,6 +3216,15 @@ fn prepare_erosion_bind_groups(
                 &view_debug_bed.texture_view,
             )),
         ),
+        export: export
+            .and_then(|e| Some((gpu_images.get(&e.a)?, gpu_images.get(&e.b)?)))
+            .map(|(a, b)| {
+                render_device.create_bind_group(
+                    None,
+                    &layout(&pipeline.layout_export_out),
+                    &BindGroupEntries::sequential((&a.texture_view, &b.texture_view)),
+                )
+            }),
     });
 }
 
@@ -4222,9 +4312,11 @@ fn erosion_compute(
                     (pipes.pipeline_blur_v, &groups.blit_blur),
                 ];
                 let fields = (pipes.pipeline_blit_fields, &groups.debug_fields);
+                let export = groups.export.as_ref().map(|g| (pipes.pipeline_export, g));
                 for &(id, group1) in passes[..if ao { 4 } else { 1 }]
                     .iter()
                     .chain(std::iter::once(&fields))
+                    .chain(export.as_ref())
                 {
                     if let Some(p) = get(id) {
                         pass.set_pipeline(p);
