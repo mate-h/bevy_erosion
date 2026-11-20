@@ -870,6 +870,7 @@ dependencies = [
  "bevy",
  "bevy_fft",
  "bytemuck",
+ "river_geometry",
  "serde_json",
  "sha2",
 ]
@@ -939,7 +940,7 @@ dependencies = [
 [[package]]
 name = "bevy_fft"
 version = "0.2.0"
-source = "git+https://github.com/mate-h/bevy_fft?rev=9188dc697594573ad028f43a40c60face01afee9#9188dc697594573ad028f43a40c60face01afee9"
+source = "git+https://github.com/mate-h/bevy_fft?rev=cc5eacbe24def5ffece82dc1d288ef55adbc54d9#cc5eacbe24def5ffece82dc1d288ef55adbc54d9"
 dependencies = [
  "bevy",
  "bytemuck",
@@ -4718,6 +4719,14 @@ name = "renderdoc-sys"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
+
+[[package]]
+name = "river_geometry"
+version = "0.1.0"
+source = "git+https://github.com/mate-h/bevy_fft?rev=cc5eacbe24def5ffece82dc1d288ef55adbc54d9#cc5eacbe24def5ffece82dc1d288ef55adbc54d9"
+dependencies = [
+ "glam",
+]
 
 [[package]]
 name = "rodio"

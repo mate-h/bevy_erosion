@@ -1448,57 +1448,8 @@ impl Default for BedShaping {
 }
 
 /// River channels from their discharge, shared by Shape Beds and the river brush (see
-/// `docs/UNIFIED_PLAN.md`): a catchment of A km² carries a bankfull discharge
-/// Q = k · A^0.8 m³/s, and a channel for Q is a_W · Q^0.5 m wide and a_H · Q^0.4 m deep
-/// (Leopold & Maddock 1953; Parker et al. 2007).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ChannelModel {
-    /// k in Q = k · A^0.8: about 1–3 in humid regions, much less in arid ones.
-    pub bankfull_k: f32,
-    /// a_W in width = a_W · Q^0.5 (m).
-    pub width_coef: f32,
-    /// a_H in depth = a_H · Q^0.4 (m).
-    pub depth_coef: f32,
-    /// Narrowest channel (texels) the water can run in. Narrower ones are widened to it and made
-    /// shallower so they carry the same flow (Manning conveyance W · H^(5/3)).
-    pub min_width: f32,
-}
-
-impl Default for ChannelModel {
-    fn default() -> Self {
-        Self {
-            bankfull_k: 1.5,
-            width_coef: 4.4,
-            depth_coef: 0.3,
-            min_width: 3.0,
-        }
-    }
-}
-
-impl ChannelModel {
-    /// Bankfull discharge (m³/s) of a catchment of `area` m².
-    pub fn discharge(&self, area: f32) -> f32 {
-        self.bankfull_k * (area.max(0.0) / 1.0e6).powf(0.8)
-    }
-
-    /// Width and depth (m) of the channel for `q` m³/s, widened to [`Self::min_width`] texels.
-    pub fn section(&self, q: f32, scale: &WorldScale) -> (f32, f32) {
-        let q = q.max(1e-6);
-        let (w, h) = (self.width_coef * q.sqrt(), self.depth_coef * q.powf(0.4));
-        let min = self.min_width * scale.metres_per_texel;
-        if w < min {
-            (min, h * (w / min).powf(0.6))
-        } else {
-            (w, h)
-        }
-    }
-
-    /// Half-width (texels) and depth (height units) of the channel for `q` m³/s.
-    pub fn half_width_and_depth(&self, q: f32, scale: &WorldScale) -> (f32, f32) {
-        let (w, h) = self.section(q, scale);
-        (scale.texels(0.5 * w), scale.heights(h))
-    }
-}
+/// `docs/UNIFIED_PLAN.md`), from the `river_geometry` crate shared with bevy_fft.
+pub use river_geometry::ChannelModel;
 
 /// Widest bank grading (dilation steps of the shore distance).
 pub const MAX_BANK_WIDTH: f32 = 32.0;
