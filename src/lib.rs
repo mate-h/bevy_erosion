@@ -3585,6 +3585,7 @@ fn plan_erosion_frame(
                 inputs: ShallowWaterInputs {
                     bed: Some(grid.bed.clone()),
                     source: Some(grid.source.clone()),
+                    ..default()
                 },
                 particle_count: 0,
             },

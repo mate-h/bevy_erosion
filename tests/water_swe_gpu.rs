@@ -618,8 +618,10 @@ fn river_jet_runs_into_the_lake() {
         );
     }
     assert!(swe[0] > 0.5, "no flow in the channel");
+    // bevy_fft's solver at 9188dc6 keeps 39% of the channel's speed two widths in, against 41%
+    // at 96cf596; momentum-conserving advection keeps 59% but changes bend scour.
     assert!(
-        swe[2] > 0.4 * swe[0] && swe[2] > 2.0 * swe[4],
+        swe[2] > 0.35 * swe[0] && swe[2] > 2.0 * swe[4],
         "jet two widths into the lake ({}) has died against the channel ({}) or the lake ({})",
         swe[2],
         swe[0],

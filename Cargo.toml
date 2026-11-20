@@ -28,7 +28,7 @@ ui = ["bevy/bevy_feathers"]
 [dependencies]
 bevy = "0.20"
 bytemuck = { version = "1", features = ["derive"] }
-bevy_fft = { git = "https://github.com/mate-h/bevy_fft", branch = "water-foundations" }
+bevy_fft = { git = "https://github.com/mate-h/bevy_fft", rev = "9188dc697594573ad028f43a40c60face01afee9" }
 
 [dev-dependencies]
 serde_json = "1"
