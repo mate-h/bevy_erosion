@@ -940,7 +940,7 @@ dependencies = [
 [[package]]
 name = "bevy_fft"
 version = "0.2.0"
-source = "git+https://github.com/mate-h/bevy_fft?rev=cc5eacbe24def5ffece82dc1d288ef55adbc54d9#cc5eacbe24def5ffece82dc1d288ef55adbc54d9"
+source = "git+https://github.com/mate-h/bevy_fft?rev=958c437c1a257a2768d82ce8658a4d0463bae21e#958c437c1a257a2768d82ce8658a4d0463bae21e"
 dependencies = [
  "bevy",
  "bytemuck",
@@ -4723,7 +4723,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 [[package]]
 name = "river_geometry"
 version = "0.1.0"
-source = "git+https://github.com/mate-h/bevy_fft?rev=cc5eacbe24def5ffece82dc1d288ef55adbc54d9#cc5eacbe24def5ffece82dc1d288ef55adbc54d9"
+source = "git+https://github.com/mate-h/bevy_fft?rev=958c437c1a257a2768d82ce8658a4d0463bae21e#958c437c1a257a2768d82ce8658a4d0463bae21e"
 dependencies = [
  "glam",
 ]
