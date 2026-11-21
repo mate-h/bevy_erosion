@@ -28,8 +28,8 @@ ui = ["bevy/bevy_feathers"]
 [dependencies]
 bevy = "0.20"
 bytemuck = { version = "1", features = ["derive"] }
-bevy_fft = { git = "https://github.com/mate-h/bevy_fft", rev = "de6a6d2" }
-river_geometry = { git = "https://github.com/mate-h/bevy_fft", rev = "de6a6d2" }
+bevy_fft = { git = "https://github.com/mate-h/bevy_fft", rev = "5023710" }
+river_geometry = { git = "https://github.com/mate-h/bevy_fft", rev = "5023710" }
 
 [dev-dependencies]
 serde_json = "1"

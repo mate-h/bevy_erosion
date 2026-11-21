@@ -660,11 +660,13 @@ fn spawn_terrain(
             // 2560x1440 the grid's water pass took 0.140 ms and the quadtree's 0.067 ms, 0.044 ms
             // with dry culling, which adds about 0.035 ms of tile selection. Not the default yet:
             // distant tiles are coarser than the heightfield, so their vertices straddle wet cells
-            // and dry ones sunk below the terrain and a pond's shore turns into diamonds, and
-            // tiles past the LOD slices draw open water out to the horizon.
+            // and dry ones sunk below the terrain and a pond's shore turns into diamonds. The
+            // extent keeps it on the map, where past the LOD slices it would draw open water.
+            let half = 0.5 * width;
             surface.insert(WaterQuadtree {
                 frustum_cull: false,
                 dry_culling: true,
+                extent: Some(Rect::new(-half, -half, half, half)),
                 ..default()
             });
         } else {
