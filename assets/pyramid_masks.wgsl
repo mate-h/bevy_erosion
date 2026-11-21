@@ -12,9 +12,6 @@
 // Water bodies (`water.wgsl` depth on the base map) count as source outflow too, so the coarse
 // levels of a restarted cascade drain into the lakes like the finest level does.
 
-// Wet thresholds, as in `water.wgsl`.
-const WET_DEPTH: f32 = 0.0005;
-const FULL_DEPTH: f32 = 0.004;
 
 // Houdini gauss filter with filterscale 1.5 (source voxels) ≈ sigma 0.75.
 const GAUSS_SIGMA: f32 = 0.75;
@@ -34,6 +31,9 @@ struct PyramidResampleParams {
     granularity_strength: f32,
     padded_size: vec2<u32>,  // finest level (padded base)
     pad_offset: vec2<u32>,   // base map offset inside the padded grid (Compute_Padding)
+    // Water bodies count as outflow from `wet_depth` to fully at `full_depth` (height units).
+    wet_depth: f32,
+    full_depth: f32,
 }
 
 @group(0) @binding(0) var<storage, read> src_outflow_acc: array<f32>;
@@ -112,7 +112,7 @@ fn expanded_orig_outflow(pos: vec2<f32>, ratio: f32) -> f32 {
             let d = length(vec2<f32>(q) + 0.5 - pos);
             let w = clamp((falloff - d) / (falloff - core), 0.0, 1.0);
             let k = clamp_texel(q, resample.orig_size);
-            let wet = smoothstep(WET_DEPTH, FULL_DEPTH, water_depth[k]);
+            let wet = smoothstep(resample.wet_depth, resample.full_depth, water_depth[k]);
             o = max(o, max(orig_masks[k].y, wet) * w);
         }
     }

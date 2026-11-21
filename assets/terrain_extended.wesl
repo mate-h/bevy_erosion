@@ -4,7 +4,7 @@ import bevy_pbr::render::{
     forward_io::{VertexOutput, FragmentOutput},
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing, alpha_discard},
-    mesh_view_bindings::{view, globals},
+    mesh_view_bindings::view,
 };
 
 // Extension bind group uses MATERIAL_BIND_GROUP with slots starting at 100
@@ -21,18 +21,35 @@ import bevy_pbr::render::{
 struct TerrainParams {
     height_scale: f32,
 }
+// Height units per two texels of run: half of `CELLS_PER_HEIGHT` in `lib.rs`.
+const NORMAL_SLOPE_SCALE: f32 = 50.0;
 @group(constants::MATERIAL_BIND_GROUP) @binding(106) var<uniform> terrain_params: TerrainParams;
 
+// `PreviewMode` and a linear gain on the debug fields.
 struct PreviewParams {
-    mode: u32,  // 0=PBR, 1=Flow, 2=Sediment, 3=Erosion, 4=Height, 5=ViewSpaceNormals, 6=Curvature, 7=Age
+    mode: u32,
+    gain: f32,
+    // Strength of the grain size tint on the terrain colour (0 = off).
+    grain_colour: f32,
 }
 @group(constants::MATERIAL_BIND_GROUP) @binding(107) var<uniform> preview_params: PreviewParams;
 // Water solver output: R = depth, GB = velocity (texels per solver step), A = suspended sediment.
+// bevy_fft's water surface draws the water itself; the terrain only tints it in the simple view.
 @group(constants::MATERIAL_BIND_GROUP) @binding(108) var water_tex: texture_2d<f32>;
 struct SeaParams {
     level: f32, // 0 = no ocean
 }
 @group(constants::MATERIAL_BIND_GROUP) @binding(109) var<uniform> sea: SeaParams;
+// Debug views (see `ErosionImages`): terrain brush edits; KTT masks (softness, outflow, erode,
+// uplift); layers (sediment above bedrock, raw age); discharge (q.xy, mean depth, KTT river
+// discharge); bed (bed load, helical intensity, pending bed change).
+@group(constants::MATERIAL_BIND_GROUP) @binding(110) var terrain_edit_tex: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(111) var debug_masks_tex: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(112) var debug_layers_tex: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(113) var debug_discharge_tex: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(114) var debug_bed_tex: texture_2d<f32>;
+// Drainage area (m²), from the CPU (`drainage.rs`).
+@group(constants::MATERIAL_BIND_GROUP) @binding(115) var drainage_tex: texture_2d<f32>;
 
 // Water depth above the terrain at `uv`: lakes and rivers from the solver, plus the ocean.
 fn water_depth_at(uv: vec2<f32>, ground: f32) -> f32 {
@@ -43,10 +60,8 @@ fn water_depth_at(uv: vec2<f32>, ground: f32) -> f32 {
     return max(d, 0.0);
 }
 
-// Displayed surface: terrain, or the water surface where there is water.
 fn surface_at(uv: vec2<f32>) -> f32 {
-    let ground = textureSampleLevel(height_tex, height_sampler, uv, 0.0).x;
-    return ground + water_depth_at(uv, ground);
+    return textureSampleLevel(height_tex, height_sampler, uv, 0.0).x;
 }
 
 struct VertexIn {
@@ -75,8 +90,10 @@ fn vertex(v: VertexIn) -> VertexOutput {
     let h_r = surface_at(v.uv + vec2(texel.x, 0.0));
     let h_d = surface_at(v.uv - vec2(0.0, texel.y));
     let h_u = surface_at(v.uv + vec2(0.0, texel.y));
-    let d_hx = (h_r - h_l) * terrain_params.height_scale;
-    let d_hz = (h_u - h_d) * terrain_params.height_scale;
+    // Rise over the two texels' run: heights are isotropic with the grid (100 texels per
+    // height unit), so this does not depend on the scene's scale.
+    let d_hx = (h_r - h_l) * NORMAL_SLOPE_SCALE;
+    let d_hz = (h_u - h_d) * NORMAL_SLOPE_SCALE;
     let n_local = normalize(vec3<f32>(-d_hx, 1.0, -d_hz));
     let nmat = mat3x3<f32>(
         world_from_local[0].xyz,
@@ -89,15 +106,37 @@ fn vertex(v: VertexIn) -> VertexOutput {
     return out;
 }
 
-// Preview mode constants
+// `PreviewMode` discriminants.
 const MODE_PBR: u32 = 0u;
-const MODE_FLOW: u32 = 1u;
-const MODE_SEDIMENT: u32 = 2u;
-const MODE_EROSION: u32 = 3u;
-const MODE_HEIGHT: u32 = 4u;
+const MODE_SIMPLE: u32 = 1u;
+const MODE_ALBEDO: u32 = 2u;
+const MODE_HEIGHT: u32 = 3u;
+const MODE_SLOPE: u32 = 4u;
 const MODE_VIEW_NORMALS: u32 = 5u;
 const MODE_CURVATURE: u32 = 6u;
-const MODE_AGE: u32 = 7u;
+const MODE_AO: u32 = 7u;
+const MODE_EDITS: u32 = 8u;
+const MODE_FLOW: u32 = 9u;
+const MODE_SEDIMENT: u32 = 10u;
+const MODE_EROSION: u32 = 11u;
+const MODE_RIVERS: u32 = 12u;
+const MODE_AGE: u32 = 13u;
+const MODE_SOFTNESS: u32 = 14u;
+const MODE_OUTFLOW: u32 = 15u;
+const MODE_ERODE_MASK: u32 = 16u;
+const MODE_UPLIFT: u32 = 17u;
+const MODE_BEDROCK: u32 = 18u;
+const MODE_WATER_DEPTH: u32 = 19u;
+const MODE_WATER_VELOCITY: u32 = 20u;
+const MODE_SUSPENDED: u32 = 21u;
+const MODE_DISCHARGE: u32 = 22u;
+const MODE_MEAN_DEPTH: u32 = 23u;
+const MODE_RIVER_DISCHARGE: u32 = 24u;
+const MODE_BED_LOAD: u32 = 25u;
+const MODE_HELICAL: u32 = 26u;
+const MODE_BED_CHANGE: u32 = 27u;
+const MODE_DRAINAGE: u32 = 28u;
+const MODE_BOULDERS: u32 = 29u;
 
 // Convert HSV to RGB (hue, saturation, value all in [0, 1])
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
@@ -156,209 +195,220 @@ fn apply_lambert_shading(base_color: vec4<f32>, world_normal: vec3<f32>) -> vec4
     return vec4<f32>(base_color.rgb * light_color * exaggerated, base_color.a);
 }
 
-// Get base color for the current preview mode
+fn load(tex: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {
+    let dims = vec2<i32>(textureDimensions(tex, 0));
+    let px = clamp(vec2<i32>(vec2<f32>(dims) * uv), vec2<i32>(0), dims - 1);
+    return textureLoad(tex, px, 0);
+}
+
+// Bilinear `load`, for the fields the terrain colour uses (the debug images have no sampler).
+fn bilinear(tex: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {
+    let dims = vec2<i32>(textureDimensions(tex, 0));
+    let pos = vec2<f32>(dims) * uv - 0.5;
+    let p0 = vec2<i32>(floor(pos));
+    let f = pos - floor(pos);
+    let top = dims - 1;
+    let a = textureLoad(tex, clamp(p0, vec2<i32>(0), top), 0);
+    let b = textureLoad(tex, clamp(p0 + vec2<i32>(1, 0), vec2<i32>(0), top), 0);
+    let c = textureLoad(tex, clamp(p0 + vec2<i32>(0, 1), vec2<i32>(0), top), 0);
+    let d = textureLoad(tex, clamp(p0 + vec2<i32>(1, 1), vec2<i32>(0), top), 0);
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// Bare rock colour of boulder beds and scree, and how far a bed of boulders only moves toward it.
+const BOULDER_COLOUR: vec3<f32> = vec3<f32>(0.66, 0.65, 0.62);
+const BOULDER_TINT: f32 = 0.6;
+
+// Blue for negative, white at zero, red for positive; `v` in [-1, 1].
+fn diverging(v: f32) -> vec3<f32> {
+    let t = clamp(v, -1.0, 1.0);
+    let white = vec3<f32>(0.95);
+    if (t < 0.0) {
+        return mix(white, vec3<f32>(0.1, 0.3, 0.9), -t);
+    }
+    return mix(white, vec3<f32>(0.9, 0.15, 0.1), t);
+}
+
+// Hue for direction, brightness for magnitude (`m` in [0, 1]).
+fn direction_color(v: vec2<f32>, m: f32) -> vec3<f32> {
+    let hue = fract(atan2(v.y, v.x) / 6.2831853 + 1.0);
+    return hsv_to_rgb(hue, 0.85, clamp(m, 0.0, 1.0));
+}
+
+fn gray(v: f32) -> vec4<f32> {
+    return vec4<f32>(vec3<f32>(mix(0.06, 1.0, clamp(v, 0.0, 1.0))), 1.0);
+}
+
+fn heat(v: f32) -> vec4<f32> {
+    // Exact zero reads dark grey, so dry or untouched cells stand apart from small values and
+    // the terrain still shows against the black sky.
+    if (v <= 0.0) {
+        return vec4<f32>(0.06, 0.06, 0.06, 1.0);
+    }
+    return vec4<f32>(heat_map(v), 1.0);
+}
+
+// Base colour of the current view; every debug field is scaled by the view's gain.
 fn get_preview_color(mode: u32, uv: vec2<f32>, world_normal: vec3<f32>) -> vec4<f32> {
-    let dims = textureDimensions(color_tex, 0);
-    let px = vec2<i32>(vec2<f32>(dims) * uv);
-    
+    let g = preview_params.gain;
     switch (mode) {
-        case MODE_FLOW: {
-            let analysis = textureSample(analysis_tex, ao_sampler, uv);
-            let flow_mag = analysis.r * 2.0;
-            let color = heat_map(flow_mag);
-            return vec4<f32>(color, 1.0);
-        }
-        case MODE_SEDIMENT: {
-            let analysis = textureSample(analysis_tex, ao_sampler, uv);
-            let sediment = analysis.g * 20.0;
-            let color = heat_map(sediment);
-            return vec4<f32>(color, 1.0);
-        }
-        case MODE_EROSION: {
-            let analysis = textureSample(analysis_tex, ao_sampler, uv);
-            let erosion = analysis.b * 2.0;
-            let color = heat_map(erosion);
-            return vec4<f32>(color, 1.0);
-        }
         case MODE_HEIGHT: {
-            // Height: repeating black/white bands for high contrast visualization
+            // Height with repeating contour bands.
             let height = textureSampleLevel(height_tex, height_sampler, uv, 0.0).x;
-            let bands = fract(height * 100.0); // 100 repeating bands
-            let color = step(0.5, bands); // Black (0) or white (1)
-            return vec4(vec3(height + (color * .2)), 1.0);
+            let bands = step(0.5, fract(height * 100.0));
+            return vec4(vec3(height * g + bands * 0.2), 1.0);
+        }
+        case MODE_SLOPE: {
+            let slope = acos(clamp(world_normal.y, -1.0, 1.0));
+            return gray(slope / radians(60.0) * g);
         }
         case MODE_CURVATURE: {
-            let analysis = textureSample(analysis_tex, ao_sampler, uv);
-            let curvature = analysis.a; // Alpha channel contains curvature
-            let color = heat_map(curvature);
-            return vec4<f32>(color, 1.0);
+            // Stored as laplacian * 50 + 0.5.
+            let c = load(analysis_tex, uv).a - 0.5;
+            return vec4<f32>(diverging(-c * 2.0 * g), 1.0);
+        }
+        case MODE_AO: {
+            return gray(textureSample(ao_tex, ao_sampler, uv).x);
+        }
+        case MODE_EDITS: {
+            let e = load(terrain_edit_tex, uv);
+            var c = diverging(e.r * 20.0 * g);
+            c = mix(c, vec3<f32>(0.1, 0.8, 0.2), clamp(e.g, 0.0, 1.0) * 0.6);
+            c = mix(c, vec3<f32>(1.0), clamp(e.a, 0.0, 1.0) * 0.6);
+            return vec4<f32>(c, 1.0);
+        }
+        case MODE_FLOW: {
+            return heat(load(analysis_tex, uv).r * 2.0 * g);
+        }
+        case MODE_SEDIMENT: {
+            return heat(load(analysis_tex, uv).g * 20.0 * g);
+        }
+        case MODE_EROSION: {
+            return heat(load(analysis_tex, uv).b * 2.0 * g);
+        }
+        case MODE_RIVERS: {
+            // KTT river momentum (Do Rivers), scaled in the erosion blit
+            return heat(textureSampleLevel(height_tex, height_sampler, uv, 0.0).z * g);
         }
         case MODE_AGE: {
             // KTT __Age (time since a trail last changed the cell), scaled in the erosion blit
-            let age = textureSampleLevel(height_tex, height_sampler, uv, 0.0).y;
-            return vec4<f32>(heat_map(age), 1.0);
+            return heat(textureSampleLevel(height_tex, height_sampler, uv, 0.0).y * g);
+        }
+        case MODE_SOFTNESS: {
+            return gray(load(debug_masks_tex, uv).x * g);
+        }
+        case MODE_OUTFLOW: {
+            return gray(load(debug_masks_tex, uv).y * g);
+        }
+        case MODE_ERODE_MASK: {
+            return gray(load(debug_masks_tex, uv).z * g);
+        }
+        case MODE_UPLIFT: {
+            return gray(load(debug_masks_tex, uv).w * 0.5 * g);
+        }
+        case MODE_BEDROCK: {
+            return heat(load(debug_layers_tex, uv).x * 20.0 * g);
+        }
+        case MODE_WATER_DEPTH: {
+            let ground = textureSampleLevel(height_tex, height_sampler, uv, 0.0).x;
+            let d = load(water_tex, uv).x;
+            if (d <= 0.0 && sea.level > ground) {
+                return vec4<f32>(0.3, 0.3, 0.35, 1.0);
+            }
+            return heat(d * 50.0 * g);
+        }
+        case MODE_WATER_VELOCITY: {
+            let w = load(water_tex, uv);
+            return vec4<f32>(direction_color(w.yz, length(w.yz) * 4.0 * g), 1.0);
+        }
+        case MODE_SUSPENDED: {
+            return heat(load(water_tex, uv).w * 500.0 * g);
+        }
+        case MODE_DISCHARGE: {
+            let q = load(debug_discharge_tex, uv).xy;
+            // Log scale: discharge spans orders of magnitude between rills and rivers.
+            let m = log2(1.0 + length(q) * 1000.0 * g) / 8.0;
+            return vec4<f32>(direction_color(q, m), 1.0);
+        }
+        case MODE_MEAN_DEPTH: {
+            return heat(load(debug_discharge_tex, uv).z * 50.0 * g);
+        }
+        case MODE_RIVER_DISCHARGE: {
+            let w = load(debug_discharge_tex, uv).w;
+            return heat(log2(1.0 + w * 1000.0 * g) / 8.0);
+        }
+        case MODE_BED_LOAD: {
+            let qb = load(debug_bed_tex, uv).x;
+            return heat(log2(1.0 + qb * 10.0 * g) / 8.0);
+        }
+        case MODE_HELICAL: {
+            return vec4<f32>(diverging(load(debug_bed_tex, uv).y * 100.0 * g), 1.0);
+        }
+        case MODE_BED_CHANGE: {
+            return vec4<f32>(diverging(load(debug_bed_tex, uv).z * 100000.0 * g), 1.0);
+        }
+        case MODE_BOULDERS: {
+            return gray(load(debug_bed_tex, uv).w * g);
+        }
+        case MODE_DRAINAGE: {
+            // 100 m² (one 10 m texel) to 100 km².
+            let a = load(drainage_tex, uv).x;
+            return heat((log2(max(a, 1.0)) / 3.3219 - 2.0) / 6.0 * g);
         }
         default: {
-            // PBR mode: use computed color texture with linear sampling
-            return textureSample(color_tex, ao_sampler, uv);
+            // PBR, simple and albedo: the computed colour bands with linear sampling, lighter
+            // and greyer where the bed is boulders (armour, scree).
+            let base = textureSample(color_tex, ao_sampler, uv);
+            let boulders = clamp(preview_params.grain_colour * bilinear(debug_bed_tex, uv).w, 0.0, 1.0);
+            return vec4<f32>(mix(base.rgb, BOULDER_COLOUR, BOULDER_TINT * boulders), base.a);
         }
     }
 }
-
-// --- Water surface shading -------------------------------------------------------------------
 
 // Wet thresholds, as in `water.wgsl`.
 const WET_DEPTH: f32 = 0.0005;
 const FULL_DEPTH: f32 = 0.004;
-// Per world unit of path length through the water: red goes first, blue last.
-const ABSORPTION: vec3<f32> = vec3<f32>(2.2, 0.7, 0.45);
-// In-scattered colour of deep clear water and of silty water.
-const DEEP_COLOR: vec3<f32> = vec3<f32>(0.015, 0.06, 0.08);
-const SILT_COLOR: vec3<f32> = vec3<f32>(0.22, 0.17, 0.10);
-// Ripples per UV unit, and how far (UV per second) a ripple drifts at solver speed 1.
-const RIPPLE_SCALE: f32 = 160.0;
-const RIPPLE_FLOW: f32 = 0.02;
-
-fn hash2(p: vec2<f32>) -> f32 {
-    let q = fract(p * vec2<f32>(123.34, 456.21));
-    let r = q + dot(q, q + 45.32);
-    return fract(r.x * r.y);
-}
-
-fn value_noise(p: vec2<f32>) -> f32 {
-    let i = floor(p);
-    let f = fract(p);
-    let u = f * f * (3.0 - 2.0 * f);
-    let a = mix(hash2(i), hash2(i + vec2<f32>(1.0, 0.0)), u.x);
-    let b = mix(hash2(i + vec2<f32>(0.0, 1.0)), hash2(i + vec2<f32>(1.0, 1.0)), u.x);
-    return mix(a, b, u.y);
-}
-
-fn ripple_height(p: vec2<f32>) -> f32 {
-    return value_noise(p) * 0.65 + value_noise(p * 2.3 + 17.0) * 0.35;
-}
-
-// Gradient of the ripple field at `p` (ripple units).
-fn ripple_gradient(p: vec2<f32>) -> vec2<f32> {
-    let e = 0.15;
-    let c = ripple_height(p);
-    return vec2<f32>(ripple_height(p + vec2<f32>(e, 0.0)) - c, ripple_height(p + vec2<f32>(0.0, e)) - c) / e;
-}
-
-// Flow-map ripples: two copies advected along `flow` (UV per second), each restarting every
-// period and faded out as it restarts, so the pattern never stretches. `x` is the ripple value
-// (for foam), `yz` its gradient.
-fn flow_ripples(uv: vec2<f32>, flow: vec2<f32>, time: f32) -> vec3<f32> {
-    let period = 2.0;
-    var out = vec3<f32>(0.0);
-    for (var k = 0; k < 2; k = k + 1) {
-        let phase = fract(time / period + f32(k) * 0.5);
-        let w = 1.0 - abs(2.0 * phase - 1.0);
-        let p = (uv - flow * phase * period) * RIPPLE_SCALE + f32(k) * 31.7;
-        out += w * vec3<f32>(ripple_height(p), ripple_gradient(p));
-    }
-    return out;
-}
-
-struct WaterShade {
-    color: vec3<f32>,
-    normal: vec3<f32>,
-    roughness: f32,
-    wet: f32,
-}
-
-// Water over the bed colour `bed`: depth absorption along the view path, silt, ripple normals
-// following the solver velocity (ocean waves drift with time) and foam on rapids and shores.
-fn shade_water(uv: vec2<f32>, bed: vec3<f32>, n: vec3<f32>, v: vec3<f32>) -> WaterShade {
-    let ground = textureSampleLevel(height_tex, height_sampler, uv, 0.0).x;
-    let water = textureSampleLevel(water_tex, height_sampler, uv, 0.0);
-    let depth = water_depth_at(uv, ground);
-    var shade: WaterShade;
-    shade.wet = smoothstep(WET_DEPTH, FULL_DEPTH, depth);
-    shade.color = bed;
-    shade.normal = n;
-    shade.roughness = 1.0;
-    if (shade.wet <= 0.0) {
-        return shade;
-    }
-    let ocean = sea.level > 0.0 && sea.level - ground > water.x;
-    let vel = select(water.yz, vec2<f32>(0.0), ocean);
-    let speed = length(vel);
-    let time = globals.time;
-
-    var flow = vel * RIPPLE_FLOW;
-    var amp = 0.04 + 0.25 * smoothstep(0.05, 0.6, speed);
-    if (ocean) {
-        // Open water: waves drift with the wind instead of a current.
-        flow = vec2<f32>(0.004, 0.0025);
-        amp = 0.18;
-    }
-    let ripples = flow_ripples(uv, flow, time);
-    let tilt = ripples.yz * amp * shade.wet;
-    shade.normal = normalize(n + vec3<f32>(-tilt.x, 0.0, -tilt.y));
-
-    // Light crosses the water column down to the bed and back up toward the eye.
-    let column = depth * terrain_params.height_scale;
-    let path = column * (1.0 + 1.0 / max(abs(v.y), 0.15));
-    let transmit = exp(-ABSORPTION * path);
-    let silt = clamp(water.w * 400.0, 0.0, 0.8);
-    let scatter = mix(DEEP_COLOR, SILT_COLOR, silt);
-    var color = mix(bed * transmit + scatter * (1.0 - transmit), scatter, silt * (1.0 - transmit.b));
-
-    // Foam: white water on fast flow, and a thin broken line where the water meets the shore.
-    let shore = 1.0 - smoothstep(FULL_DEPTH, 3.0 * FULL_DEPTH, depth);
-    let rapids = smoothstep(0.35, 0.9, speed);
-    let breaking = select(0.0, 0.5, ocean) * shore;
-    let foam = clamp(max(rapids, max(shore * 0.6, breaking)) * smoothstep(0.75, 1.05, ripples.x), 0.0, 1.0);
-    color = mix(color, vec3<f32>(0.85, 0.88, 0.9), foam);
-
-    shade.color = mix(bed, color, shade.wet);
-    shade.roughness = mix(0.04, 0.5, foam);
-    return shade;
-}
 
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
     var out: FragmentOutput;
-    
+    let mode = preview_params.mode;
+
     // Sample precomputed ambient occlusion with linear interpolation for smooth result
     let ao_value = textureSample(ao_tex, ao_sampler, in.uv).x;
-    
+
     // Create PBR input for lighting
     var pbr_input = pbr_input_from_standard_material(in, is_front);
-    
+
     // Get base color based on preview mode
-    let base_color = get_preview_color(preview_params.mode, in.uv, in.world_normal);
-    
-    // Apply base color and lighting
-    if (preview_params.mode == MODE_PBR) {
-        // Water: absorption, ripples and foam over the bed; glossy, with a water-like F0 so the
-        // atmosphere environment map supplies the Fresnel sky reflection.
-        let water = shade_water(in.uv, base_color.rgb, pbr_input.N, pbr_input.V);
-        let color = vec4<f32>(water.color, base_color.a);
-        pbr_input.N = normalize(mix(pbr_input.N, water.normal, water.wet));
-        pbr_input.material.perceptual_roughness = mix(pbr_input.material.perceptual_roughness, water.roughness, water.wet);
-        pbr_input.material.reflectance = mix(pbr_input.material.reflectance, vec3<f32>(0.35), water.wet);
+    let base_color = get_preview_color(mode, in.uv, in.world_normal);
+
+    if (mode == MODE_PBR) {
         // Full PBR lighting for default mode
-        pbr_input.material.base_color = alpha_discard(pbr_input.material.flags, pbr_input.material.alpha_cutoff, color);
+        pbr_input.material.base_color = alpha_discard(pbr_input.material.flags, pbr_input.material.alpha_cutoff, base_color);
         // Apply AO to diffuse_occlusion
         pbr_input.diffuse_occlusion = vec3<f32>(ao_value);
         out.color = apply_pbr_lighting(pbr_input);
         out.color = main_pass_post_lighting_processing(pbr_input, out.color);
-    } 
-    else if (preview_params.mode == MODE_VIEW_NORMALS) {
+    } else if (mode == MODE_VIEW_NORMALS) {
         // Transform world normal to view space
         let view_normal = normalize((view.view_from_world * vec4<f32>(in.world_normal, 0.0)).xyz);
         let color = vec4<f32>(view_normal * 0.5 + 0.5, 1.0);
         out.color = pow(color, vec4(vec3(4.0), 1.0));
-    }
-    else {
-        // Simple Lambert shading for preview modes - apply AO as simple multiplier
-        out.color = apply_lambert_shading(base_color, in.world_normal);
+    } else if (mode == MODE_SIMPLE) {
+        // Flat tint where there is water, so the simulations stay visible without optics.
+        let ground = textureSampleLevel(height_tex, height_sampler, in.uv, 0.0).x;
+        let wet = smoothstep(WET_DEPTH, 4.0 * FULL_DEPTH, water_depth_at(in.uv, ground));
+        let color = vec4<f32>(mix(base_color.rgb, vec3<f32>(0.05, 0.2, 0.3), wet), base_color.a);
+        out.color = apply_lambert_shading(color, in.world_normal);
         out.color = vec4<f32>(out.color.rgb * ao_value, out.color.a);
+    } else {
+        // Data views: the field itself with a light relief shade, so the shape still reads
+        // without hiding the values.
+        let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.5));
+        let relief = mix(0.65, 1.0, max(0.0, dot(in.world_normal, light_dir)));
+        out.color = vec4<f32>(base_color.rgb * relief, 1.0);
     }
-    
+
     return out;
 }
-
-
