@@ -14,6 +14,13 @@
 //! `EROSION_BENCH_DISTANCE`, `_PITCH` and `_YAW`,
 //! in degrees, frame it), and `EROSION_BENCH_RAIN=<mm/h>` rains on the whole map, `EROSION_BENCH_RIVER=x,y` places a river from texel (x, y). `EROSION_VIEW=<view>` starts in a debug view (see the View tab). `EROSION_BENCH_SCREENSHOT=<path>` hides the settings panel (kept with `EROSION_BENCH_PANEL=1`) and saves
 //! the window just before the bench quits.
+//!
+//! `EROSION_HEADLESS=<width>x<height>` renders into an image of that size with no window, for
+//! benches on machines without a display; screenshots then come from that image.
+//! `EROSION_LOG_DIAGNOSTICS=1` logs Bevy's per-pass render diagnostics (GPU and CPU time per
+//! pass) once a second. The water surface is a bevy_fft `WaterQuadtree` with dry culling, which
+//! skips tiles with no water under them; `EROSION_WATER_GRID=1` draws it on the terrain's grid
+//! instead.
 
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::{
@@ -36,7 +43,7 @@ use bevy::{
         render_resource::PipelineCache,
         view::screenshot::{Screenshot, save_to_disk},
     },
-    window::PresentMode,
+    window::{ExitCondition, PresentMode},
 };
 #[cfg(feature = "ui")]
 use bevy_erosion::ui::ErosionParamsPlugin;
@@ -53,8 +60,8 @@ use bevy_erosion::{
 };
 use bevy_fft::water::{
     JerlovWaterType, WaterLodClear, WaterLodSettings, WaterOpticsUniform, WaterPlugin,
-    WaterSurfaceExtension, WaterSurfaceMaterial, WaterSurfaceTag, WaterSurfaceUniform,
-    WaterTransmission,
+    WaterQuadtree, WaterSurfaceExtension, WaterSurfaceMaterial, WaterSurfaceTag,
+    WaterSurfaceUniform, WaterTransmission,
 };
 use std::sync::{
     Arc,
@@ -118,6 +125,7 @@ fn showcase_shots(
     mut taken: Local<Option<usize>>,
     mut started: Local<bool>,
     mut exit: MessageWriter<AppExit>,
+    headless: Option<Res<HeadlessTarget>>,
 ) {
     let Ok(dir) = std::env::var("EROSION_SHOWCASE_SHOTS") else {
         return;
@@ -137,7 +145,7 @@ fn showcase_shots(
         let path = format!("{dir}/{:02}_{name}.png", status.index);
         info!("Showcase shot {path}");
         commands
-            .spawn(Screenshot::primary_window())
+            .spawn(screenshot(headless.as_deref()))
             .observe(save_to_disk(path));
     }
 }
@@ -193,13 +201,7 @@ fn main() {
             ..Default::default()
         })
         .add_plugins((
-            DefaultPlugins.set(WindowPlugin {
-                primary_window: Some(Window {
-                    present_mode,
-                    ..default()
-                }),
-                ..default()
-            }),
+            default_plugins(present_mode),
             ErosionComputePlugin,
             MaterialPlugin::<TerrainMaterial>::default(),
             OrbitCameraPlugin,
@@ -240,10 +242,82 @@ fn main() {
                 base_texel_size: map_metres / 2048.0,
             });
     }
+    if let Some(size) = headless_size() {
+        app.insert_resource(HeadlessSize(size))
+            .add_systems(PreStartup, create_headless_target)
+            .add_plugins(bevy::app::ScheduleRunnerPlugin::run_loop(
+                std::time::Duration::ZERO,
+            ));
+    }
+    if std::env::var_os("EROSION_LOG_DIAGNOSTICS").is_some() {
+        // Bevy adds its render diagnostics itself only with `tracing-tracy`.
+        if !app.is_plugin_added::<bevy::render::diagnostic::RenderDiagnosticsPlugin>() {
+            app.add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin);
+        }
+        app.add_plugins(bevy::diagnostic::LogDiagnosticsPlugin::default());
+    }
     app.sub_app_mut(RenderApp)
         .insert_resource(ready_frames)
         .add_systems(Render, count_ready_render_frames);
     app.run();
+}
+
+/// `EROSION_HEADLESS=<width>x<height>`.
+fn headless_size() -> Option<UVec2> {
+    let v = std::env::var("EROSION_HEADLESS").ok()?;
+    let (w, h) = v.split_once('x')?;
+    Some(UVec2::new(w.parse().ok()?, h.parse().ok()?))
+}
+
+/// Bevy's default plugins, without a window or winit when running headless.
+fn default_plugins(present_mode: PresentMode) -> bevy::app::PluginGroupBuilder {
+    if headless_size().is_some() {
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: None,
+                exit_condition: ExitCondition::DontExit,
+                ..default()
+            })
+            .disable::<bevy::winit::WinitPlugin>()
+    } else {
+        DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                present_mode,
+                ..default()
+            }),
+            ..default()
+        })
+    }
+}
+
+#[derive(Resource)]
+struct HeadlessSize(UVec2);
+
+/// The image the camera renders into with `EROSION_HEADLESS`.
+#[derive(Resource)]
+struct HeadlessTarget(Handle<Image>);
+
+fn create_headless_target(
+    mut commands: Commands,
+    size: Res<HeadlessSize>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let mut image = Image::new_target_texture(
+        size.0.x,
+        size.0.y,
+        bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+        None,
+    );
+    image.texture_descriptor.usage |= bevy::render::render_resource::TextureUsages::COPY_SRC;
+    commands.insert_resource(HeadlessTarget(images.add(image)));
+}
+
+/// A screenshot of the window, or of the headless target.
+fn screenshot(headless: Option<&HeadlessTarget>) -> Screenshot {
+    match headless {
+        Some(target) => Screenshot::image(target.0.clone()),
+        None => Screenshot::primary_window(),
+    }
 }
 
 /// Render frames so far with no pipeline still compiling (shared with the render world).
@@ -321,7 +395,11 @@ fn log_frame_times(
     mut water: ResMut<WaterControl>,
     mut brush: ResMut<WaterBrush>,
     mut boulders: ResMut<BoulderEdits>,
-    (mut slides, drainage): (ResMut<Landslides>, Res<DrainageArea>),
+    (mut slides, drainage, headless): (
+        ResMut<Landslides>,
+        Res<DrainageArea>,
+        Option<Res<HeadlessTarget>>,
+    ),
     mut exit: MessageWriter<AppExit>,
     mut window: Local<(f32, u32)>,
     mut bench: Local<Option<f32>>,
@@ -447,7 +525,7 @@ fn log_frame_times(
                 }
             }
             commands
-                .spawn(Screenshot::primary_window())
+                .spawn(screenshot(headless.as_deref()))
                 .observe(save_to_disk(path));
         }
         if *elapsed >= len {
@@ -508,6 +586,7 @@ fn spawn_terrain(
     erosion_images: Res<ErosionImages>,
     config: Res<ErosionConfig>,
     scale: Res<WorldScale>,
+    headless: Option<Res<HeadlessTarget>>,
 ) {
     // A subdivided plane with one vertex per texel, in metres: the scene is the map at real
     // scale, so the atmosphere, shadows and water optics see real distances.
@@ -543,10 +622,10 @@ fn spawn_terrain(
             width,
             height_scale,
         ));
-        // The surface samples the water LOD data by world position, so it reuses the terrain's
-        // grid. Its bounds are flat, so it is never frustum culled.
-        commands.spawn((
-            Mesh3d(mesh_handle.clone()),
+        // The surface samples the water LOD data by world position. A quadtree around the camera
+        // carries it and skips tiles with no water under them (bevy_fft drops them when the
+        // material sets `dry_depth`); `EROSION_WATER_GRID=1` reuses the terrain's grid instead.
+        let mut surface = commands.spawn((
             MeshMaterial3d(water_materials.add(WaterSurfaceMaterial {
                 base: StandardMaterial {
                     base_color: Color::WHITE,
@@ -574,9 +653,22 @@ fn spawn_terrain(
             })),
             Transform::default(),
             WaterSurfaceTag,
-            NoFrustumCulling,
             bevy::light::NotShadowCaster,
         ));
+        if std::env::var("EROSION_WATER_GRID").is_ok_and(|v| v != "0") {
+            // Its bounds are flat, so it is never frustum culled.
+            surface.insert((Mesh3d(mesh_handle.clone()), NoFrustumCulling));
+        } else {
+            // Water sits anywhere between the sea and the peaks, so no height bounds would hold
+            // for frustum culling; dry tiles are what the quadtree drops. On a 5090 at 2560x1440
+            // the grid's water pass took 0.140 ms and the quadtree's 0.067 ms, 0.044 ms with dry
+            // culling, which adds about 0.035 ms of tile selection.
+            surface.insert(WaterQuadtree {
+                frustum_cull: false,
+                dry_culling: true,
+                ..default()
+            });
+        }
     }
 
     commands.spawn((
@@ -614,7 +706,7 @@ fn spawn_terrain(
         .expect("Failed to create compensation curve"),
     );
 
-    // 3D camera
+    // 3D camera, rendering into the headless target when there is no window.
     let mut camera = commands.spawn((
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection {
@@ -632,6 +724,14 @@ fn spawn_terrain(
             ..Default::default()
         },
     ));
+    if let Some(target) = &headless {
+        camera.insert(bevy::camera::RenderTarget::Image(
+            bevy::camera::ImageRenderTarget {
+                handle: target.0.clone(),
+                scale_factor: 1.0,
+            },
+        ));
+    }
     if simple_mode() {
         camera.insert((
             Tonemapping::None,
