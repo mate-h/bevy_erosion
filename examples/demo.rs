@@ -18,9 +18,9 @@
 //! `EROSION_HEADLESS=<width>x<height>` renders into an image of that size with no window, for
 //! benches on machines without a display; screenshots then come from that image.
 //! `EROSION_LOG_DIAGNOSTICS=1` logs Bevy's per-pass render diagnostics (GPU and CPU time per
-//! pass) once a second. `EROSION_WATER_QUADTREE=1` draws the water on a bevy_fft `WaterQuadtree`
-//! with dry culling instead of the terrain's grid; see `spawn_terrain` for why it is not the
-//! default yet.
+//! pass) once a second. The water is drawn on a bevy_fft `WaterQuadtree` with dry culling;
+//! `EROSION_WATER_GRID=1` draws it on the terrain's grid instead, and
+//! `EROSION_WATER_QUADTREE_SHAPE=<leaf m>,<cells per tile>,<lod range>,<levels>` reshapes the tree.
 
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::{
@@ -50,11 +50,11 @@ use bevy_erosion::ui::ErosionParamsPlugin;
 use bevy_erosion::{
     ErosionConfig,
     boulders::{Boulder, BoulderEdits, BoulderList},
+    brush::{BrushMode, TerrainSurface, WaterBrush, WaterBrushPlugin},
+    camera::{OrbitCameraPlugin, OrbitController},
     drainage::DrainageArea,
     landslide::Landslides,
     scenes::{SceneKind, SceneRequest, SceneStatus},
-    brush::{BrushMode, TerrainSurface, WaterBrush, WaterBrushPlugin},
-    camera::{OrbitCameraPlugin, OrbitController},
     sun::{Sun, SunController, SunPlugin},
     water_heightfield, *,
 };
@@ -622,8 +622,8 @@ fn spawn_terrain(
             width,
             height_scale,
         ));
-        // The surface samples the water LOD data by world position, so it reuses the terrain's
-        // grid. `EROSION_WATER_QUADTREE=1` puts it on a quadtree around the camera instead.
+        // The surface samples the water LOD data by world position, on a quadtree around the
+        // camera; `EROSION_WATER_GRID=1` reuses the terrain's grid instead.
         let mut surface = commands.spawn((
             MeshMaterial3d(water_materials.add(WaterSurfaceMaterial {
                 base: StandardMaterial {
@@ -654,24 +654,44 @@ fn spawn_terrain(
             WaterSurfaceTag,
             bevy::light::NotShadowCaster,
         ));
-        if std::env::var("EROSION_WATER_QUADTREE").is_ok_and(|v| v != "0") {
+        if std::env::var("EROSION_WATER_GRID").is_ok_and(|v| v != "0") {
+            // Its bounds are flat, so it is never frustum culled.
+            surface.insert((Mesh3d(mesh_handle.clone()), NoFrustumCulling));
+        } else {
             // Water sits anywhere between the sea and the peaks, so no height bounds would hold
-            // for frustum culling; dry culling drops tiles with no water under them. On a 5090 at
-            // 2560x1440 the grid's water pass took 0.140 ms and the quadtree's 0.067 ms, 0.044 ms
-            // with dry culling, which adds about 0.035 ms of tile selection. Not the default yet:
-            // distant tiles are coarser than the heightfield, so their vertices straddle wet cells
-            // and dry ones sunk below the terrain and a pond's shore turns into diamonds. The
-            // extent keeps it on the map, where past the LOD slices it would draw open water.
+            // for frustum culling; dry culling drops tiles with no water under them, and the
+            // extent keeps the tree on the map, past which the surface would draw open water.
+            // bevy_fft's default shape (2 m leaves, 8 cells per tile, range 4) puts vertices about
+            // 64 m apart 2-3 km out, against 10 m heightfield cells, and a pond's shore there
+            // turned into diamonds. 8 m leaves with 16 cells per tile and range 8 draw it like the
+            // terrain grid. On a 5090 at 2560x1440 the water pass took 0.140 ms on the grid and
+            // 0.028 ms on this quadtree, plus 0.059 ms of tile selection.
             let half = 0.5 * width;
-            surface.insert(WaterQuadtree {
+            let mut quadtree = WaterQuadtree {
+                leaf_size: 8.0,
+                tile_cells: 16,
+                lod_range: 8.0,
+                levels: 12,
+                max_tiles: 4096,
                 frustum_cull: false,
                 dry_culling: true,
                 extent: Some(Rect::new(-half, -half, half, half)),
                 ..default()
-            });
-        } else {
-            // Its bounds are flat, so it is never frustum culled.
-            surface.insert((Mesh3d(mesh_handle.clone()), NoFrustumCulling));
+            };
+            // `EROSION_WATER_QUADTREE_SHAPE=<leaf m>,<cells per tile>,<lod range>,<levels>`.
+            if let Some(shape) = std::env::var("EROSION_WATER_QUADTREE_SHAPE")
+                .ok()
+                .and_then(|v| {
+                    let f: Vec<f32> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+                    (f.len() == 4).then_some(f)
+                })
+            {
+                quadtree.leaf_size = shape[0];
+                quadtree.tile_cells = shape[1] as u32;
+                quadtree.lod_range = shape[2];
+                quadtree.levels = shape[3] as u32;
+            }
+            surface.insert(quadtree);
         }
     }
 
