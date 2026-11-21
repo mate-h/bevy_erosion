@@ -1343,6 +1343,10 @@ pub struct BedLoad {
     /// Sternberg abrasion coefficient α (per km): moving boulders wear into fines as
     /// e^(−α · distance travelled). Hard rock measures 0.01–0.1 per km, weak rock up to 1.
     pub abrasion: f32,
+    /// Bed friction from the bed's grain sizes instead of Manning's n: bevy_fft's Ferguson
+    /// (2007) resistance from the D84 of the fines and boulders on the surface, which drags
+    /// harder where the water is as shallow as the grains.
+    pub grain_friction: bool,
 }
 
 impl Default for BedLoad {
@@ -1363,6 +1367,7 @@ impl Default for BedLoad {
             boulder_scree: 0.3,
             hiding: 0.85,
             abrasion: 0.05,
+            grain_friction: false,
         }
     }
 }
@@ -1619,6 +1624,8 @@ struct MorphoParams {
     active_layer: f32,
     abrasion: f32,
     reset_boulders: u32,
+    /// Write the bed's D84 for the solver's friction (`morpho_grain`), or 0 for Manning's.
+    grain_friction: u32,
 }
 
 /// Longest boulder substep (s): contacts and friction stay stable, and at the fastest a boulder
@@ -1893,6 +1900,9 @@ struct ErosionPipeline {
     pipeline_blit_fields: CachedComputePipelineId,
     pipeline_export: CachedComputePipelineId,
     pipeline_morpho_debug: CachedComputePipelineId,
+    /// `morpho_grain` (`water_morpho.wgsl`) and its output, the solver's grain texture.
+    pipeline_morpho_grain: CachedComputePipelineId,
+    layout_grain_out: BindGroupLayoutDescriptor,
     /// `water.wgsl`: clear, flux, depth, erode, advect, copy, the bevy_fft solver's export,
     /// gather and import, apply (the staged erosion), and the surface for bevy_fft's renderer.
     pipelines_water: [CachedComputePipelineId; 11],
@@ -2341,6 +2351,21 @@ fn init_erosion_pipeline(
         &water_morpho_shader,
         "morpho_debug",
     );
+    let layout_grain_out = BindGroupLayoutDescriptor::new(
+        "GrainOut",
+        &BindGroupLayoutEntries::with_indices(
+            ShaderStages::COMPUTE,
+            ((
+                2,
+                texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::WriteOnly),
+            ),),
+        ),
+    );
+    let pipeline_morpho_grain = compute(
+        vec![layout_water_morpho.clone(), layout_grain_out.clone()],
+        &water_morpho_shader,
+        "morpho_grain",
+    );
 
     let water_splat_shader = asset_server.load(WATER_SPLAT_SHADER);
     let pipelines_water_splat = ["water_splat", "water_record"]
@@ -2463,6 +2488,8 @@ fn init_erosion_pipeline(
         pipeline_blit_fields,
         pipeline_export,
         pipeline_morpho_debug,
+        pipeline_morpho_grain,
+        layout_grain_out,
         pipelines_water,
     });
 }
@@ -2624,6 +2651,9 @@ struct SweGrid {
     bed: TextureView,
     /// `Rgba32Float` sources and sinks, written by `swe_export`.
     source: TextureView,
+    /// `R32Float` bed D84 in texels for the solver's grain friction, written by `morpho_grain`;
+    /// 0 keeps Manning's.
+    grain: TextureView,
     /// Built once the solver's pipelines have compiled.
     solver: Option<ShallowWaterSolver>,
 }
@@ -2652,6 +2682,7 @@ impl SweGrid {
             textures: ShallowWaterTextures::create(device, size),
             bed: input("water_swe_bed", TextureFormat::R32Float),
             source: input("water_swe_source", TextureFormat::Rgba32Float),
+            grain: input("water_swe_grain", TextureFormat::R32Float),
             solver: None,
         }
     }
@@ -2724,6 +2755,7 @@ impl WaterBuffers {
                 active_layer: 2.0,
                 abrasion: 0.0,
                 reset_boulders: 0,
+                grain_friction: 0,
             }),
             river: StorageBuffer::from(vec![Vec4::new(river::NO_RIVER, 1.0, 0.0, 0.0); n]),
             river_band: StorageBuffer::from(vec![Vec2::ZERO; n]),
@@ -2764,6 +2796,8 @@ struct ErosionBindGroups {
     /// Water solver, indexed by work set.
     water: [BindGroup; 2],
     water_out: BindGroup,
+    /// `morpho_grain`'s output, the solver's grain texture.
+    grain_out: BindGroup,
     /// Bed reconstruction, indexed by work set.
     water_bed: [BindGroup; 2],
     /// Discharge, helical flow and steering, indexed by work set.
@@ -3128,6 +3162,11 @@ fn prepare_erosion_bind_groups(
                 &view_water_velocity.texture_view,
                 &view_obstacle.texture_view,
             )),
+        ),
+        grain_out: render_device.create_bind_group(
+            None,
+            &layout(&pipeline.layout_grain_out),
+            &BindGroupEntries::with_indices(((2, &buffers.water.swe.grain),)),
         ),
         blit: render_device.create_bind_group(
             None,
@@ -3536,6 +3575,7 @@ fn plan_erosion_frame(
                 inputs: ShallowWaterInputs {
                     bed: Some(grid.bed.clone()),
                     source: Some(grid.source.clone()),
+                    grain: Some(grid.grain.clone()),
                     ..default()
                 },
                 particle_count: 0,
@@ -3724,6 +3764,7 @@ fn plan_erosion_frame(
             active_layer: ACTIVE_LAYER,
             abrasion: bed_load.abrasion_per_texel(&scale),
             reset_boulders: u32::from(reset_boulders),
+            grain_friction: u32::from(bed_load.grain_friction),
         });
         buffers
             .water
@@ -4158,6 +4199,14 @@ fn erosion_compute(
                         pass.dispatch_workgroups(gx, gy, 1);
                     }
                     if steer && let Some(p) = p_steer {
+                        pass.set_pipeline(p);
+                        pass.dispatch_workgroups(gx, gy, 1);
+                    }
+                    // The bed's D84 for the solver's friction next frame.
+                    if swe.is_some()
+                        && let Some(p) = get(pipes.pipeline_morpho_grain)
+                    {
+                        pass.set_bind_group(1, &groups.grain_out, &[]);
                         pass.set_pipeline(p);
                         pass.dispatch_workgroups(gx, gy, 1);
                     }

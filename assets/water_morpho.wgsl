@@ -83,6 +83,8 @@ struct MorphoParams {
     // 1 for one frame after the boulder settings changed: the surface layer starts again from
     // the substrate.
     reset_boulders: u32,
+    // Write the bed's D84 for the solver's friction (`morpho_grain`), or 0 for Manning's.
+    grain_friction: u32,
 }
 
 @group(0) @binding(0) var<storage, read_write> height: array<atomic<u32>>;
@@ -463,4 +465,23 @@ fn morpho_debug(@builtin(global_invocation_id) gid: vec3<u32>) {
         p,
         vec4<f32>(length(qb), helical_now, state[STATE_STRIDE * i + 2u], surface_boulders(p)),
     );
+}
+
+// The bed's D84 (texels) for bevy_fft's grain friction (Ferguson 2007), or 0 to keep Manning's.
+// With two grain sizes the 84th percentile jumps from the fines to the boulders once boulders
+// cover 16 % of the surface; it eases across that in log size, from 8 % to 24 %.
+@group(1) @binding(2) var grain_out: texture_storage_2d<r32float, write>;
+
+@compute @workgroup_size(8, 8, 1)
+fn morpho_grain(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let p = vec2<i32>(gid.xy);
+    if (!inside(p)) { return; }
+    var d84 = 0.0;
+    if (params.grain_friction != 0u) {
+        let fines = max(params.grain, 1e-6) / SUBMERGED_DENSITY;
+        let boulders = max(params.boulder_grain, 1e-6) / SUBMERGED_DENSITY;
+        let t = smoothstep(0.08, 0.24, surface_boulders(p));
+        d84 = exp(mix(log(fines), log(boulders), t));
+    }
+    textureStore(grain_out, p, vec4<f32>(d84, 0.0, 0.0, 0.0));
 }

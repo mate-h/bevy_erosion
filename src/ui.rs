@@ -496,6 +496,7 @@ enum ToggleKind {
     MomentumFlow,
     SecondOrderDepth,
     LiveBedLoad,
+    GrainFriction,
     AutoLandslides,
 }
 
@@ -528,6 +529,7 @@ impl ToggleKind {
             Self::MomentumFlow => water.solver == WaterSolver::Swe,
             Self::SecondOrderDepth => water.second_order_depth,
             Self::LiveBedLoad => water.bed_load.live,
+            Self::GrainFriction => water.bed_load.grain_friction,
             Self::AutoLandslides => water.landslide.auto,
         }
     }
@@ -568,6 +570,7 @@ impl ToggleKind {
             }
             Self::SecondOrderDepth => water.second_order_depth = on,
             Self::LiveBedLoad => water.bed_load.live = on,
+            Self::GrainFriction => water.bed_load.grain_friction = on,
             Self::AutoLandslides => water.landslide.auto = on,
         }
     }
@@ -1057,6 +1060,8 @@ fn erosion_params_panel(params: ErodeParams, sim: SimControl, world: WorldScale)
                         @note_text("Flowing water moves its bed: bars, pools, steps and deltas.")
                         --
                         @toggle_row("Live Bed Load", ToggleKind::LiveBedLoad)
+                        --
+                        @toggle_row("Grain Friction (Ferguson)", ToggleKind::GrainFriction)
                         --
                         @FeathersButton {
                             @caption: bsn! { Text("Refine Beds (M)") ThemedText },

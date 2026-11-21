@@ -72,6 +72,10 @@ Wong & Parker (2006) for the grain size. River channels come from one model: a c
 A km² carries a bankfull Q = k·A^0.8 m³/s in a channel 4.4·Q^0.5 m wide and 0.3·Q^0.4 m deep.
 The Drainage view shows the catchment of every texel. See `docs/UNIFIED_PLAN.md`.
 
+Grain Friction (Bed Load panel, off by default) replaces Manning's n with bevy_fft's Ferguson
+(2007) resistance from the bed's D84: the fines' diameter, easing to the boulders' as they cover
+8–24 % of the surface. It drags harder where the water is as shallow as the grains.
+
 ## River brush
 
 With the River brush, a click on the terrain places a river. A preview line shows where it will

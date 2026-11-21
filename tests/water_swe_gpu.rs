@@ -560,6 +560,56 @@ fn flume_follows_manning() {
     );
 }
 
+/// With grain friction on, the same sheet flow follows Ferguson's (2007) resistance for the bed's
+/// D84 instead of Manning's: u = U/u* · √(g h S), U/u* = 6.5 · 2.5 r / √(6.5² + 2.5² r^(5/3)),
+/// r = h / D84. Fines 0.5 m and no boulders, so D84 is the fines' diameter.
+#[test]
+#[ignore = "needs a graphics adapter"]
+fn grain_friction_follows_ferguson() {
+    let slope = 0.001;
+    let bed = move |x: u32, _| 0.3 + slope * (N - 1 - x) as f32;
+    let mut h = Harness::new(WaterSolver::Swe, bed);
+    let d84 = 0.5 / scale().metres_per_texel;
+    {
+        let mut water = h.water();
+        water.bed_load.grain_friction = true;
+        water.bed_load.diameter = 0.5;
+        water.bed_load.boulder_base = 0.0;
+        water.bed_load.boulder_rock = 0.0;
+        water.bed_load.boulder_scree = 0.0;
+    }
+    let n = n_cells();
+    let s = slope * CELLS_PER_HEIGHT;
+    let q_mid = 0.3f32.powf(5.0 / 3.0) * s.sqrt() / n;
+    let rain = q_mid / (CELLS_PER_HEIGHT * (N / 2) as f32);
+    h.water().rainfall = mm_per_hour(rain / TIME);
+    h.run(90.0);
+    let water = h.read_water();
+    let ferguson = |h_cells: f32| {
+        let r = h_cells / d84;
+        let ratio = 6.5 * 2.5 * r / (6.5f32 * 6.5 + 2.5 * 2.5 * r.powf(5.0 / 3.0)).sqrt();
+        ratio * (g_cells() * h_cells * s).sqrt()
+    };
+    let mut ratios = Vec::new();
+    let mut manning = Vec::new();
+    for y in (N / 4)..(3 * N / 4) {
+        for x in (3 * N / 8)..(5 * N / 8) {
+            let w = water[idx(x, y)];
+            let h_cells = w.depth * CELLS_PER_HEIGHT;
+            ratios.push(w.velocity.x / ferguson(h_cells));
+            manning.push(w.velocity.x / (h_cells.powf(2.0 / 3.0) * s.sqrt() / n));
+        }
+    }
+    let median = |v: &mut Vec<f32>| {
+        v.sort_by(f32::total_cmp);
+        v[v.len() / 2]
+    };
+    let (u_ratio, m_ratio) = (median(&mut ratios), median(&mut manning));
+    println!("grain friction: speed / Ferguson {u_ratio:.3}, speed / Manning {m_ratio:.3}");
+    assert!((u_ratio - 1.0).abs() < 0.15, "speed is {u_ratio} of Ferguson's");
+    assert!((m_ratio - 1.0).abs() > 0.15, "speed still follows Manning ({m_ratio})");
+}
+
 /// Land at 0.5 with a basin (bed 0.40) and a channel sloping into it from the west.
 fn lake_and_channel(x: u32, y: u32) -> f32 {
     let in_basin = (120..236).contains(&x) && (40..216).contains(&y);
