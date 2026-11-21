@@ -17,9 +17,20 @@ path = "src/lib.rs"
 name = "demo"
 path = "examples/demo.rs"
 
+[[example]]
+name = "headless"
+path = "examples/headless.rs"
+
 [features]
 default = ["ui"]
 ui = ["bevy/bevy_feathers"]
 
 [dependencies]
 bevy = "0.20"
+bytemuck = { version = "1", features = ["derive"] }
+bevy_fft = { git = "https://github.com/mate-h/bevy_fft", rev = "958c437c1a257a2768d82ce8658a4d0463bae21e" }
+river_geometry = { git = "https://github.com/mate-h/bevy_fft", rev = "958c437c1a257a2768d82ce8658a4d0463bae21e" }
+
+[dev-dependencies]
+serde_json = "1"
+sha2 = "0.10"
