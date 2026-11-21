@@ -1657,6 +1657,69 @@ fn apex_scour(helical: f32) -> Vec<f32> {
         .collect()
 }
 
+/// Speed, depth, streamline curvature (from the velocity field, on the CPU) and helical intensity
+/// along the S-bend's apexes after 25 s of flow, with MacCormack and with momentum-conserving
+/// advection, on a fixed bed. For bevy_fft's bead 0ge.8: helical flow needs about three times its strength
+/// under momentum-conserving advection to shift the bend scour as far.
+#[test]
+#[ignore = "needs a graphics adapter; an inspection"]
+fn inspect_bend_helical() {
+    for momentum_conserving in [false, true] {
+        let mut h = Harness::new(WaterSolver::Swe, s_bend);
+        {
+            let mut water = h.water();
+            water.momentum_conserving = momentum_conserving;
+            water.springs.push(Spring {
+                center: Vec2::new(
+                    10.0,
+                    N as f32 / 2.0 + 24.0 * (2.0 * PI * 10.0 / 128.0).sin(),
+                ),
+                radius: 6.0,
+                rate: 0.05 / TIME,
+            });
+        }
+        h.run(25.0);
+        let water = h.read_water();
+        let handle = h.app.world().resource::<ErosionImages>().debug_bed.clone();
+        let helical: Vec<f32> = h.read(handle).iter().map(|t| t[1]).collect();
+        let u = |x: u32, y: u32| water[idx(x, y)].velocity;
+        let mut rows = Vec::new();
+        for x0 in [96u32, 160] {
+            let (mut speed, mut depth, mut kappa, mut is, mut count) = (0.0, 0.0, 0.0, 0.0, 0.0);
+            for x in x0 - 4..=x0 + 4 {
+                let c = N as f32 / 2.0 + 24.0 * (2.0 * PI * x as f32 / 128.0).sin();
+                for y in (c - 5.0) as u32..=(c + 5.0) as u32 {
+                    let v = u(x, y);
+                    let s = v.length();
+                    if water[idx(x, y)].depth <= 0.0 || s < 1e-3 {
+                        continue;
+                    }
+                    let dudx = 0.5 * (u(x + 1, y) - u(x - 1, y));
+                    let dudy = 0.5 * (u(x, y + 1) - u(x, y - 1));
+                    let a = v.x * dudx + v.y * dudy;
+                    kappa += ((v.x * a.y - v.y * a.x) / (s * s * s)).abs();
+                    speed += s;
+                    depth += water[idx(x, y)].depth * CELLS_PER_HEIGHT;
+                    is += helical[idx(x, y)].abs();
+                    count += 1.0;
+                }
+            }
+            rows.push(format!(
+                "apex {x0}: speed {:.2}, depth {:.3}, |kappa| {:.4}, |I_s| {:.4}",
+                speed / count,
+                depth / count,
+                kappa / count,
+                is / count
+            ));
+        }
+        println!(
+            "{}: {}",
+            if momentum_conserving { "momentum-conserving" } else { "MacCormack" },
+            rows.join("; ")
+        );
+    }
+}
+
 /// Helical flow moves bed load toward the inner banks of bends: the outer bank scours, on
 /// opposite sides in successive bends.
 #[test]

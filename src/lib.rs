@@ -1208,6 +1208,10 @@ pub struct WaterControl {
     /// Carries depth with a second-order flux in [`WaterSolver::Swe`] instead of first-order
     /// upwind, whose numerical diffusion damps roll waves.
     pub second_order_depth: bool,
+    /// Advects the water in momentum-conserving form (Stelling and Duinmeijer 2003) instead of
+    /// MacCormack's, so bores and jets keep their speed. Off until the helical flow's strength is
+    /// recalibrated for it (bevy_fft's `docs/river_ecosystem.md`, bead 0ge.8).
+    pub momentum_conserving: bool,
     /// Gravity (m/s²).
     pub gravity: f32,
     /// Simulated seconds per second of frame time.
@@ -1513,6 +1517,7 @@ impl Default for WaterControl {
             solver: WaterSolver::default(),
             manning_n: 0.2,
             second_order_depth: false,
+            momentum_conserving: false,
             gravity: GRAVITY,
             time_scale: 50.0,
             dt: 0.0,
@@ -3808,6 +3813,7 @@ fn plan_erosion_frame(
                     evaporation: 0.0,
                     overshoot_limiter: false,
                     second_order_depth: water.second_order_depth,
+                    momentum_conserving: water.momentum_conserving,
                     ..default()
                 },
             );
