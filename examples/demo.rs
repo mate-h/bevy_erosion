@@ -18,9 +18,9 @@
 //! `EROSION_HEADLESS=<width>x<height>` renders into an image of that size with no window, for
 //! benches on machines without a display; screenshots then come from that image.
 //! `EROSION_LOG_DIAGNOSTICS=1` logs Bevy's per-pass render diagnostics (GPU and CPU time per
-//! pass) once a second. The water surface is a bevy_fft `WaterQuadtree` with dry culling, which
-//! skips tiles with no water under them; `EROSION_WATER_GRID=1` draws it on the terrain's grid
-//! instead.
+//! pass) once a second. `EROSION_WATER_QUADTREE=1` draws the water on a bevy_fft `WaterQuadtree`
+//! with dry culling instead of the terrain's grid; see `spawn_terrain` for why it is not the
+//! default yet.
 
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::{
@@ -622,9 +622,8 @@ fn spawn_terrain(
             width,
             height_scale,
         ));
-        // The surface samples the water LOD data by world position. A quadtree around the camera
-        // carries it and skips tiles with no water under them (bevy_fft drops them when the
-        // material sets `dry_depth`); `EROSION_WATER_GRID=1` reuses the terrain's grid instead.
+        // The surface samples the water LOD data by world position, so it reuses the terrain's
+        // grid. `EROSION_WATER_QUADTREE=1` puts it on a quadtree around the camera instead.
         let mut surface = commands.spawn((
             MeshMaterial3d(water_materials.add(WaterSurfaceMaterial {
                 base: StandardMaterial {
@@ -655,19 +654,22 @@ fn spawn_terrain(
             WaterSurfaceTag,
             bevy::light::NotShadowCaster,
         ));
-        if std::env::var("EROSION_WATER_GRID").is_ok_and(|v| v != "0") {
-            // Its bounds are flat, so it is never frustum culled.
-            surface.insert((Mesh3d(mesh_handle.clone()), NoFrustumCulling));
-        } else {
+        if std::env::var("EROSION_WATER_QUADTREE").is_ok_and(|v| v != "0") {
             // Water sits anywhere between the sea and the peaks, so no height bounds would hold
-            // for frustum culling; dry tiles are what the quadtree drops. On a 5090 at 2560x1440
-            // the grid's water pass took 0.140 ms and the quadtree's 0.067 ms, 0.044 ms with dry
-            // culling, which adds about 0.035 ms of tile selection.
+            // for frustum culling; dry culling drops tiles with no water under them. On a 5090 at
+            // 2560x1440 the grid's water pass took 0.140 ms and the quadtree's 0.067 ms, 0.044 ms
+            // with dry culling, which adds about 0.035 ms of tile selection. Not the default yet:
+            // distant tiles are coarser than the heightfield, so their vertices straddle wet cells
+            // and dry ones sunk below the terrain and a pond's shore turns into diamonds, and
+            // tiles past the LOD slices draw open water out to the horizon.
             surface.insert(WaterQuadtree {
                 frustum_cull: false,
                 dry_culling: true,
                 ..default()
             });
+        } else {
+            // Its bounds are flat, so it is never frustum culled.
+            surface.insert((Mesh3d(mesh_handle.clone()), NoFrustumCulling));
         }
     }
 
